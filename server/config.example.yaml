@@ -45,7 +45,11 @@ anomaly_max_changes: 5
 
 # ---------- Storage ---------- #
 
-# Path to the JSON state file (tracks user IPs and knock timestamps).
+# Path to the SQLite database file (tracks users, groups, state, logs).
+# The first run auto-migrates legacy state.json into the DB.
+db_path: "/var/lib/ufw-okboy/ufw-okboy.db"
+
+# Path to the legacy JSON state file (used only for one-time migration).
 state_file: "/var/lib/ufw-okboy/state.json"
 
 # ---------- Users ---------- #

@@ -18,6 +18,11 @@ state.json
 
 # Scaffolding / CI tooling templates
 .spec-workflow/
+.workflow/
+
+# Release packages
+dist/
+*.tar.gz
 
 # IDE
 .idea/
@@ -33,3 +38,4 @@ Desktop.ini
 
 # Logs
 *.log
+Typora_Hook_Log.txt

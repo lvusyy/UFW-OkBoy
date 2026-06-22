@@ -9,12 +9,10 @@ Authentication: HMAC-SHA256 with timestamp (secret never transmitted).
 """
 
 import argparse
-import hashlib
-import hmac
 import logging
 import secrets
+import sqlite3
 import sys
-import time
 from datetime import datetime
 from pathlib import Path
 
@@ -23,6 +21,8 @@ import os
 import yaml
 from flask import Flask, request, jsonify, send_from_directory
 
+import auth
+from db import Database
 from ufw_ops import UFWManager
 
 logger = logging.getLogger("ufw-okboy")
@@ -48,83 +48,67 @@ def load_config(path: str) -> dict:
         if not info.get("secret"):
             sys.exit(f"Config error: user '{name}' is missing 'secret'")
 
+    if not cfg.get("db_path"):
+        logger.warning("'db_path' not set in config; using default /var/lib/ufw-okboy/ufw-okboy.db")
+
     return cfg
 
-# ====================================================================== #
-#  HMAC-SHA256 Authentication
-# ====================================================================== #
 
-def verify_auth(auth_header: str | None, users: dict, ttl: int = 300) -> tuple[str | None, str | None]:
-    """Verify the HMAC-SHA256 Authorization header.
-
-    Header format: ``HMAC-SHA256 <username>:<timestamp>:<hex_signature>``
-    Where signature = HMAC-SHA256(secret, "<username>:<timestamp>")
-
-    Returns:
-        (username, None) on success, or (None, error_message) on failure.
-    """
-    if not auth_header or not auth_header.startswith("HMAC-SHA256 "):
-        return None, "Missing or invalid Authorization header"
-
-    payload = auth_header[len("HMAC-SHA256 "):]
-
-    # Parse payload
-    parts = payload.split(":", 2)
-    if len(parts) != 3:
-        return None, "Malformed auth payload (expected username:timestamp:signature)"
-    username, ts_str, signature = parts
-
-    # Validate timestamp
-    try:
-        ts = int(ts_str)
-    except ValueError:
-        return None, "Invalid timestamp"
-    if abs(int(time.time()) - ts) > ttl:
-        return None, "Signature expired"
-
-    # Validate user
-    if username not in users:
-        return None, "Unknown user"
-
-    # Verify HMAC
-    secret = users[username]["secret"]
-    expected = hmac.new(
-        secret.encode("utf-8"),
-        f"{username}:{ts_str}".encode("utf-8"),
-        hashlib.sha256,
-    ).hexdigest()
-
-    if not hmac.compare_digest(signature, expected):
-        return None, "Invalid signature"
-
-    return username, None
+def open_database(cfg: dict) -> Database:
+    """Construct, initialize, and (if empty) migrate the Database from config."""
+    db = Database(cfg.get("db_path", "/var/lib/ufw-okboy/ufw-okboy.db"))
+    db.init()
+    if not db.list_users():
+        db.migrate_from_json(
+            cfg.get("state_file", "/var/lib/ufw-okboy/state.json"),
+            cfg["users"],
+            cfg["protected_ports"],
+            cfg.get("proto", "tcp"),
+        )
+        logger.info("Database seeded from config + state.json (first run)")
+    return db
 
 # ====================================================================== #
 #  Flask Application Factory
 # ====================================================================== #
 
-def create_app(config_path: str = "config.yaml") -> Flask:
-    """Create and configure the Flask application."""
+def create_app(config_path: str = "config.yaml",
+               db_override: Database | None = None,
+               ufw_override: UFWManager | None = None) -> Flask:
+    """Create and configure the Flask application.
+
+    Args:
+        config_path: Path to the YAML config file.
+        db_override: Optional pre-built Database (used by tests). When
+            provided, config-based seeding/migration is skipped.
+        ufw_override: Optional pre-built UFWManager (used by tests).
+    """
     static_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
     app = Flask(__name__, static_folder=static_dir, static_url_path="/static")
     cfg = load_config(config_path)
 
-    ufw = UFWManager(
-        rule_prefix=cfg.get("rule_prefix", "ufw-okboy"),
-        state_file=cfg.get("state_file", "/var/lib/ufw-okboy/state.json"),
-    )
+    if db_override is not None:
+        db = db_override
+    else:
+        db = open_database(cfg)
+    if ufw_override is not None:
+        ufw = ufw_override
+    else:
+        ufw = UFWManager(
+            rule_prefix=cfg.get("rule_prefix", "ufw-okboy"),
+            db=db,
+        )
 
-    users = cfg["users"]
     ttl = cfg.get("signature_ttl", 300)
-    ports = cfg["protected_ports"]
-    proto = cfg.get("proto", "tcp")
 
     # Anomaly detection thresholds (configurable)
     anomaly_window = cfg.get("anomaly_window", 3600)      # 1 hour
     anomaly_max_changes = cfg.get("anomaly_max_changes", 5)  # max IP changes per window
 
     def _auth():
-        return verify_auth(request.headers.get("Authorization"), users, ttl)
+        return auth.verify_hmac(
+            db, request.headers.get("Authorization"), ttl, _client_ip(),
+        )
 
     def _client_ip() -> str:
         """Extract real client IP, respecting reverse-proxy headers."""
@@ -151,11 +135,17 @@ def create_app(config_path: str = "config.yaml") -> Flask:
                 "error": "Cannot determine real client IP. Check Nginx X-Real-IP header.",
             }), 400
 
-        old_ip = ufw.get_user_ip(username)
+        user = db.get_user_by_username(username)
+        if not user:
+            return jsonify({"ok": False, "error": "User not found"}), 404
+        user_id = user["id"]
+
+        enabled_groups = db.get_user_groups(user_id, only_enabled=True)
+        old_ip = db.get_user_ip(username)
 
         # IP unchanged - just refresh the timestamp
         if old_ip == client_ip:
-            ufw.update_knock_time(username, client_ip)
+            db.update_knock_time(user_id, client_ip)
             logger.info("Knock: %s@%s (unchanged)", username, client_ip)
             return jsonify({
                 "ok": True,
@@ -164,16 +154,18 @@ def create_app(config_path: str = "config.yaml") -> Flask:
                 "message": "IP unchanged, heartbeat recorded",
             })
 
-        # IP changed - swap firewall rules
+        # IP changed - swap firewall rules for every enabled group
         if old_ip:
-            for port in ports:
-                ufw.remove_rule(old_ip, port, username, proto)
+            for grp in enabled_groups:
+                ufw.remove_rule(old_ip, grp["port"], username, grp["proto"], grp["name"])
             logger.info("Removed old rules for %s (was %s)", username, old_ip)
 
-        for port in ports:
-            ufw.add_rule(client_ip, port, username, proto)
+        for grp in enabled_groups:
+            ufw.add_rule(client_ip, grp["port"], username, grp["proto"], grp["name"])
 
-        ufw.update_state(username, client_ip)
+        db.set_user_ip(user_id, client_ip)
+        db.update_knock_time(user_id, client_ip)
+        db.log_operation(username, "ip_change", client_ip, f"old={old_ip}")
         logger.info("Knock: %s@%s (was %s)", username, client_ip, old_ip or "new")
 
         # Check for anomalous IP change patterns (possible credential sharing)
@@ -196,6 +188,7 @@ def create_app(config_path: str = "config.yaml") -> Flask:
             "ip": client_ip,
             "changed": True,
             "old_ip": old_ip,
+            "groups": [grp["name"] for grp in enabled_groups],
             "message": "Firewall rules updated",
             **({"warning": warning} if warning else {}),
         })
@@ -208,7 +201,87 @@ def create_app(config_path: str = "config.yaml") -> Flask:
             return jsonify({"ok": False, "error": err}), 401
 
         state = ufw.get_user_state(username)
-        return jsonify({"ok": True, "username": username, **state})
+        user = db.get_user_by_username(username)
+        enabled_groups = []
+        if user:
+            enabled_groups = [
+                {"name": grp["name"], "port": grp["port"], "proto": grp["proto"]}
+                for grp in db.get_user_groups(user["id"], only_enabled=True)
+            ]
+        return jsonify({
+            "ok": True,
+            "username": username,
+            "enabled_groups": enabled_groups,
+            **state,
+        })
+
+    @app.route("/api/membership/<int:user_id>/<int:group_id>", methods=["PATCH"])
+    def toggle_membership(user_id: int, group_id: int):
+        """Toggle a user's group membership and sync UFW rules immediately.
+
+        Allowed when the requester is an admin or is toggling their own
+        membership (self-toggle).
+        """
+        username, err = _auth()
+        if err:
+            return jsonify({"ok": False, "error": err}), 401
+
+        requester = db.get_user_by_username(username)
+        if not requester:
+            return jsonify({"ok": False, "error": "Authenticated user not found"}), 401
+
+        is_self = requester["id"] == user_id
+        if not is_self and not auth.is_admin(db, username):
+            return jsonify({
+                "ok": False,
+                "error": "Forbidden: admin privileges or self-toggle required",
+            }), 403
+
+        body = request.get_json(silent=True) or {}
+        enabled = body.get("enabled")
+        if not isinstance(enabled, bool):
+            return jsonify({
+                "ok": False,
+                "error": "Request body must include 'enabled' (bool)",
+            }), 400
+
+        group = db.get_group(group_id)
+        if not group:
+            return jsonify({"ok": False, "error": "Group not found"}), 404
+        target = db.get_user(user_id)
+        if not target:
+            return jsonify({"ok": False, "error": "User not found"}), 404
+
+        db.set_membership_enabled(user_id, group_id, 1 if enabled else 0)
+
+        user_ip = target["current_ip"]
+        if user_ip:
+            if not enabled:
+                ufw.remove_rule(
+                    user_ip, group["port"], target["username"],
+                    group["proto"], group["name"],
+                )
+            else:
+                ufw.add_rule(
+                    user_ip, group["port"], target["username"],
+                    group["proto"], group["name"],
+                )
+
+        db.log_audit(
+            username, "toggle_membership",
+            f"{user_id}/{group_id}", f"enabled={enabled}",
+        )
+        logger.info(
+            "Membership toggled: user=%s group=%s enabled=%s by %s",
+            user_id, group_id, enabled, username,
+        )
+
+        return jsonify({
+            "ok": True,
+            "user_id": user_id,
+            "group_id": group_id,
+            "enabled": enabled,
+        })
 
     @app.route("/health", methods=["GET"])
     def health():
@@ -221,6 +294,149 @@ def create_app(config_path: str = "config.yaml") -> Flask:
     def client_page():
         """Serve the web-based client UI."""
         return send_from_directory(static_dir, "index.html")
+
+    # ---- Admin API ---- #
+
+    def _admin_error_response(err: str):
+        """Build a (jsonify, status) tuple for an admin auth failure."""
+        status = 403 if err == "Admin privileges required" else 401
+        return jsonify({"ok": False, "error": err}), status
+
+    @app.route("/api/admin/users", methods=["GET"])
+    def admin_list_users():
+        """List all users (admin only). Secrets are stripped from the response."""
+        user, err = auth.require_admin(
+            db, request.headers.get("Authorization"), ttl, _client_ip(),
+        )
+        if err:
+            return _admin_error_response(err)
+        users = []
+        for row in db.list_users():
+            d = dict(row)
+            d.pop("secret", None)
+            users.append(d)
+        return jsonify({"ok": True, "users": users})
+
+    @app.route("/api/admin/users", methods=["POST"])
+    def admin_create_user():
+        """Create a new user (admin only). Returns the generated/explied secret."""
+        user, err = auth.require_admin(
+            db, request.headers.get("Authorization"), ttl, _client_ip(),
+        )
+        if err:
+            return _admin_error_response(err)
+        data = request.get_json(force=True, silent=True) or {}
+        username = data.get("username")
+        if not username:
+            return jsonify({"ok": False, "error": "username is required"}), 400
+        secret = data.get("secret") or secrets.token_hex(32)
+        is_admin = bool(data.get("is_admin", False))
+        try:
+            user_id = db.create_user(username, secret, is_admin=is_admin)
+        except sqlite3.IntegrityError:
+            return jsonify({"ok": False, "error": f"User '{username}' already exists"}), 409
+        db.log_audit(user["username"], "user_add", username, f"is_admin={is_admin}")
+        return jsonify({
+            "ok": True, "id": user_id, "username": username,
+            "secret": secret, "is_admin": is_admin,
+        }), 201
+
+    @app.route("/api/admin/users/<int:user_id>", methods=["DELETE"])
+    def admin_delete_user(user_id: int):
+        """Delete a user and clean up their UFW rules (admin only)."""
+        user, err = auth.require_admin(
+            db, request.headers.get("Authorization"), ttl, _client_ip(),
+        )
+        if err:
+            return _admin_error_response(err)
+        target = db.get_user(user_id)
+        if not target:
+            return jsonify({"ok": False, "error": "User not found"}), 404
+        if target["current_ip"]:
+            for g in db.get_user_groups(user_id, only_enabled=True):
+                ufw.remove_rule(target["current_ip"], g["port"], target["username"], g["proto"])
+        db.delete_user(user_id)
+        db.log_audit(user["username"], "user_del", target["username"], None)
+        return jsonify({"ok": True, "deleted": user_id})
+
+    @app.route("/api/admin/groups", methods=["GET"])
+    def admin_list_groups():
+        """List all groups (admin only)."""
+        user, err = auth.require_admin(
+            db, request.headers.get("Authorization"), ttl, _client_ip(),
+        )
+        if err:
+            return _admin_error_response(err)
+        groups = [dict(g) for g in db.list_groups()]
+        return jsonify({"ok": True, "groups": groups})
+
+    @app.route("/api/admin/groups", methods=["POST"])
+    def admin_create_group():
+        """Create a new group (admin only)."""
+        user, err = auth.require_admin(
+            db, request.headers.get("Authorization"), ttl, _client_ip(),
+        )
+        if err:
+            return _admin_error_response(err)
+        data = request.get_json(force=True, silent=True) or {}
+        name = data.get("name")
+        port = data.get("port")
+        if not name or port is None:
+            return jsonify({"ok": False, "error": "name and port are required"}), 400
+        proto = data.get("proto", "tcp")
+        try:
+            group_id = db.create_group(name, int(port), proto)
+        except sqlite3.IntegrityError:
+            return jsonify({"ok": False, "error": f"Group '{name}' already exists"}), 409
+        db.log_audit(user["username"], "group_add", name, f"port={port} proto={proto}")
+        return jsonify({
+            "ok": True, "id": group_id, "name": name,
+            "port": int(port), "proto": proto,
+        }), 201
+
+    @app.route("/api/admin/groups/<int:group_id>", methods=["DELETE"])
+    def admin_delete_group(group_id: int):
+        """Delete a group and clean up UFW rules for its members (admin only)."""
+        user, err = auth.require_admin(
+            db, request.headers.get("Authorization"), ttl, _client_ip(),
+        )
+        if err:
+            return _admin_error_response(err)
+        group = db.get_group(group_id)
+        if not group:
+            return jsonify({"ok": False, "error": "Group not found"}), 404
+        for m in db.get_group_members(group_id):
+            if m["current_ip"]:
+                ufw.remove_rule(m["current_ip"], group["port"], m["username"], group["proto"])
+        db.delete_group(group_id)
+        db.log_audit(user["username"], "group_del", group["name"], None)
+        return jsonify({"ok": True, "deleted": group_id})
+
+    @app.route("/api/admin/users/<int:user_id>/groups", methods=["POST"])
+    def admin_add_membership(user_id: int):
+        """Add a user to a group (admin only)."""
+        user, err = auth.require_admin(
+            db, request.headers.get("Authorization"), ttl, _client_ip(),
+        )
+        if err:
+            return _admin_error_response(err)
+        target = db.get_user(user_id)
+        if not target:
+            return jsonify({"ok": False, "error": "User not found"}), 404
+        data = request.get_json(force=True, silent=True) or {}
+        group_id = data.get("group_id")
+        if group_id is None:
+            return jsonify({"ok": False, "error": "group_id is required"}), 400
+        group = db.get_group(int(group_id))
+        if not group:
+            return jsonify({"ok": False, "error": "Group not found"}), 404
+        enabled = 1 if data.get("enabled", True) else 0
+        db.add_membership(user_id, int(group_id), enabled=enabled)
+        db.log_audit(user["username"], "user_join", target["username"], group["name"])
+        return jsonify({
+            "ok": True, "user_id": user_id,
+            "group_id": int(group_id), "enabled": enabled,
+        }), 201
 
     return app
 
@@ -260,12 +476,12 @@ def cmd_gen_secret(args):
 def cmd_list(args):
     """List all managed users and their current firewall rules."""
     cfg = load_config(args.config)
+    db = open_database(cfg)
     ufw = UFWManager(
         rule_prefix=cfg.get("rule_prefix", "ufw-okboy"),
-        state_file=cfg.get("state_file", "/var/lib/ufw-okboy/state.json"),
+        db=db,
     )
 
-    # Configured users
     print("=== Configured Users ===")
     for name in cfg["users"]:
         state = ufw.get_user_state(name)
@@ -274,15 +490,14 @@ def cmd_list(args):
         last_str = datetime.fromtimestamp(last).strftime("%Y-%m-%d %H:%M:%S") if last else "never"
         print(f"  {name:20s}  IP: {ip:20s}  Last knock: {last_str}")
 
-    # State entries not in config (orphaned)
-    orphaned = set(ufw.state.keys()) - set(cfg["users"].keys())
+    db_users = {row["username"] for row in db.list_users()}
+    orphaned = db_users - set(cfg["users"].keys())
     if orphaned:
-        print("\n=== Orphaned State Entries (user removed from config) ===")
+        print("\n=== Orphaned DB Users (not in config) ===")
         for name in orphaned:
-            state = ufw.state[name]
-            print(f"  {name:20s}  IP: {state.get('ip', 'N/A')}")
+            state = ufw.get_user_state(name)
+            print(f"  {name:20s}  IP: {state.get('ip') or 'N/A'}")
 
-    # Actual UFW rules
     print("\n=== UFW Rules (managed) ===")
     rules = ufw.list_managed_rules()
     if rules:
@@ -296,9 +511,10 @@ def cmd_cleanup(args):
     """Remove firewall rules for users who haven't knocked recently."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     cfg = load_config(args.config)
+    db = open_database(cfg)
     ufw = UFWManager(
         rule_prefix=cfg.get("rule_prefix", "ufw-okboy"),
-        state_file=cfg.get("state_file", "/var/lib/ufw-okboy/state.json"),
+        db=db,
     )
     max_age = args.max_age * 86400  # days -> seconds
     removed = ufw.cleanup_stale(max_age, cfg["protected_ports"], cfg.get("proto", "tcp"))
@@ -309,12 +525,13 @@ def cmd_cleanup(args):
 
 
 def cmd_sync(args):
-    """Rebuild state.json from current UFW rules (disaster recovery)."""
+    """Recover user IPs from current UFW rules into the database (disaster recovery)."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     cfg = load_config(args.config)
+    db = open_database(cfg)
     ufw = UFWManager(
         rule_prefix=cfg.get("rule_prefix", "ufw-okboy"),
-        state_file=cfg.get("state_file", "/var/lib/ufw-okboy/state.json"),
+        db=db,
     )
     recovered = ufw.sync_state_from_ufw(cfg["protected_ports"])
     if recovered:
@@ -323,6 +540,139 @@ def cmd_sync(args):
             print(f"  {name}: {data['ip']}")
     else:
         print("No managed rules found in UFW.")
+
+
+def cmd_user_add(args):
+    """Create a new user with a random secret."""
+    cfg = load_config(args.config)
+    db = open_database(cfg)
+    secret = secrets.token_hex(32)
+    db.create_user(args.username, secret, is_admin=args.admin)
+    print(f"Created user '{args.username}' with secret: {secret}")
+    db.log_audit("cli", "user_add", args.username, f"is_admin={args.admin}")
+
+
+def cmd_user_del(args):
+    """Delete a user and clean up their UFW rules."""
+    cfg = load_config(args.config)
+    db = open_database(cfg)
+    ufw = UFWManager(rule_prefix=cfg.get("rule_prefix", "ufw-okboy"), db=db)
+    user = db.get_user_by_username(args.username)
+    if not user:
+        print(f"User '{args.username}' not found.")
+        return
+    if user["current_ip"]:
+        for g in db.get_user_groups(user["id"], only_enabled=True):
+            ufw.remove_rule(user["current_ip"], g["port"], args.username, g["proto"])
+    db.delete_user(user["id"])
+    db.log_audit("cli", "user_del", args.username, None)
+    print(f"Deleted user '{args.username}'.")
+
+
+def cmd_user_list(args):
+    """List all users in the database."""
+    cfg = load_config(args.config)
+    db = open_database(cfg)
+    users = db.list_users()
+    if not users:
+        print("No users found.")
+        return
+    print(f"{'ID':>4}  {'Username':20s}  {'Admin':5s}  {'Current IP':16s}  {'Last Knock'}")
+    for u in users:
+        last = u["last_knock"]
+        last_str = datetime.fromtimestamp(last).strftime("%Y-%m-%d %H:%M:%S") if last else "never"
+        ip = u["current_ip"] or "(none)"
+        admin = "Yes" if u["is_admin"] else "No"
+        print(f"{u['id']:>4}  {u['username']:20s}  {admin:5s}  {ip:16s}  {last_str}")
+
+
+def cmd_group_add(args):
+    """Create a new port group."""
+    cfg = load_config(args.config)
+    db = open_database(cfg)
+    db.create_group(args.name, args.port, args.proto)
+    print(f"Created group '{args.name}' (port {args.port}/{args.proto})")
+    db.log_audit("cli", "group_add", args.name, f"port={args.port} proto={args.proto}")
+
+
+def cmd_group_del(args):
+    """Delete a group and clean up UFW rules for its members."""
+    cfg = load_config(args.config)
+    db = open_database(cfg)
+    ufw = UFWManager(rule_prefix=cfg.get("rule_prefix", "ufw-okboy"), db=db)
+    group = db.get_group_by_name(args.name)
+    if not group:
+        print(f"Group '{args.name}' not found.")
+        return
+    for m in db.get_group_members(group["id"]):
+        if m["current_ip"]:
+            ufw.remove_rule(m["current_ip"], group["port"], m["username"], group["proto"])
+    db.delete_group(group["id"])
+    db.log_audit("cli", "group_del", args.name, None)
+    print(f"Deleted group '{args.name}'.")
+
+
+def cmd_group_list(args):
+    """List all groups in the database."""
+    cfg = load_config(args.config)
+    db = open_database(cfg)
+    groups = db.list_groups()
+    if not groups:
+        print("No groups found.")
+        return
+    print(f"{'ID':>4}  {'Name':20s}  {'Port':>5}  {'Proto'}")
+    for g in groups:
+        print(f"{g['id']:>4}  {g['name']:20s}  {g['port']:>5}  {g['proto']}")
+
+
+def cmd_user_join(args):
+    """Add a user to a group."""
+    cfg = load_config(args.config)
+    db = open_database(cfg)
+    user = db.get_user_by_username(args.username)
+    group = db.get_group_by_name(args.groupname)
+    if not user:
+        print(f"User '{args.username}' not found.")
+        return
+    if not group:
+        print(f"Group '{args.groupname}' not found.")
+        return
+    db.add_membership(user["id"], group["id"])
+    db.log_audit("cli", "user_join", args.username, args.groupname)
+    print(f"Added '{args.username}' to group '{args.groupname}'.")
+
+
+def cmd_user_leave(args):
+    """Remove a user from a group and clean up the UFW rule."""
+    cfg = load_config(args.config)
+    db = open_database(cfg)
+    ufw = UFWManager(rule_prefix=cfg.get("rule_prefix", "ufw-okboy"), db=db)
+    user = db.get_user_by_username(args.username)
+    group = db.get_group_by_name(args.groupname)
+    if not user:
+        print(f"User '{args.username}' not found.")
+        return
+    if not group:
+        print(f"Group '{args.groupname}' not found.")
+        return
+    if user["current_ip"]:
+        ufw.remove_rule(user["current_ip"], group["port"], args.username, group["proto"])
+    db.remove_membership(user["id"], group["id"])
+    db.log_audit("cli", "user_leave", args.username, args.groupname)
+    print(f"Removed '{args.username}' from group '{args.groupname}'.")
+
+
+def cmd_admin_add(args):
+    """Grant admin privileges to a user."""
+    cfg = load_config(args.config)
+    db = open_database(cfg)
+    user = db.get_user_by_username(args.username)
+    if not user:
+        print(f"User '{args.username}' not found.")
+        return
+    db.set_user_admin(user["id"], True)
+    db.log_audit("cli", "admin_add", args.username, None)
+    print(f"Granted admin privileges to '{args.username}'.")
 
 
 # ====================================================================== #
@@ -360,6 +710,45 @@ def main():
     # sync
     sub.add_parser("sync", help="Rebuild state from UFW rules (disaster recovery)")
 
+    # user-add
+    p_user_add = sub.add_parser("user-add", help="Create a new user")
+    p_user_add.add_argument("username", help="Username to create")
+    p_user_add.add_argument("--admin", action="store_true", help="Grant admin privileges")
+
+    # user-del
+    p_user_del = sub.add_parser("user-del", help="Delete a user")
+    p_user_del.add_argument("username", help="Username to delete")
+
+    # user-list
+    sub.add_parser("user-list", help="List all users")
+
+    # group-add
+    p_group_add = sub.add_parser("group-add", help="Create a new port group")
+    p_group_add.add_argument("name", help="Group name")
+    p_group_add.add_argument("port", type=int, help="Port number")
+    p_group_add.add_argument("--proto", default="tcp", help="Protocol (default: tcp)")
+
+    # group-del
+    p_group_del = sub.add_parser("group-del", help="Delete a group")
+    p_group_del.add_argument("name", help="Group name")
+
+    # group-list
+    sub.add_parser("group-list", help="List all groups")
+
+    # user-join
+    p_user_join = sub.add_parser("user-join", help="Add a user to a group")
+    p_user_join.add_argument("username", help="Username")
+    p_user_join.add_argument("groupname", help="Group name")
+
+    # user-leave
+    p_user_leave = sub.add_parser("user-leave", help="Remove a user from a group")
+    p_user_leave.add_argument("username", help="Username")
+    p_user_leave.add_argument("groupname", help="Group name")
+
+    # admin-add
+    p_admin_add = sub.add_parser("admin-add", help="Grant admin privileges to a user")
+    p_admin_add.add_argument("username", help="Username to promote")
+
     args = parser.parse_args()
 
     commands = {
@@ -368,6 +757,15 @@ def main():
         "list": cmd_list,
         "cleanup": cmd_cleanup,
         "sync": cmd_sync,
+        "user-add": cmd_user_add,
+        "user-del": cmd_user_del,
+        "user-list": cmd_user_list,
+        "group-add": cmd_group_add,
+        "group-del": cmd_group_del,
+        "group-list": cmd_group_list,
+        "user-join": cmd_user_join,
+        "user-leave": cmd_user_leave,
+        "admin-add": cmd_admin_add,
     }
 
     handler = commands.get(args.command)

@@ -2,51 +2,28 @@
 
 Responsibilities:
 - Add/remove UFW allow rules with user-identifying comments
-- Track per-user state (current IP, last knock time) in a JSON file
+- Track per-user state (current IP, last knock time) via the Database layer
 - Cleanup stale rules that exceed a configurable max age
 """
 
-import json
 import logging
 import re
 import subprocess
 import time
-from pathlib import Path
+
+from db import Database
 
 logger = logging.getLogger("ufw-okboy.ufw")
 
 
 class UFWManager:
-    """Manages UFW firewall rules and persists user-IP mapping state."""
+    """Manages UFW firewall rules and delegates user-IP state to a Database."""
 
-    def __init__(self, rule_prefix: str = "ufw-okboy",
-                 state_file: str = "/var/lib/ufw-okboy/state.json"):
+    def __init__(self, rule_prefix: str = "ufw-okboy", db: Database | None = None) -> None:
         self.rule_prefix = rule_prefix
-        self.state_file = Path(state_file)
-        self.state_file.parent.mkdir(parents=True, exist_ok=True)
-        self.state: dict = self._load_state()
-
-    # ------------------------------------------------------------------ #
-    #  State persistence
-    # ------------------------------------------------------------------ #
-
-    def _load_state(self) -> dict:
-        """Load user state from JSON file. Return empty dict if missing or corrupt."""
-        if not self.state_file.exists():
-            return {}
-        try:
-            with open(self.state_file, encoding="utf-8") as f:
-                return json.load(f)
-        except (json.JSONDecodeError, OSError) as exc:
-            logger.warning("State file corrupt or unreadable, starting fresh: %s", exc)
-            return {}
-
-    def _save_state(self) -> None:
-        """Atomically write state to disk (write-then-rename)."""
-        tmp = self.state_file.with_suffix(".tmp")
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(self.state, f, indent=2, ensure_ascii=False)
-        tmp.replace(self.state_file)
+        if db is None:
+            raise RuntimeError("UFWManager requires a Database instance")
+        self.db: Database = db
 
     # ------------------------------------------------------------------ #
     #  UFW commands
@@ -73,28 +50,40 @@ class UFWManager:
             raise RuntimeError(f"UFW command failed: {result.stderr.strip()}")
         return result.stdout
 
-    def add_rule(self, ip: str, port: int, username: str, proto: str = "tcp") -> None:
-        """Add a UFW allow rule: allow <ip> to access <port> with identifying comment."""
+    def add_rule(self, ip: str, port: int, username: str, proto: str = "tcp",
+                 group: str | None = None) -> None:
+        """Add a UFW allow rule: allow <ip> to access <port> with identifying comment.
+
+        When *group* is provided the comment becomes
+        ``<prefix>:<username>:<group>`` for traceability; otherwise it stays
+        ``<prefix>:<username>`` (backward compatible).
+        """
         comment = f"{self.rule_prefix}:{username}"
+        if group:
+            comment = f"{comment}:{group}"
         self._run_ufw(
             "allow", "from", ip,
             "to", "any", "port", str(port), "proto", proto,
             "comment", comment,
         )
-        logger.info("Added rule: %s -> port %s/%s (%s)", ip, port, proto, username)
+        logger.info("Added rule: %s -> port %s/%s (%s)", ip, port, proto, comment)
 
-    def remove_rule(self, ip: str, port: int, username: str, proto: str = "tcp") -> None:
+    def remove_rule(self, ip: str, port: int, username: str, proto: str = "tcp",
+                    group: str | None = None) -> None:
         """Remove a specific UFW rule. Logs warning if rule doesn't exist.
 
         Uses ``--force`` to suppress the interactive confirmation prompt
-        that ``ufw delete`` would otherwise display.
+        that ``ufw delete`` would otherwise display.  *group* is accepted
+        for symmetry with :meth:`add_rule` and used only in the log line;
+        UFW deletion matches on ip/port/proto, not on the comment.
         """
         try:
             self._run_ufw(
                 "--force", "delete", "allow", "from", ip,
                 "to", "any", "port", str(port), "proto", proto,
             )
-            logger.info("Removed rule: %s -> port %s/%s (%s)", ip, port, proto, username)
+            label = f"{self.rule_prefix}:{username}" + (f":{group}" if group else "")
+            logger.info("Removed rule: %s -> port %s/%s (%s)", ip, port, proto, label)
         except RuntimeError:
             logger.warning("Rule removal failed (may not exist): %s -> %s/%s", ip, port, proto)
 
@@ -104,80 +93,60 @@ class UFWManager:
 
     def get_user_ip(self, username: str) -> str | None:
         """Return the currently registered IP for a user, or None."""
-        return self.state.get(username, {}).get("ip")
+        return self.db.get_user_ip(username)
 
     def get_user_state(self, username: str) -> dict:
-        """Return full state dict for a user (safe copy without ip_history)."""
-        data = self.state.get(username, {"ip": None, "last_knock": None})
-        # Return a clean view for the API (omit internal tracking fields)
+        """Return full state dict for a user (API-safe view)."""
+        user = self.db.get_user_by_username(username)
+        if not user:
+            return {"ip": None, "last_knock": None, "ip_changes_recent": 0}
         return {
-            "ip": data.get("ip"),
-            "last_knock": data.get("last_knock"),
-            "ip_changes_recent": len(data.get("ip_history", [])),
+            "ip": user["current_ip"],
+            "last_knock": user["last_knock"],
+            "ip_changes_recent": self.db.count_recent_ip_changes(username, 86400),
         }
 
     def update_state(self, username: str, ip: str) -> None:
-        """Record a new IP and knock timestamp, maintaining IP change history."""
-        now = int(time.time())
-        existing = self.state.get(username, {})
-        old_ip = existing.get("ip")
-
-        # Maintain a rolling window of recent IP changes for anomaly detection.
-        # Each entry: {"ip": ..., "ts": ...}
-        ip_history = existing.get("ip_history", [])
+        """Record a new IP and knock timestamp, logging the prior IP change."""
+        user = self.db.get_user_by_username(username)
+        if not user:
+            logger.warning("update_state: unknown user %s", username)
+            return
+        old_ip = user["current_ip"]
         if old_ip and old_ip != ip:
-            ip_history.append({"ip": old_ip, "ts": now})
-        # Keep only last 24 hours of history
-        cutoff = now - 86400
-        ip_history = [e for e in ip_history if e["ts"] > cutoff]
-
-        self.state[username] = {
-            "ip": ip,
-            "last_knock": now,
-            "ip_history": ip_history,
-        }
-        self._save_state()
+            self.db.log_operation(username, "ip_change", ip=old_ip)
+        self.db.set_user_ip(user["id"], ip)
+        self.db.update_knock_time(user["id"], ip)
 
     def update_knock_time(self, username: str, ip: str) -> None:
         """Update only the last-knock timestamp (IP unchanged)."""
-        if username in self.state:
-            self.state[username]["last_knock"] = int(time.time())
-        else:
-            self.state[username] = {
-                "ip": ip,
-                "last_knock": int(time.time()),
-                "ip_history": [],
-            }
-        self._save_state()
+        user = self.db.get_user_by_username(username)
+        if not user:
+            logger.warning("update_knock_time: unknown user %s", username)
+            return
+        self.db.update_knock_time(user["id"], ip)
 
     def check_ip_anomaly(self, username: str, window_seconds: int = 3600,
                          max_changes: int = 5) -> dict | None:
         """Detect suspicious IP change patterns that suggest credential sharing.
 
-        Checks if IP has changed more than *max_changes* times within the
-        rolling *window_seconds*. Normal users rarely change IP more than
-        once or twice per day.
-
         Returns:
             None if normal, or dict with anomaly details if suspicious.
         """
-        data = self.state.get(username, {})
-        ip_history = data.get("ip_history", [])
-        if not ip_history:
+        user = self.db.get_user_by_username(username)
+        if not user:
             return None
-
-        now = int(time.time())
-        cutoff = now - window_seconds
-        recent_changes = [e for e in ip_history if e["ts"] > cutoff]
-
-        if len(recent_changes) >= max_changes:
-            unique_ips = {e["ip"] for e in recent_changes}
-            unique_ips.add(data.get("ip", ""))
+        changes = self.db.count_recent_ip_changes(username, window_seconds)
+        if changes >= max_changes:
+            ips = self.db.get_recent_ip_change_ips(username, window_seconds)
+            unique = set(ips)
+            if user["current_ip"]:
+                unique.add(user["current_ip"])
             return {
-                "changes": len(recent_changes),
+                "changes": changes,
                 "window": window_seconds,
-                "unique_ips": len(unique_ips),
-                "ips": list(unique_ips),
+                "unique_ips": len(unique),
+                "ips": list(unique),
             }
         return None
 
@@ -194,20 +163,22 @@ class UFWManager:
         now = int(time.time())
         removed: list[str] = []
 
-        for username in list(self.state):
-            data = self.state[username]
-            last_knock = data.get("last_knock", 0)
+        for user in self.db.list_users():
+            last_knock = user["last_knock"]
+            if last_knock is None:
+                continue
             if now - last_knock > max_age_seconds:
-                ip = data.get("ip")
+                ip = user["current_ip"]
+                username = user["username"]
                 if ip:
                     for port in ports:
                         self.remove_rule(ip, port, username, proto)
-                del self.state[username]
+                self.db.clear_user_state(user["id"])
                 removed.append(username)
-                logger.info("Cleaned up stale user: %s (last knock %ds ago)", username, now - last_knock)
-
-        if removed:
-            self._save_state()
+                logger.info(
+                    "Cleaned up stale user: %s (last knock %ds ago)",
+                    username, now - last_knock,
+                )
         return removed
 
     def list_managed_rules(self) -> list[str]:
@@ -226,12 +197,14 @@ class UFWManager:
         ]
 
     def sync_state_from_ufw(self, ports: list[int]) -> dict:
-        """Rebuild state by parsing current UFW rules (recovery tool).
+        """Recover user IPs by parsing current UFW rules into the database.
 
-        Useful if state.json is lost but UFW rules still exist.
+        Useful if the DB state is lost but UFW rules still exist. Only
+        users already present in the DB can be updated; unknown usernames
+        are logged as warnings.
         """
         pattern = re.compile(
-            rf"ALLOW\s+IN?\s+(\S+)\s+.*#\s*{re.escape(self.rule_prefix)}:(\S+)"
+            rf"ALLOW\s+IN?\s+(\S+)\s+.*#\s*{re.escape(self.rule_prefix)}:([^:\s]+)(?::([^:\s]+))?"
         )
         try:
             output = subprocess.run(
@@ -240,15 +213,23 @@ class UFWManager:
         except Exception:
             return {}
 
-        recovered = {}
+        recovered: dict = {}
+        now = int(time.time())
         for line in output.splitlines():
             m = pattern.search(line)
             if m:
                 ip, username = m.group(1), m.group(2)
-                recovered[username] = {"ip": ip, "last_knock": int(time.time())}
+                user = self.db.get_user_by_username(username)
+                if not user:
+                    logger.warning("sync: UFW rule references unknown user %s", username)
+                    continue
+                self.db.set_user_ip(user["id"], ip)
+                self.db.conn.execute(
+                    "UPDATE users SET last_knock=? WHERE id=?", (now, user["id"]),
+                )
+                self.db.conn.commit()
+                recovered[username] = {"ip": ip, "last_knock": now}
 
         if recovered:
-            self.state.update(recovered)
-            self._save_state()
             logger.info("Recovered %d users from UFW rules", len(recovered))
         return recovered
