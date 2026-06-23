@@ -1,0 +1,138 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag (e.g. v2.0.0)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          pip install -r server/requirements.txt
+
+      - name: Run tests
+        working-directory: server
+        run: |
+          python -m unittest discover -s tests -v
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine version
+        id: version
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "version=${{ inputs.version }}" >> $GITHUB_OUTPUT
+          else
+            echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build release package
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          PKG_NAME="ufw-okboy-${VERSION}"
+          mkdir -p "$PKG_NAME/server/static" "$PKG_NAME/server/tests" "$PKG_NAME/client" "$PKG_NAME/deploy" "$PKG_NAME/nginx"
+
+          # Server
+          cp server/app.py server/ufw_ops.py server/db.py server/auth.py \
+             server/requirements.txt server/config.example.yaml "$PKG_NAME/server/"
+          cp server/static/index.html "$PKG_NAME/server/static/" 2>/dev/null || true
+          cp server/tests/*.py "$PKG_NAME/server/tests/" 2>/dev/null || true
+          cp server/tests/__init__.py "$PKG_NAME/server/tests/" 2>/dev/null || true
+
+          # Client
+          cp client/knock.py client/knock.sh client/config.example.yaml "$PKG_NAME/client/" 2>/dev/null || true
+
+          # Deploy
+          cp deploy/deploy.sh deploy/quick-install.sh deploy/install-client.sh \
+             deploy/install-server.sh deploy/ufw-okboy.service \
+             deploy/ufw-okboy-cleanup.service deploy/ufw-okboy-cleanup.timer \
+             deploy/knock.service deploy/knock.timer "$PKG_NAME/deploy/" 2>/dev/null || true
+
+          # Nginx
+          cp nginx/ufw-okboy.conf "$PKG_NAME/nginx/" 2>/dev/null || true
+
+          # Docs
+          cp README.md README.en.md GUIDE.md "$PKG_NAME/" 2>/dev/null || true
+
+          # Install wrapper
+          cat > "$PKG_NAME/install.sh" << 'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+          exec bash "$SCRIPT_DIR/deploy/deploy.sh" "$@"
+          EOF
+          chmod +x "$PKG_NAME/install.sh"
+
+          # Create tarball
+          tar czf "ufw-okboy-${VERSION}.tar.gz" "$PKG_NAME"
+
+          # SHA256
+          sha256sum "ufw-okboy-${VERSION}.tar.gz" > "ufw-okboy-${VERSION}.tar.gz.sha256"
+
+          echo "### Build Complete" >> $GITHUB_STEP_SUMMARY
+          echo "Package: ufw-okboy-${VERSION}.tar.gz" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          cat "ufw-okboy-${VERSION}.tar.gz.sha256" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-package
+          path: |
+            ufw-okboy-*.tar.gz
+            ufw-okboy-*.tar.gz.sha256
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine version
+        id: version
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "version=${{ inputs.version }}" >> $GITHUB_OUTPUT
+          else
+            echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: release-package
+          path: dist
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          name: UFW OkBoy ${{ steps.version.outputs.version }}
+          generate_release_notes: true
+          files: |
+            dist/ufw-okboy-*.tar.gz
+            dist/ufw-okboy-*.tar.gz.sha256
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
