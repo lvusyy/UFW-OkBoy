@@ -1,6 +1,6 @@
 # UFW OkBoy 使用指南
 
-> 动态防火墙白名单管理工具 v2.0 — 让授权用户的 IP 变更不再需要手动处理。
+> 动态防火墙白名单管理工具 v2.1 — 让授权用户的 IP 变更不再需要手动处理。
 
 ---
 
@@ -17,6 +17,7 @@
 - [客户端使用](#客户端使用)
 - [日常管理](#日常管理)
 - [安全机制](#安全机制)
+- [升级与版本管理](#升级与版本管理)
 - [常见问题](#常见问题)
 
 ---
@@ -91,9 +92,11 @@ curl -fsSL https://raw.githubusercontent.com/lvusyy/UFW-OkBoy/master/deploy/quic
 **从 Release 包安装（离线）：**
 
 ```bash
-# 从 GitHub Release 下载 ufw-okboy-v2.0.0.tar.gz
-tar xzf ufw-okboy-v2.0.0.tar.gz
-cd ufw-okboy-v2.0.0
+# 从 GitHub Release 下载（替换 <VERSION> 为实际版本号，如 v2.1.0）
+# 或用 deploy/build-release.sh 构建，版本号自动从 VERSION 文件读取
+curl -fsSL https://github.com/lvusyy/UFW-OkBoy/releases/latest/download/ufw-okboy-<VERSION>.tar.gz -o ufw-okboy.tar.gz
+tar xzf ufw-okboy.tar.gz
+cd ufw-okboy-<VERSION>
 bash install.sh --self-signed -y
 ```
 
@@ -782,6 +785,55 @@ LIMIT 20;
 | 监控审计日志 | 定期检查 audit_log 表 |
 | HTTPS 必须开启 | 不要在 HTTP 下使用 |
 | 使用域名+Let's Encrypt | 优于自签证书，浏览器无警告 |
+
+---
+
+## 升级与版本管理
+
+UFW OkBoy 自 v2.1 起内置版本号与升级机制，便于持续迭代。
+
+### 查看当前版本
+
+```bash
+python app.py --version
+# 或查看 VERSION 文件
+cat VERSION
+```
+
+### 检查新版本（安全，可定期执行）
+
+```bash
+python app.py upgrade --check
+```
+
+查询 GitHub 最新 release 并对比当前版本，仅提示不升级。可配合 systemd timer 定期执行（如每日），不联网拉代码、不改动服务。
+
+### 手动升级（需 --force）
+
+```bash
+python app.py upgrade --force
+# 或非交互：python app.py upgrade --force -y
+```
+
+升级流程：备份 DB → 拉取新代码（`git pull`，无 .git 时下载 release tarball + SHA256 校验）→ 运行 DB 迁移 → `systemctl restart ufw-okboy` → 健康检查 `/health` → **失败自动回滚**（恢复 DB 备份 + 代码 checkout）。
+
+> **安全说明**：root 服务不自动联网拉代码。升级需手动触发（`--force`），检测（`--check`）仅提示。DB 迁移向前兼容不丢数据。GPG 签名验证暂未引入（先 SHA256），如需更强供应链保护可后续评估。
+
+### 版本化 DB 迁移
+
+v2.1 引入 `schema_version` 表与迁移注册表。`Database.init()` 启动时自动跑 pending 迁移：
+
+- 全新安装：建表后记录 baseline v1
+- 已有 v2.0 部署升级：检测到 6 表已存在，**记录 baseline v1 但不重新 seed**（避免重复导入用户）
+- 未来 schema 变更：在 `db.py` 的 `MIGRATIONS` 注册表新增 `(version, description)` + 对应迁移方法
+
+### 构建发布包
+
+```bash
+# 版本号自动从 VERSION 文件读取，无需手动传参
+bash deploy/build-release.sh
+# 或显式指定：bash deploy/build-release.sh v2.1.0
+```
 
 ---
 

@@ -202,14 +202,15 @@ class TestDatabase(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["reason"], "bad signature")
 
-    def test_schema_has_six_tables(self) -> None:
+    def test_schema_has_expected_tables(self) -> None:
         rows = self.db.conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
         ).fetchall()
         names = {r["name"] for r in rows}
         self.assertEqual(
             names,
-            {"users", "groups", "user_group_membership", "audit_log", "operation_log", "failed_attempts"},
+            {"users", "groups", "user_group_membership", "audit_log",
+             "operation_log", "failed_attempts", "schema_version"},
         )
 
     def test_foreign_key_cascade(self) -> None:
