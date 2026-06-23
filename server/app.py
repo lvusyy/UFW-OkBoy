@@ -141,12 +141,22 @@ def create_app(config_path: str = "config.yaml",
         user_id = user["id"]
 
         enabled_groups = db.get_user_groups(user_id, only_enabled=True)
+        enabled_groups_ports = {
+            grp["name"]: (grp["port"], grp["proto"]) for grp in enabled_groups
+        }
         old_ip = db.get_user_ip(username)
+
+        # Idempotent reconcile: align UFW rules with the user's enabled groups.
+        # Runs on BOTH the heartbeat path (IP unchanged) and the IP-change path,
+        # so any desync (recent join/leave, concurrent membership change, stale
+        # rules from a crashed knock, stale old-IP rules) is self-healed every
+        # knock. Fixes BUG-A/C; per-group proto preserved (fixes H-2).
+        ufw.reconcile_user_rules(username, client_ip, enabled_groups_ports)
 
         # IP unchanged - just refresh the timestamp
         if old_ip == client_ip:
             db.update_knock_time(user_id, client_ip)
-            logger.info("Knock: %s@%s (unchanged)", username, client_ip)
+            logger.info("Knock: %s@%s (unchanged, reconciled)", username, client_ip)
             return jsonify({
                 "ok": True,
                 "ip": client_ip,
@@ -154,14 +164,12 @@ def create_app(config_path: str = "config.yaml",
                 "message": "IP unchanged, heartbeat recorded",
             })
 
-        # IP changed - swap firewall rules for every enabled group
+        # IP changed - the reconcile above already added the new-ip rules;
+        # now remove rules bound to the old IP for every enabled group.
         if old_ip:
             for grp in enabled_groups:
                 ufw.remove_rule(old_ip, grp["port"], username, grp["proto"], grp["name"])
-            logger.info("Removed old rules for %s (was %s)", username, old_ip)
-
-        for grp in enabled_groups:
-            ufw.add_rule(client_ip, grp["port"], username, grp["proto"], grp["name"])
+            logger.info("Removed old-IP rules for %s (was %s)", username, old_ip)
 
         db.set_user_ip(user_id, client_ip)
         db.update_knock_time(user_id, client_ip)
@@ -211,8 +219,100 @@ def create_app(config_path: str = "config.yaml",
         return jsonify({
             "ok": True,
             "username": username,
+            "is_admin": bool(user and user["is_admin"]) if user else False,
             "enabled_groups": enabled_groups,
             **state,
+        })
+
+    @app.route("/api/me/groups", methods=["GET"])
+    def my_groups():
+        """Return the caller's groups with enabled flags (for self-authorization UI).
+
+        Each item: ``{id, name, port, proto, enabled}``. Both enabled and
+        disabled memberships are returned so the user can see / re-enable
+        previously-authorized groups. Groups the user has never been a member
+        of are NOT listed — those require admin grant.
+        """
+        username, err = _auth()
+        if err:
+            return jsonify({"ok": False, "error": err}), 401
+        user = db.get_user_by_username(username)
+        if not user:
+            return jsonify({"ok": False, "error": "User not found"}), 404
+        rows = db.conn.execute(
+            "SELECT g.id AS id, g.name AS name, g.port AS port, g.proto AS proto, "
+            "m.enabled AS enabled "
+            "FROM groups g JOIN user_group_membership m ON m.group_id = g.id "
+            "WHERE m.user_id=? ORDER BY g.name",
+            (user["id"],),
+        ).fetchall()
+        groups = [dict(r) for r in rows]
+        return jsonify({"ok": True, "username": username, "groups": groups})
+
+    @app.route("/api/me/membership/<int:group_id>", methods=["PATCH"])
+    def self_toggle_membership(group_id: int):
+        """Toggle the caller's own group membership (self-authorization).
+
+        Enforces the same VULN-A rule as the admin/self membership toggle: a
+        user may only re-enable a group they were previously authorized for
+        (admin grants new groups). Used by the group-authorization multi-select
+        UI so the client does not need to know its own user_id.
+        """
+        username, err = _auth()
+        if err:
+            return jsonify({"ok": False, "error": err}), 401
+        requester = db.get_user_by_username(username)
+        if not requester:
+            return jsonify({"ok": False, "error": "Authenticated user not found"}), 401
+
+        body = request.get_json(silent=True) or {}
+        enabled = body.get("enabled")
+        if not isinstance(enabled, bool):
+            return jsonify({
+                "ok": False, "error": "Request body must include 'enabled' (bool)",
+            }), 400
+
+        # Self-enable authorization check (VULN-A): re-enable only if the
+        # user was previously authorized for this group.
+        if enabled and not auth.is_admin(db, username):
+            if not auth.user_has_group_access(
+                db, username, group_id, allow_reenable=True,
+            ):
+                db.log_audit(
+                    username, "unauthorized_reenable_attempt",
+                    f"self/{group_id}", "self-enable of never-authorized group",
+                )
+                return jsonify({
+                    "ok": False,
+                    "error": "Forbidden: you may only re-enable a previously "
+                             "authorized group. Ask an admin to grant access.",
+                }), 403
+
+        group = db.get_group(group_id)
+        if not group:
+            return jsonify({"ok": False, "error": "Group not found"}), 404
+
+        db.set_membership_enabled(requester["id"], group_id, 1 if enabled else 0)
+
+        user_ip = requester["current_ip"]
+        if user_ip:
+            if not enabled:
+                ufw.remove_rule(
+                    user_ip, group["port"], requester["username"],
+                    group["proto"], group["name"],
+                )
+            else:
+                ufw.add_rule(
+                    user_ip, group["port"], requester["username"],
+                    group["proto"], group["name"],
+                )
+
+        db.log_audit(
+            username, "self_toggle_membership",
+            f"{requester['id']}/{group_id}", f"enabled={enabled}",
+        )
+        return jsonify({
+            "ok": True, "group_id": group_id, "enabled": enabled,
         })
 
     @app.route("/api/membership/<int:user_id>/<int:group_id>", methods=["PATCH"])
@@ -244,6 +344,23 @@ def create_app(config_path: str = "config.yaml",
                 "ok": False,
                 "error": "Request body must include 'enabled' (bool)",
             }), 400
+
+        # Self-enable authorization check (VULN-A): a non-admin user may only
+        # re-enable a group they were previously authorized for. Enabling a
+        # group they have never been granted requires an admin (join API).
+        if is_self and enabled and not auth.is_admin(db, username):
+            if not auth.user_has_group_access(
+                db, username, group_id, allow_reenable=True,
+            ):
+                db.log_audit(
+                    username, "unauthorized_reenable_attempt",
+                    f"{user_id}/{group_id}", "self-enable of never-authorized group",
+                )
+                return jsonify({
+                    "ok": False,
+                    "error": "Forbidden: you may only re-enable a group you were "
+                             "previously authorized for. Ask an admin to grant access.",
+                }), 403
 
         group = db.get_group(group_id)
         if not group:
@@ -354,7 +471,7 @@ def create_app(config_path: str = "config.yaml",
             return jsonify({"ok": False, "error": "User not found"}), 404
         if target["current_ip"]:
             for g in db.get_user_groups(user_id, only_enabled=True):
-                ufw.remove_rule(target["current_ip"], g["port"], target["username"], g["proto"])
+                ufw.remove_rule(target["current_ip"], g["port"], target["username"], g["proto"], g["name"])
         db.delete_user(user_id)
         db.log_audit(user["username"], "user_del", target["username"], None)
         return jsonify({"ok": True, "deleted": user_id})
@@ -384,14 +501,33 @@ def create_app(config_path: str = "config.yaml",
         if not name or port is None:
             return jsonify({"ok": False, "error": "name and port are required"}), 400
         proto = data.get("proto", "tcp")
+
+        # Port whitelist (VULN-B): when an admin explicitly configures
+        # `allowed_ports`, new groups may only bind to ports in that set.
+        # When NOT configured, no restriction is applied (backward compatible
+        # — admin opts into the whitelist by setting allowed_ports in config).
         try:
-            group_id = db.create_group(name, int(port), proto)
+            port_int = int(port)
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "error": "port must be an integer"}), 400
+        allowed_ports = cfg.get("allowed_ports")
+        if allowed_ports and port_int not in allowed_ports:
+            db.log_audit(
+                user["username"], "group_add_denied", name,
+                f"port {port_int} not in allowed_ports",
+            )
+            return jsonify({
+                "ok": False,
+                "error": f"Port {port_int} is not in the allowed_ports whitelist",
+            }), 400
+        try:
+            group_id = db.create_group(name, port_int, proto)
         except sqlite3.IntegrityError:
             return jsonify({"ok": False, "error": f"Group '{name}' already exists"}), 409
-        db.log_audit(user["username"], "group_add", name, f"port={port} proto={proto}")
+        db.log_audit(user["username"], "group_add", name, f"port={port_int} proto={proto}")
         return jsonify({
             "ok": True, "id": group_id, "name": name,
-            "port": int(port), "proto": proto,
+            "port": port_int, "proto": proto,
         }), 201
 
     @app.route("/api/admin/groups/<int:group_id>", methods=["DELETE"])
@@ -407,7 +543,7 @@ def create_app(config_path: str = "config.yaml",
             return jsonify({"ok": False, "error": "Group not found"}), 404
         for m in db.get_group_members(group_id):
             if m["current_ip"]:
-                ufw.remove_rule(m["current_ip"], group["port"], m["username"], group["proto"])
+                ufw.remove_rule(m["current_ip"], group["port"], m["username"], group["proto"], group["name"])
         db.delete_group(group_id)
         db.log_audit(user["username"], "group_del", group["name"], None)
         return jsonify({"ok": True, "deleted": group_id})
@@ -432,11 +568,53 @@ def create_app(config_path: str = "config.yaml",
             return jsonify({"ok": False, "error": "Group not found"}), 404
         enabled = 1 if data.get("enabled", True) else 0
         db.add_membership(user_id, int(group_id), enabled=enabled)
+        # Immediate UFW sync: if the target user is online, open the port now.
+        target_ip = target["current_ip"]
+        if target_ip and enabled:
+            ufw.add_rule(
+                target_ip, group["port"], target["username"],
+                group["proto"], group["name"],
+            )
         db.log_audit(user["username"], "user_join", target["username"], group["name"])
         return jsonify({
             "ok": True, "user_id": user_id,
             "group_id": int(group_id), "enabled": enabled,
         }), 201
+
+    @app.route("/api/admin/memberships/remove", methods=["POST"])
+    def admin_remove_membership():
+        """Remove a user from a group and clean up the UFW rule (admin only)."""
+        user, err = auth.require_admin(
+            db, request.headers.get("Authorization"), ttl, _client_ip(),
+        )
+        if err:
+            return _admin_error_response(err)
+        data = request.get_json(force=True, silent=True) or {}
+        target = db.get_user_by_username(data.get("username", ""))
+        group = db.get_group_by_name(data.get("group_name", ""))
+        if not target:
+            return jsonify({"ok": False, "error": "User not found"}), 404
+        if not group:
+            return jsonify({"ok": False, "error": "Group not found"}), 404
+        db.remove_membership(target["id"], group["id"])
+        # Immediate UFW cleanup: if the target user is online, remove the rule.
+        target_ip = target["current_ip"]
+        if target_ip:
+            ufw.remove_rule(
+                target_ip, group["port"], target["username"],
+                group["proto"], group["name"],
+            )
+        db.log_audit(
+            user["username"], "remove_membership",
+            target["username"], group["name"],
+        )
+        logger.info(
+            "Membership removed: user=%s group=%s by %s",
+            target["username"], group["name"], user["username"],
+        )
+        return jsonify({
+            "ok": True, "user_id": target["id"], "group_id": group["id"],
+        })
 
     return app
 
@@ -517,7 +695,13 @@ def cmd_cleanup(args):
         db=db,
     )
     max_age = args.max_age * 86400  # days -> seconds
-    removed = ufw.cleanup_stale(max_age, cfg["protected_ports"], cfg.get("proto", "tcp"))
+    # Drive cleanup from each user's actual enabled group ports (ORPHAN-A),
+    # so rules on custom group ports are removed too — not just protected_ports.
+    user_group_ports = db.get_all_user_group_ports(only_enabled=True)
+    removed = ufw.cleanup_stale(
+        max_age, user_group_ports=user_group_ports,
+        ports=cfg["protected_ports"], proto=cfg.get("proto", "tcp"),
+    )
     if removed:
         print(f"Cleaned up {len(removed)} stale user(s): {', '.join(removed)}")
     else:
@@ -533,7 +717,13 @@ def cmd_sync(args):
         rule_prefix=cfg.get("rule_prefix", "ufw-okboy"),
         db=db,
     )
-    recovered = ufw.sync_state_from_ufw(cfg["protected_ports"])
+    # Reconcile recovered rules against each user's enabled groups (ORPHAN-B):
+    # rules for disabled groups are removed, leaving UFW consistent with DB.
+    user_group_ports = db.get_all_user_group_ports(only_enabled=True)
+    recovered = ufw.sync_state_from_ufw(
+        cfg["protected_ports"], user_group_ports=user_group_ports,
+        proto=cfg.get("proto", "tcp"),
+    )
     if recovered:
         print(f"Recovered {len(recovered)} user(s) from UFW rules:")
         for name, data in recovered.items():
@@ -563,7 +753,7 @@ def cmd_user_del(args):
         return
     if user["current_ip"]:
         for g in db.get_user_groups(user["id"], only_enabled=True):
-            ufw.remove_rule(user["current_ip"], g["port"], args.username, g["proto"])
+            ufw.remove_rule(user["current_ip"], g["port"], args.username, g["proto"], g["name"])
     db.delete_user(user["id"])
     db.log_audit("cli", "user_del", args.username, None)
     print(f"Deleted user '{args.username}'.")
@@ -606,7 +796,7 @@ def cmd_group_del(args):
         return
     for m in db.get_group_members(group["id"]):
         if m["current_ip"]:
-            ufw.remove_rule(m["current_ip"], group["port"], m["username"], group["proto"])
+            ufw.remove_rule(m["current_ip"], group["port"], m["username"], group["proto"], group["name"])
     db.delete_group(group["id"])
     db.log_audit("cli", "group_del", args.name, None)
     print(f"Deleted group '{args.name}'.")
@@ -629,6 +819,7 @@ def cmd_user_join(args):
     """Add a user to a group."""
     cfg = load_config(args.config)
     db = open_database(cfg)
+    ufw = UFWManager(rule_prefix=cfg.get("rule_prefix", "ufw-okboy"), db=db)
     user = db.get_user_by_username(args.username)
     group = db.get_group_by_name(args.groupname)
     if not user:
@@ -638,6 +829,13 @@ def cmd_user_join(args):
         print(f"Group '{args.groupname}' not found.")
         return
     db.add_membership(user["id"], group["id"])
+    # Immediate UFW sync: if the user is online, open the port now.
+    current_ip = user["current_ip"]
+    if current_ip:
+        ufw.add_rule(
+            current_ip, group["port"], args.username,
+            group["proto"], group["name"],
+        )
     db.log_audit("cli", "user_join", args.username, args.groupname)
     print(f"Added '{args.username}' to group '{args.groupname}'.")
 
@@ -656,7 +854,7 @@ def cmd_user_leave(args):
         print(f"Group '{args.groupname}' not found.")
         return
     if user["current_ip"]:
-        ufw.remove_rule(user["current_ip"], group["port"], args.username, group["proto"])
+        ufw.remove_rule(user["current_ip"], group["port"], args.username, group["proto"], group["name"])
     db.remove_membership(user["id"], group["id"])
     db.log_audit("cli", "user_leave", args.username, args.groupname)
     print(f"Removed '{args.username}' from group '{args.groupname}'.")
