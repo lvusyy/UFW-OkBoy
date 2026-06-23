@@ -206,10 +206,16 @@ class Database:
     # ------------------------------------------------------------------ #
 
     def add_membership(self, user_id: int, group_id: int, enabled: int = 1) -> None:
-        """Add a user to a group, ignoring if already a member."""
+        """Add a user to a group, or re-enable a previously disabled membership.
+
+        Uses UPSERT (ON CONFLICT) so that re-joining a group the user was
+        previously disabled from resets ``enabled=1`` instead of being
+        silently ignored by INSERT OR IGNORE (fixes ORPHAN-C).
+        """
         self.conn.execute(
-            "INSERT OR IGNORE INTO user_group_membership (user_id, group_id, enabled) "
-            "VALUES (?, ?, ?)",
+            "INSERT INTO user_group_membership (user_id, group_id, enabled) "
+            "VALUES (?, ?, ?) "
+            "ON CONFLICT(user_id, group_id) DO UPDATE SET enabled=excluded.enabled",
             (user_id, group_id, enabled),
         )
         self.conn.commit()
@@ -221,6 +227,14 @@ class Database:
             (user_id, group_id),
         )
         self.conn.commit()
+
+    def membership_exists(self, user_id: int, group_id: int) -> bool:
+        """Return True if a membership row exists (enabled or disabled)."""
+        row = self.conn.execute(
+            "SELECT 1 FROM user_group_membership WHERE user_id=? AND group_id=?",
+            (user_id, group_id),
+        ).fetchone()
+        return row is not None
 
     def set_membership_enabled(self, user_id: int, group_id: int, enabled: int) -> None:
         """Toggle the enabled flag on an existing membership."""
@@ -250,6 +264,44 @@ class Database:
             "WHERE m.group_id=? ORDER BY u.username",
             (group_id,),
         ).fetchall()
+
+    def get_user_enabled_groups_ports(self, user_id: int) -> dict:
+        """Return ``{group_name: (port, proto)}`` for the user's enabled memberships.
+
+        Used by the knock reconcile path to align UFW rules with the user's
+        currently authorized (enabled) groups (per-group proto preserved).
+        """
+        rows = self.conn.execute(
+            "SELECT g.name AS name, g.port AS port, g.proto AS proto FROM groups g "
+            "JOIN user_group_membership m ON m.group_id = g.id "
+            "WHERE m.user_id=? AND m.enabled=1",
+            (user_id,),
+        ).fetchall()
+        return {row["name"]: (row["port"], row["proto"]) for row in rows}
+
+    def get_all_user_group_ports(self, only_enabled: bool = True) -> dict:
+        """Return ``{username: [(group_name, port, proto), ...]}`` for all users.
+
+        Used by cleanup/sync to drive UFW reconciliation from each user's
+        actual (enabled) group ports (with per-group proto) instead of the
+        legacy protected_ports.
+        """
+        sql = (
+            "SELECT u.username AS username, g.name AS group_name, "
+            "g.port AS port, g.proto AS proto "
+            "FROM users u "
+            "JOIN user_group_membership m ON m.user_id = u.id "
+            "JOIN groups g ON g.id = m.group_id"
+        )
+        if only_enabled:
+            sql += " WHERE m.enabled=1"
+        sql += " ORDER BY u.username, g.name"
+        result: dict[str, list[tuple[str, int, str]]] = {}
+        for row in self.conn.execute(sql).fetchall():
+            result.setdefault(row["username"], []).append(
+                (row["group_name"], row["port"], row["proto"])
+            )
+        return result
 
     # ------------------------------------------------------------------ #
     #  Logging helpers
