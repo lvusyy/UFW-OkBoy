@@ -8,14 +8,20 @@
 
 set -euo pipefail
 
-VERSION="${1:-}"
-OUTPUT_DIR="${2:-dist}"
-
-if [[ -z "$VERSION" ]]; then
+# Version: explicit arg first, else read from repo-root VERSION file (single
+# source of truth). Allows `bash build-release.sh` with no args.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+if [[ -n "${1:-}" ]]; then
+    VERSION="$1"
+elif [[ -f "$REPO_DIR/VERSION" ]]; then
+    VERSION="v$(tr -d '[:space:]' < "$REPO_DIR/VERSION")"
+else
     echo "Usage: bash build-release.sh <version> [output_dir]"
-    echo "Example: bash build-release.sh v2.0.0"
+    echo "Example: bash build-release.sh v2.1.0   (or create a VERSION file)"
     exit 1
 fi
+OUTPUT_DIR="${2:-dist}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -68,6 +74,9 @@ cp "$REPO_DIR/README.md" "$PKG_DIR/" 2>/dev/null || true
 cp "$REPO_DIR/README.en.md" "$PKG_DIR/" 2>/dev/null || true
 cp "$REPO_DIR/GUIDE.md" "$PKG_DIR/" 2>/dev/null || true
 cp "$REPO_DIR/CLAUDE.md" "$PKG_DIR/" 2>/dev/null || true
+
+# Copy VERSION file so installed app can report its version (for upgrade checks)
+cp "$REPO_DIR/VERSION" "$PKG_DIR/" 2>/dev/null || true
 
 # Create a simple install.sh wrapper in the package root
 cat > "$PKG_DIR/install.sh" << 'INSTALLEOF'

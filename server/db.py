@@ -16,6 +16,12 @@ logger = logging.getLogger("ufw-okboy.db")
 
 
 SCHEMA: dict[str, str] = {
+    "schema_version": """
+        CREATE TABLE schema_version (
+            version INTEGER PRIMARY KEY,
+            applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+    """,
     "users": """
         CREATE TABLE users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -79,6 +85,18 @@ SCHEMA: dict[str, str] = {
 }
 
 
+# ── Schema migration registry ─────────────────────────────────────── #
+# Each entry: (version, description). The Database.run_migrations() method
+# applies pending migrations in order, recording each in schema_version.
+# Version 1 = the baseline 6-table schema (users/groups/membership/logs/...).
+# The legacy JSON→SQLite import is migration v0→v1 (first-run only).
+MIGRATIONS: list[tuple[int, str]] = [
+    (1, "baseline 6-table schema + legacy JSON import"),
+]
+
+CURRENT_SCHEMA_VERSION: int = MIGRATIONS[-1][0]
+
+
 class Database:
     """SQLite-backed persistence for UFW OkBoy.
 
@@ -102,12 +120,15 @@ class Database:
     # ------------------------------------------------------------------ #
 
     def init(self) -> None:
-        """Create all tables if they do not already exist."""
+        """Create all tables if they do not already exist, then run migrations."""
         for name, ddl in SCHEMA.items():
             if self._table_exists(name):
                 continue
             self.conn.execute(ddl)
         self.conn.commit()
+        # Run any pending schema migrations (records baseline v1 for
+        # pre-existing DBs, runs v0→v1 JSON import for fresh DBs).
+        self.run_migrations()
 
     def _table_exists(self, name: str) -> bool:
         """Return True if a table named *name* already exists."""
@@ -116,6 +137,63 @@ class Database:
             (name,),
         ).fetchone()
         return row is not None
+
+    def get_schema_version(self) -> int:
+        """Return the highest applied schema version, or 0 if none recorded.
+
+        Ensures the schema_version table exists first (a pre-v2.1 DB upgraded
+        in place may have the 6 data tables but not this tracking table).
+        """
+        if not self._table_exists("schema_version"):
+            self.conn.execute(SCHEMA["schema_version"])
+            self.conn.commit()
+        row = self.conn.execute(
+            "SELECT MAX(version) AS v FROM schema_version",
+        ).fetchone()
+        return int(row["v"]) if row and row["v"] is not None else 0
+
+    def _record_migration(self, version: int) -> None:
+        """Record that *version* has been applied."""
+        self.conn.execute(
+            "INSERT OR IGNORE INTO schema_version (version) VALUES (?)",
+            (version,),
+        )
+        self.conn.commit()
+
+    def run_migrations(self) -> list[int]:
+        """Apply pending schema migrations in order.
+
+        Migration logic:
+        - If the DB is empty (no users) AND no schema_version recorded: this is a
+          fresh install. The legacy migrate_from_json (v0→v1) is expected to be
+          called separately by open_database() for first-run seeding; here we
+          just record baseline v1 so it is not re-run.
+        - If the DB has the 6-table schema but no schema_version row (a pre-v2.1
+          install upgraded in place): record baseline v1 WITHOUT re-running the
+          JSON import, avoiding duplicate user/group seeding.
+        - Apply each pending migration > current version.
+
+        Returns the list of versions applied (empty if already current).
+        """
+        current = self.get_schema_version()
+        applied: list[int] = []
+        for version, _desc in MIGRATIONS:
+            if version <= current:
+                continue
+            # v1 baseline: the 6 tables already exist (created by init() or
+            # pre-existing). Just record it; do NOT re-seed from JSON here —
+            # migrate_from_json is invoked by open_database() only on truly
+            # empty DBs. This guard prevents duplicate seeding of existing DBs.
+            if version == 1:
+                self._record_migration(version)
+                applied.append(version)
+                continue
+            # Future migrations (v2+) would dispatch to specific methods here.
+            self._record_migration(version)
+            applied.append(version)
+        if applied:
+            logger.info("DB migrations applied: %s (now at v%d)", applied, self.get_schema_version())
+        return applied
 
     def close(self) -> None:
         """Close the underlying connection."""

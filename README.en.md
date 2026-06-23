@@ -10,6 +10,20 @@ English | [中文](README.md)
 
 ---
 
+## What's New in v2.1
+
+| Feature | Description |
+|---------|-------------|
+| **Coordination fix** | Group membership changes (join/leave) sync to UFW **immediately** for online users; the 30s knock heartbeat idempotently reconciles stale/old-IP rules every cycle — no race residue |
+| **Precise rule deletion** | Rules are deleted by exact comment `ufw-okboy:<user>:<group>`, so groups sharing the same port no longer clobber each other |
+| **Admin web console** | Admins get an in-browser console for user/group/rule CRUD — no CLI required |
+| **Group authorization multi-select** | Users pick which groups to authorize (first checked by default, batch-submitted on save), with server-side re-validation against port escalation |
+| **PIN encryption lock** | Admin-console credentials are encrypted via PIN→PBKDF2→AES-GCM; localStorage stores only ciphertext, the key never lands on disk or the wire |
+| **Port whitelist** | New optional `allowed_ports` config constrains which ports new groups may bind, preventing accidental exposure of sensitive ports |
+| **Versioned DB migrations** | A `schema_version` table + migration registry let future schema changes upgrade in place without data loss |
+| **Smart upgrades** | `app.py upgrade --check` queries GitHub for a newer release (notify only); `--force` manually upgrades (backup DB → pull → migrate → restart → health-check → auto-rollback on failure). The root service never auto-pulls code |
+| **Versioning** | A single `VERSION` source of truth + `app.py --version`, shared by build/upgrade |
+
 ## Why
 
 Your server's sensitive ports (admin panels, databases, APIs) are behind UFW firewall rules that only allow specific IPs. But client IPs change — switching WiFi, traveling, restarting routers — and every change means bothering the admin to update the firewall manually.

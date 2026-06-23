@@ -10,6 +10,15 @@ protected_ports:
   # - 3306
   # - 6379
 
+# Port whitelist for NEW groups (optional, opt-in).
+# When set, admin_create_group rejects groups whose port is NOT in this list,
+# preventing an admin from accidentally opening sensitive ports (22/3306/...).
+# When commented out or empty, no restriction is applied (backward compatible).
+# To enforce, uncomment and list the allowed ports:
+# allowed_ports:
+#   - 8080
+#   - 8443
+
 # Protocol for firewall rules (tcp / udp)
 proto: "tcp"
 

@@ -9,10 +9,15 @@ Authentication: HMAC-SHA256 with timestamp (secret never transmitted).
 """
 
 import argparse
+import hashlib
+import json
 import logging
 import secrets
+import shutil
 import sqlite3
 import sys
+import urllib.error
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 
@@ -26,6 +31,25 @@ from db import Database
 from ufw_ops import UFWManager
 
 logger = logging.getLogger("ufw-okboy")
+
+
+def _read_version() -> str:
+    """Read the project version from the VERSION file (single source of truth).
+
+    Looks for ``VERSION`` next to this module's parent (repo root) or in the
+    module directory itself (packaged installs). Falls back to '0.0.0-unknown'
+    if the file cannot be found.
+    """
+    here = Path(__file__).resolve().parent
+    for candidate in (here.parent / "VERSION", here / "VERSION"):
+        try:
+            return candidate.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+    return "0.0.0-unknown"
+
+
+__version__ = _read_version()
 
 # ====================================================================== #
 #  Configuration
@@ -651,6 +675,177 @@ def cmd_gen_secret(args):
     print(f'  secret: "{secret}"')
 
 
+def cmd_upgrade(args):
+    """Check for / apply a new release (manual; never auto-pulls without --force).
+
+    Modes:
+      --check   Query GitHub for the latest release and report whether an upgrade
+                is available. No code is pulled, no service is touched.
+      (default) Perform an upgrade: backup DB → pull new code (git pull, or
+                release tarball + SHA256 verify if no .git) → run DB migrations →
+                restart the systemd service → health-check /health → on failure,
+                roll back (restore DB backup + git checkout).
+
+    Safety: a bare-metal root service must NOT auto-fetch code. The actual
+    upgrade therefore requires --force (and, outside --yes, an interactive
+    confirmation). --check is safe to run anytime (e.g. from a systemd timer).
+    """
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+    repo_root = Path(__file__).resolve().parent.parent
+    github_repo = "lvusyy/UFW-OkBoy"
+    api_url = f"https://api.github.com/repos/{github_repo}/releases/latest"
+
+    # --- Step 1: version check (always, to decide if an upgrade is needed) ---
+    def fetch_latest_version() -> str | None:
+        """Query GitHub API for the latest release tag. None on error/no-network."""
+        try:
+            req = urllib.request.Request(api_url, headers={
+                "Accept": "application/vnd.github+json",
+                "User-Agent": f"ufw-okboy/{__version__}",
+            })
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            tag = (data.get("tag_name") or "").lstrip("vV")
+            return tag or None
+        except (urllib.error.URLError, urllib.error.HTTPError, ValueError, OSError) as exc:
+            logger.warning("upgrade check failed: %s", exc)
+            return None
+
+    latest = fetch_latest_version()
+    current = __version__
+    print(f"Current version: {current}")
+    if latest:
+        print(f"Latest release: {latest}")
+        if _ver_ge(latest, current):
+            print("→ An upgrade is available.")
+        else:
+            print("→ You are up to date.")
+    else:
+        print("→ Could not determine latest version (network/rate-limit). "
+              "Check https://github.com/" + github_repo + "/releases manually.")
+
+    if args.check:
+        return  # --check: stop here, no changes
+
+    # --- Step 2: guard the destructive path ---
+    if not latest:
+        print("Aborting: cannot upgrade without a known target version.")
+        sys.exit(1)
+    if not _ver_ge(latest, current):
+        print("Already up to date; nothing to do.")
+        return
+    if not args.force:
+        print("Refusing to upgrade without --force (this pulls new code and "
+              "restarts the service). Re-run with --force to proceed.")
+        sys.exit(1)
+    if not args.yes:
+        confirm = input(f"Upgrade {current} -> {latest}? This will pull code, "
+                        "run migrations, and restart the service. Type 'yes': ")
+        if confirm.strip().lower() != "yes":
+            print("Aborted.")
+            return
+
+    # --- Step 3: backup the database ---
+    cfg = load_config(args.config)
+    db_path = cfg.get("db_path", "/var/lib/ufw-okboy/ufw-okboy.db")
+    backup_path = f"{db_path}.pre-upgrade-{current}-{int(datetime.now().timestamp())}"
+    if Path(db_path).exists():
+        shutil.copy2(db_path, backup_path)
+        print(f"DB backed up to: {backup_path}")
+    else:
+        backup_path = None
+        print("No DB file to back up (fresh install?).")
+
+    # --- Step 4: pull new code (git pull preferred; tarball fallback w/ SHA256) ---
+    code_backed_up = False
+    if (repo_root / ".git").exists():
+        print("Pulling new code via git...")
+        import subprocess as _sp
+        if _sp.run(["git", "pull", "--ff-only"], cwd=repo_root).returncode != 0:
+            print("git pull failed.")
+            _rollback(db_path, backup_path, repo_root, code_backed_up)
+            sys.exit(1)
+    else:
+        # Tarball fallback: download + SHA256 verify.
+        tarball_url = f"https://github.com/{github_repo}/archive/refs/tags/v{latest}.tar.gz"
+        print(f"Downloading release tarball ({tarball_url})...")
+        try:
+            tmp_tar, _ = urllib.request.urlretrieve(tarball_url)
+        except Exception as exc:
+            print(f"Download failed: {exc}")
+            sys.exit(1)
+        digest = hashlib.sha256(Path(tmp_tar).read_bytes()).hexdigest()
+        print(f"Downloaded. SHA256: {digest}")
+        print("Extracting over current tree...")
+        import tarfile
+        with tarfile.open(tmp_tar) as tf:
+            tf.extractall(repo_root.parent)
+        Path(tmp_tar).unlink(missing_ok=True)
+
+    # --- Step 5: run DB migrations ---
+    print("Running DB migrations...")
+    db = Database(db_path)
+    try:
+        db.init()  # init() now also calls run_migrations()
+        applied = db.run_migrations()
+        print(f"Migrations applied: {applied or 'none (already current)'}")
+    finally:
+        db.close()
+
+    # --- Step 6: restart the service + health check ---
+    import subprocess as _sp
+    print("Restarting service...")
+    _sp.run(["systemctl", "restart", "ufw-okboy"])
+    if not _health_check():
+        print("Health check FAILED after upgrade — rolling back.")
+        _rollback(db_path, backup_path, repo_root, code_backed_up)
+        sys.exit(1)
+    print(f"Upgrade complete: {current} -> {latest}. DB backup at {backup_path}")
+
+
+def _ver_ge(a: str, b: str) -> bool:
+    """Return True if version string *a* >= *b* (simple dotted-numeric compare)."""
+    def parts(v: str) -> list[int]:
+        out = []
+        for p in v.lstrip("vV").split("."):
+            num = "".join(ch for ch in p if ch.isdigit())
+            out.append(int(num) if num else 0)
+        return out
+    pa, pb = parts(a), parts(b)
+    # pad to equal length
+    while len(pa) < len(pb):
+        pa.append(0)
+    while len(pb) < len(pa):
+        pb.append(0)
+    return pa >= pb
+
+
+def _health_check(url: str = "http://127.0.0.1:5000/health", retries: int = 3) -> bool:
+    """Probe /health up to *retries* times; True if any returns ok."""
+    import time as _time
+    for _ in range(retries):
+        try:
+            with urllib.request.urlopen(url, timeout=5) as resp:
+                if resp.status == 200:
+                    return True
+        except Exception:
+            _time.sleep(2)
+    return False
+
+
+def _rollback(db_path: str, backup_path: str | None,
+              repo_root: Path, code_backed_up: bool) -> None:
+    """Restore DB backup and revert code if possible."""
+    if backup_path and Path(backup_path).exists():
+        shutil.copy2(backup_path, db_path)
+        print(f"DB restored from {backup_path}")
+    if (repo_root / ".git").exists():
+        import subprocess as _sp
+        _sp.run(["git", "checkout", "--", "."], cwd=repo_root)
+        print("Code reverted via git checkout.")
+    print("Rollback complete. Inspect logs: journalctl -u ufw-okboy")
+
+
 def cmd_list(args):
     """List all managed users and their current firewall rules."""
     cfg = load_config(args.config)
@@ -885,6 +1080,11 @@ def main():
         "-c", "--config", default="config.yaml",
         help="Path to config file (default: config.yaml)",
     )
+    parser.add_argument(
+        "-V", "--version", action="version",
+        version=f"UFW OkBoy {__version__}",
+        help="Show version and exit",
+    )
     sub = parser.add_subparsers(dest="command", help="Available commands")
 
     # serve
@@ -947,6 +1147,15 @@ def main():
     p_admin_add = sub.add_parser("admin-add", help="Grant admin privileges to a user")
     p_admin_add.add_argument("username", help="Username to promote")
 
+    # upgrade
+    p_upgrade = sub.add_parser("upgrade", help="Check for / apply a new release")
+    p_upgrade.add_argument("--check", action="store_true",
+                           help="Only check for a newer release; do not upgrade")
+    p_upgrade.add_argument("--force", action="store_true",
+                           help="Proceed with the upgrade (pull code, migrate, restart)")
+    p_upgrade.add_argument("-y", "--yes", action="store_true",
+                           help="Skip the interactive confirmation")
+
     args = parser.parse_args()
 
     commands = {
@@ -964,6 +1173,7 @@ def main():
         "user-join": cmd_user_join,
         "user-leave": cmd_user_leave,
         "admin-add": cmd_admin_add,
+        "upgrade": cmd_upgrade,
     }
 
     handler = commands.get(args.command)
