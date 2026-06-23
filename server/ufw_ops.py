@@ -68,24 +68,142 @@ class UFWManager:
         )
         logger.info("Added rule: %s -> port %s/%s (%s)", ip, port, proto, comment)
 
+    def list_rules_by_comment(self, comment_prefix: str) -> list[dict]:
+        """Return UFW rules whose comment starts with *comment_prefix*.
+
+        Parses ``ufw status numbered`` output. Each returned item is::
+
+            {"number": int, "ip": str, "port": int, "proto": str, "comment": str}
+
+        Rules without a number (very old UFW) or failing to parse are
+        skipped. Returns an empty list if the numbered view is unavailable.
+        """
+        try:
+            output = subprocess.run(
+                ["ufw", "status", "numbered"], capture_output=True,
+                text=True, timeout=15, check=False,
+            ).stdout
+        except Exception:
+            return []
+
+        # Lines look like:
+        # [ 1] 22/tcp                     ALLOW IN    1.2.3.4        # ufw-okboy:alice:web
+        line_re = re.compile(
+            r"^\s*\[\s*(?P<num>\d+)\s*\]\s+"
+            r"(?P<port>\d+)/(?P<proto>\w+)\s+ALLOW\s+IN?\s+(?P<ip>\S+)"
+            r"(?:\s+#\s*(?P<comment>.*))?\s*$"
+        )
+        rules: list[dict] = []
+        for line in output.splitlines():
+            m = line_re.match(line)
+            if not m:
+                continue
+            comment = (m.group("comment") or "").strip()
+            if not comment.startswith(comment_prefix):
+                continue
+            rules.append({
+                "number": int(m.group("num")),
+                "ip": m.group("ip"),
+                "port": int(m.group("port")),
+                "proto": m.group("proto"),
+                "comment": comment,
+            })
+        return rules
+
     def remove_rule(self, ip: str, port: int, username: str, proto: str = "tcp",
                     group: str | None = None) -> None:
         """Remove a specific UFW rule. Logs warning if rule doesn't exist.
 
-        Uses ``--force`` to suppress the interactive confirmation prompt
-        that ``ufw delete`` would otherwise display.  *group* is accepted
-        for symmetry with :meth:`add_rule` and used only in the log line;
-        UFW deletion matches on ip/port/proto, not on the comment.
+        *group* is accepted for symmetry with :meth:`add_rule`. When provided,
+        the full comment ``<prefix>:<username>:<group>`` is matched precisely
+        via :meth:`list_rules_by_comment` so that rules of other groups sharing
+        the same ip/port/proto are NOT removed (fixes cross-group collision).
+
+        Falls back to the legacy ip/port/proto match when the numbered view is
+        unavailable or no comment match is found — callers relying on
+        :meth:`reconcile_user_rules` will re-add any needed rules afterwards.
         """
+        comment = f"{self.rule_prefix}:{username}"
+        if group:
+            comment = f"{comment}:{group}"
+
+        # Precise path: locate the numbered rule whose comment matches exactly.
+        for rule in self.list_rules_by_comment(comment):
+            if (rule["ip"] == ip and rule["port"] == port
+                    and rule["proto"] == proto and rule["comment"] == comment):
+                try:
+                    self._run_ufw("--force", "delete", str(rule["number"]))
+                    logger.info(
+                        "Removed rule (precise): %s -> port %s/%s (%s)",
+                        ip, port, proto, comment,
+                    )
+                    return
+                except RuntimeError:
+                    break  # fall through to legacy path
+
+        # Legacy / fallback path: match by ip/port/proto only.
         try:
             self._run_ufw(
                 "--force", "delete", "allow", "from", ip,
                 "to", "any", "port", str(port), "proto", proto,
             )
-            label = f"{self.rule_prefix}:{username}" + (f":{group}" if group else "")
-            logger.info("Removed rule: %s -> port %s/%s (%s)", ip, port, proto, label)
+            logger.info("Removed rule: %s -> port %s/%s (%s)", ip, port, proto, comment)
         except RuntimeError:
             logger.warning("Rule removal failed (may not exist): %s -> %s/%s", ip, port, proto)
+
+    def reconcile_user_rules(self, username: str, client_ip: str,
+                             enabled_groups: dict[str, tuple[int, str]]) -> dict:
+        """Idempotently align UFW rules with the user's *enabled_groups*.
+
+        *enabled_groups* maps ``group_name -> (port, proto)`` for the groups the
+        user is currently authorized to access. For each, an allow rule is added
+        if missing (comment ``<prefix>:<username>:<group>``). Then all current
+        rules for this user are scanned in a SINGLE ``ufw status numbered`` pass
+        (not per-group — avoids N+1 subprocess calls), and any rule is removed when
+        EITHER its group is no longer enabled OR its recorded IP differs from
+        *client_ip* — repairing cross-group collisions, stale memberships,
+        concurrent membership changes, AND stale old-IP rules for enabled groups.
+
+        Returns ``{"added": [...], "removed": [...]}`` (group names).
+        """
+        added: list[str] = []
+        removed: list[str] = []
+
+        # Single pass: fetch all of this user's rules once (fixes N+1).
+        prefix = f"{self.rule_prefix}:{username}:"
+        user_rules = self.list_rules_by_comment(prefix)
+        existing = {(r["ip"], r["port"], r["proto"], r["comment"]): r for r in user_rules}
+
+        # Add missing rules for every enabled group (per-group proto preserved).
+        for group_name, (port, proto) in enabled_groups.items():
+            comment = f"{prefix}{group_name}"
+            if (client_ip, port, proto, comment) not in existing:
+                self.add_rule(client_ip, port, username, proto, group_name)
+                added.append(group_name)
+
+        # Remove rules that are stale: group no longer enabled, OR bound to an
+        # old IP (stale old-IP rule for an enabled group also gets cleaned up).
+        enabled_names = set(enabled_groups.keys())
+        for rule in user_rules:
+            suffix = rule["comment"][len(prefix):]
+            group_name = suffix.split(":", 1)[0] if suffix else ""
+            stale = (group_name not in enabled_names) or (rule["ip"] != client_ip)
+            if group_name and stale:
+                try:
+                    self._run_ufw("--force", "delete", str(rule["number"]))
+                    removed.append(group_name)
+                except RuntimeError:
+                    logger.warning(
+                        "reconcile: failed to remove stale rule %s (%s)",
+                        rule["number"], rule["comment"],
+                    )
+
+        if added or removed:
+            logger.info(
+                "Reconciled rules for %s@%s: added=%s removed=%s",
+                username, client_ip, added, removed,
+            )
+        return {"added": added, "removed": removed}
 
     # ------------------------------------------------------------------ #
     #  User state queries
@@ -154,14 +272,26 @@ class UFWManager:
     #  Maintenance
     # ------------------------------------------------------------------ #
 
-    def cleanup_stale(self, max_age_seconds: int, ports: list[int],
+    def cleanup_stale(self, max_age_seconds: int,
+                      user_group_ports: dict[str, list[tuple[str, int]]] | None = None,
+                      ports: list[int] | None = None,
                       proto: str = "tcp") -> list[str]:
         """Remove firewall rules for users who haven't knocked within *max_age_seconds*.
+
+        *user_group_ports* maps ``username -> [(group_name, port), ...]`` from
+        each user's actual enabled groups (the caller — app.py — builds it from
+        the DB). When provided, cleanup only removes rules for the ports the
+        user is actually authorized for, avoiding orphaned rules on custom
+        group ports that ``protected_ports`` would miss (fixes ORPHAN-A).
+
+        Falls back to the flat *ports* list (legacy protected_ports) only when
+        *user_group_ports* is not provided, preserving backward compatibility.
 
         Returns list of removed usernames.
         """
         now = int(time.time())
         removed: list[str] = []
+        legacy_ports = ports or []
 
         for user in self.db.list_users():
             last_knock = user["last_knock"]
@@ -171,8 +301,14 @@ class UFWManager:
                 ip = user["current_ip"]
                 username = user["username"]
                 if ip:
-                    for port in ports:
-                        self.remove_rule(ip, port, username, proto)
+                    if user_group_ports is not None:
+                        # Remove rules only for the user's actual group ports
+                        # (per-group proto preserved, group passed for precise delete).
+                        for group_name, port, gproto in user_group_ports.get(username, []):
+                            self.remove_rule(ip, port, username, gproto, group_name)
+                    else:
+                        for port in legacy_ports:
+                            self.remove_rule(ip, port, username, proto)
                 self.db.clear_user_state(user["id"])
                 removed.append(username)
                 logger.info(
@@ -196,12 +332,19 @@ class UFWManager:
             if self.rule_prefix in line
         ]
 
-    def sync_state_from_ufw(self, ports: list[int]) -> dict:
+    def sync_state_from_ufw(self, ports: list[int],
+                            user_group_ports: dict[str, list[tuple[str, int]]] | None = None,
+                            proto: str = "tcp") -> dict:
         """Recover user IPs by parsing current UFW rules into the database.
 
         Useful if the DB state is lost but UFW rules still exist. Only
         users already present in the DB can be updated; unknown usernames
         are logged as warnings.
+
+        When *user_group_ports* (``username -> [(group_name, port), ...]`` of
+        ENABLED groups) is provided, each recovered user's rules are reconciled
+        against their currently-enabled groups: rules for disabled groups are
+        removed, so UFW ends up consistent with DB enabled state (fixes ORPHAN-B).
         """
         pattern = re.compile(
             rf"ALLOW\s+IN?\s+(\S+)\s+.*#\s*{re.escape(self.rule_prefix)}:([^:\s]+)(?::([^:\s]+))?"
@@ -215,20 +358,33 @@ class UFWManager:
 
         recovered: dict = {}
         now = int(time.time())
+        # Group recovery by user so reconcile runs once per user.
+        by_user: dict[str, str] = {}
         for line in output.splitlines():
             m = pattern.search(line)
             if m:
                 ip, username = m.group(1), m.group(2)
-                user = self.db.get_user_by_username(username)
-                if not user:
-                    logger.warning("sync: UFW rule references unknown user %s", username)
-                    continue
-                self.db.set_user_ip(user["id"], ip)
-                self.db.conn.execute(
-                    "UPDATE users SET last_knock=? WHERE id=?", (now, user["id"]),
-                )
-                self.db.conn.commit()
-                recovered[username] = {"ip": ip, "last_knock": now}
+                by_user[username] = ip
+
+        for username, ip in by_user.items():
+            user = self.db.get_user_by_username(username)
+            if not user:
+                logger.warning("sync: UFW rule references unknown user %s", username)
+                continue
+            self.db.set_user_ip(user["id"], ip)
+            self.db.conn.execute(
+                "UPDATE users SET last_knock=? WHERE id=?", (now, user["id"]),
+            )
+            self.db.conn.commit()
+            recovered[username] = {"ip": ip, "last_knock": now}
+
+            # Reconcile against enabled groups: drop rules for disabled groups.
+            if user_group_ports is not None:
+                enabled = {
+                    gname: (gport, gproto)
+                    for gname, gport, gproto in user_group_ports.get(username, [])
+                }
+                self.reconcile_user_rules(username, ip, enabled)
 
         if recovered:
             logger.info("Recovered %d users from UFW rules", len(recovered))

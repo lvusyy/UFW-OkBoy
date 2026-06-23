@@ -84,17 +84,40 @@ def is_admin(db: Database, username: str) -> bool:
     return bool(row and row["is_admin"])
 
 
-def user_has_group_access(db: Database, username: str, group_id: int) -> bool:
-    """Return True if *username* has an enabled membership in *group_id*.
+def user_has_group_access(db: Database, username: str, group_id: int,
+                          allow_reenable: bool = False) -> bool:
+    """Return True if *username* may use / (re-)enable membership in *group_id*.
+
+    By default (``allow_reenable=False``) this returns True only when an
+    enabled membership row exists — i.e. the user is currently authorized.
+
+    When ``allow_reenable=True`` (used by the self-toggle path), the check is
+    broadened: a *previously authorized* membership (a row exists, whether
+    enabled or disabled) also passes. This lets a user re-enable a group they
+    were once granted, while still blocking them from enabling a group they
+    have never been authorized for — closing the self-escalation gap (VULN-A).
+    New authorizations must come from an admin via the join API.
 
     Args:
         db: Database instance used for the membership lookup.
         username: Username to check.
         group_id: Target group id.
+        allow_reenable: If True, treat a previously_authorized (historical)
+            membership row as sufficient for re-enabling.
 
     Returns:
-        True only when an enabled membership row exists.
+        True when access is permitted under the rules above.
     """
+    if allow_reenable:
+        # Previously authorized: any row (enabled or disabled) for this user+group.
+        row = db.conn.execute(
+            "SELECT 1 FROM user_group_membership m "
+            "JOIN users u ON u.id = m.user_id "
+            "WHERE u.username=? AND m.group_id=?",
+            (username, group_id),
+        ).fetchone()
+        return row is not None
+    # Default: currently enabled membership only.
     row = db.conn.execute(
         "SELECT m.enabled FROM user_group_membership m "
         "JOIN users u ON u.id = m.user_id "

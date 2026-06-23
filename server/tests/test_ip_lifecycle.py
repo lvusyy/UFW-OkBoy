@@ -16,6 +16,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 import yaml
 
@@ -180,7 +181,15 @@ class TestIPLifecycle(unittest.TestCase):
         body = resp.get_json()
         self.assertEqual(body["groups"], ["web"])
 
-    def test_knock_heartbeat_no_rule_changes(self) -> None:
+    def test_knock_heartbeat_reconciles_missing_rules(self) -> None:
+        """Heartbeat (IP unchanged) now reconciles UFW rules.
+
+        Previously the heartbeat path skipped rule sync entirely (BUG-A): a
+        user added to a group while online never got the port opened until
+        their IP changed. The knock path now calls reconcile_user_rules on
+        every knock, so a missing rule for an enabled group is added even
+        when the IP is unchanged.
+        """
         self._knock("203.0.113.30")
         self.ufw.add_calls.clear()
         self.ufw.remove_calls.clear()
@@ -189,8 +198,10 @@ class TestIPLifecycle(unittest.TestCase):
         self.assertEqual(resp.status_code, 200)
         body = resp.get_json()
         self.assertFalse(body["changed"])
-        self.assertEqual(len(self.ufw.add_calls), 0)
-        self.assertEqual(len(self.ufw.remove_calls), 0)
+        # Reconcile re-adds the enabled group's rule (idempotent: add_rule is
+        # called once per missing enabled-group rule on the heartbeat path).
+        ports_added = {c["port"] for c in self.ufw.add_calls}
+        self.assertIn(8080, ports_added)
 
     # -- membership toggle --------------------------------------------- #
 
@@ -277,6 +288,130 @@ class TestIPLifecycle(unittest.TestCase):
         args = ufw.captured[0]
         comment = args[args.index("comment") + 1]
         self.assertEqual(comment, "ufw-okboy:alice")
+
+    # -- coordination: join/leave immediate sync (BUG-A/B, TASK-002) ----- #
+
+    def test_self_toggle_reenable_blocked_for_never_authorized(self) -> None:
+        """VULN-A: self-enable of a never-authorized group is rejected.
+
+        Alice is a member of web (enabled) and db (disabled) from setUp.
+        She tries to self-enable a group she was never granted — must 403.
+        """
+        other_group_id = self.db.create_group("secret", 9999, "tcp")
+        resp = self.client.patch(
+            f"/api/me/membership/{other_group_id}",
+            data=json.dumps({"enabled": True}),
+            content_type="application/json",
+            headers={"Authorization": self._auth_header()},
+        )
+        self.assertEqual(resp.status_code, 403)
+        self.assertFalse(resp.get_json()["ok"])
+
+    def test_self_toggle_reenable_allowed_for_previously_authorized(self) -> None:
+        """VULN-A: re-enabling a previously-granted (now disabled) group is OK."""
+        # db group is disabled in setUp; alice may re-enable it.
+        resp = self.client.patch(
+            f"/api/me/membership/{self.g_db_id}",
+            data=json.dumps({"enabled": True}),
+            content_type="application/json",
+            headers={"Authorization": self._auth_header()},
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(resp.get_json()["ok"])
+        self.assertTrue(resp.get_json()["enabled"])
+
+    def test_me_groups_returns_all_memberships(self) -> None:
+        """GET /api/me/groups returns both enabled and disabled memberships."""
+        resp = self.client.get(
+            "/api/me/groups",
+            headers={"Authorization": self._auth_header()},
+        )
+        self.assertEqual(resp.status_code, 200)
+        body = resp.get_json()
+        names = {g["name"] for g in body["groups"]}
+        self.assertEqual(names, {"web", "db"})
+
+    def test_status_includes_is_admin_flag(self) -> None:
+        resp = self.client.get(
+            "/api/status",
+            headers={"Authorization": self._auth_header()},
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertFalse(resp.get_json()["is_admin"])
+
+
+class TestAuthorizationGates(unittest.TestCase):
+    """Admin-level authorization: port whitelist (VULN-B) + admin-only join."""
+
+    def setUp(self) -> None:
+        self.tmpdir = tempfile.mkdtemp(prefix="ufw-okboy-authz-test-")
+        self.db_path = os.path.join(self.tmpdir, "test.db")
+        seed = Database(self.db_path)
+        seed.init()
+        self.admin_id = seed.create_user("admin", "admin-secret", is_admin=True)
+        seed.create_user("alice", "alice-secret", is_admin=False)
+        seed.close()
+
+        self.config_path = os.path.join(self.tmpdir, "config.yaml")
+        with open(self.config_path, "w", encoding="utf-8") as f:
+            yaml.dump({
+                "protected_ports": [8080],
+                "allowed_ports": [8080, 22],   # explicit whitelist
+                "proto": "tcp",
+                "db_path": self.db_path,
+                "users": {"admin": {"secret": "admin-secret"},
+                          "alice": {"secret": "alice-secret"}},
+            }, f)
+
+        self._ufw_patcher = patch.object(UFWManager, "_run_ufw", return_value="")
+        self._ufw_patcher.start()
+        self.addCleanup(self._ufw_patcher.stop)
+        from app import create_app
+        self.flask_app = create_app(self.config_path)
+        self.client = self.flask_app.test_client()
+
+    def _admin_header(self) -> str:
+        return build_auth_header("admin", "admin-secret")
+
+    def test_create_group_rejects_port_outside_whitelist(self) -> None:
+        resp = self.client.post(
+            "/api/admin/groups",
+            headers={"Authorization": self._admin_header()},
+            json={"name": "evil", "port": 6667},
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("allowed_ports", resp.get_json()["error"])
+
+    def test_create_group_accepts_whitelisted_port(self) -> None:
+        resp = self.client.post(
+            "/api/admin/groups",
+            headers={"Authorization": self._admin_header()},
+            json={"name": "ssh", "port": 22},
+        )
+        self.assertEqual(resp.status_code, 201)
+
+
+class TestMembershipUpsert(unittest.TestCase):
+    """ORPHAN-C: re-joining a disabled membership resets enabled=1."""
+
+    def setUp(self) -> None:
+        self.tmpdir = tempfile.mkdtemp(prefix="ufw-ups-")
+        self.db = Database(os.path.join(self.tmpdir, "t.db"))
+        self.db.init()
+        self.uid = self.db.create_user("alice", "s")
+        self.gid = self.db.create_group("web", 8080)
+
+    def test_rejoin_resets_disabled_membership(self) -> None:
+        self.db.add_membership(self.uid, self.gid, enabled=1)
+        self.db.set_membership_enabled(self.uid, self.gid, 0)
+        # Disabled now.
+        enabled = self.db.get_user_groups(self.uid, only_enabled=True)
+        self.assertEqual(len(enabled), 0)
+        # Re-join (UPSERT) resets enabled=1.
+        self.db.add_membership(self.uid, self.gid, enabled=1)
+        enabled = self.db.get_user_groups(self.uid, only_enabled=True)
+        self.assertEqual(len(enabled), 1)
+        self.assertEqual(enabled[0]["name"], "web")
 
 
 if __name__ == "__main__":

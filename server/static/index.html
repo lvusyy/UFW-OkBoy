@@ -332,6 +332,10 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
         <input type="checkbox" id="f-remember" checked>
         <label for="f-remember">Remember credentials</label>
       </div>
+      <div class="field">
+        <label for="f-login-pin">PIN (optional — encrypts saved credentials & locks admin)</label>
+        <input type="password" id="f-login-pin" autocomplete="off" placeholder="leave blank for plaintext fallback">
+      </div>
       <button type="submit" class="btn-primary" id="btn-connect">Connect</button>
     </form>
   </div>
@@ -369,7 +373,62 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 
     <div class="actions">
       <button class="btn-secondary btn-small" id="btn-knock">Knock Now</button>
+      <button class="btn-secondary btn-small" id="btn-admin" hidden>Admin</button>
       <button class="btn-danger btn-small" id="btn-disconnect">Disconnect</button>
+    </div>
+  </div>
+
+  <!-- PIN Lock View (admin page entry) -->
+  <div id="pin-view" class="card" hidden>
+    <div id="pin-error" class="login-error"></div>
+    <form id="pin-form">
+      <div class="field">
+        <label for="f-pin">Admin PIN (unlock encrypted vault)</label>
+        <input type="password" id="f-pin" autocomplete="off" required>
+      </div>
+      <button type="submit" class="btn-primary" id="btn-unlock">Unlock</button>
+      <button type="button" class="btn-secondary btn-small" id="btn-pin-cancel" style="margin-top:.5rem">Cancel</button>
+    </form>
+  </div>
+
+  <!-- Admin View -->
+  <div id="admin-view" class="card" hidden>
+    <h2 style="font-size:1.1rem;margin-bottom:.75rem">Admin Console</h2>
+    <div id="admin-error" class="login-error"></div>
+
+    <div class="log-section">
+      <h3>Users</h3>
+      <div id="admin-users" class="log" style="max-height:none"></div>
+      <div class="actions" style="margin-top:.5rem">
+        <input type="text" id="new-user" placeholder="username" style="flex:1">
+        <input type="checkbox" id="new-user-admin"><label for="new-user-admin" style="font-size:.8rem">admin</label>
+        <button class="btn-secondary btn-small" id="btn-add-user">Add</button>
+      </div>
+    </div>
+
+    <div class="log-section">
+      <h3>Groups</h3>
+      <div id="admin-groups" class="log" style="max-height:none"></div>
+      <div class="actions" style="margin-top:.5rem">
+        <input type="text" id="new-group-name" placeholder="name" style="flex:1">
+        <input type="number" id="new-group-port" placeholder="port" style="width:5rem">
+        <button class="btn-secondary btn-small" id="btn-add-group">Add</button>
+      </div>
+    </div>
+
+    <div class="log-section">
+      <h3>My Group Authorization</h3>
+      <p style="font-size:.75rem;color:var(--text2);margin-bottom:.5rem">
+        Select which groups to authorize your IP for. First group is checked by default.
+        Save to apply. Selection is not replayed across sessions.
+      </p>
+      <div id="my-groups"></div>
+      <button class="btn-primary btn-small" id="btn-save-auth" style="margin-top:.5rem">Save Authorization</button>
+    </div>
+
+    <div class="actions" style="margin-top:1rem">
+      <button class="btn-secondary btn-small" id="btn-admin-back">Back to Dashboard</button>
+      <button class="btn-danger btn-small" id="btn-lock">Lock</button>
     </div>
   </div>
 </div>
@@ -392,6 +451,14 @@ const API_BASE       = "";          // same origin (empty = relative)
 // ================================================================ //
 
 const $ = (s) => document.querySelector(s);
+
+// HTML-escape helper — all server-sourced strings interpolated into innerHTML
+// MUST pass through esc() to prevent stored XSS (malicious username/group/IP).
+function esc(s) {
+  return String(s == null ? "" : s).replace(/[&<>"']/g, c => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  }[c]));
+}
 const loginView    = $("#login-view");
 const dashView     = $("#dash-view");
 const loginForm    = $("#login-form");
@@ -402,6 +469,25 @@ const fRemember    = $("#f-remember");
 const btnConnect   = $("#btn-connect");
 const btnKnock     = $("#btn-knock");
 const btnDisconnect = $("#btn-disconnect");
+const btnAdmin     = $("#btn-admin");
+const fLoginPin    = $("#f-login-pin");
+const pinView      = $("#pin-view");
+const pinForm      = $("#pin-form");
+const pinError     = $("#pin-error");
+const fPin         = $("#f-pin");
+const btnUnlock    = $("#btn-unlock");
+const btnPinCancel = $("#btn-pin-cancel");
+const adminView    = $("#admin-view");
+const adminError   = $("#admin-error");
+const adminUsersEl = $("#admin-users");
+const adminGroupsEl= $("#admin-groups");
+const myGroupsEl   = $("#my-groups");
+const btnAddUser   = $("#btn-add-user");
+const btnAddGroup  = $("#btn-add-group");
+const btnSaveAuth  = $("#btn-save-auth");
+const btnAdminBack = $("#btn-admin-back");
+const btnLock      = $("#btn-lock");
+let isAdmin        = false;
 const statusBar    = $("#status-bar");
 const statusText   = $("#status-text");
 const infoUser     = $("#info-user");
@@ -446,6 +532,69 @@ async function buildAuth(username, secret) {
 }
 
 // ================================================================ //
+//  Crypto: PIN-based vault (PBKDF2 -> AES-GCM). Key never persisted.
+//  localStorage stores only {salt, iv, ciphertext}. The derived key
+//  lives in memory only; losing it (page reload without PIN) = re-login.
+// ================================================================ //
+
+const VAULT_KEY = "ufw-okboy-vault"; // encrypted blob
+const PBKDF2_ITERS = 150000;          // OWASP-tier cost; native Web Crypto
+let vaultKey = null;                  // CryptoKey in memory, never stored
+
+function toB64(buf) {
+  return btoa(String.fromCharCode(...new Uint8Array(buf)));
+}
+function fromB64(s) {
+  return Uint8Array.from(atob(s), c => c.charCodeAt(0));
+}
+
+async function deriveKey(pin, salt) {
+  const baseKey = await crypto.subtle.importKey(
+    "raw", new TextEncoder().encode(pin), "PBKDF2", false, ["deriveKey"],
+  );
+  return crypto.subtle.deriveKey(
+    { name: "PBKDF2", salt, iterations: PBKDF2_ITERS, hash: "SHA-256" },
+    baseKey, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"],
+  );
+}
+
+async function encryptVault(pin, data) {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const key = await deriveKey(pin, salt);
+  const plaintext = new TextEncoder().encode(JSON.stringify(data));
+  const ct = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, plaintext);
+  const blob = { salt: toB64(salt), iv: toB64(iv), ct: toB64(ct) };
+  localStorage.setItem(VAULT_KEY, JSON.stringify(blob));
+}
+
+function readVaultBlob() {
+  try { return JSON.parse(localStorage.getItem(VAULT_KEY) || "null"); }
+  catch { return null; }
+}
+
+async function unlockVault(pin) {
+  const blob = readVaultBlob();
+  if (!blob) return null;
+  const salt = fromB64(blob.salt), iv = fromB64(blob.iv);
+  const key = await deriveKey(pin, salt);
+  try {
+    const pt = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, fromB64(blob.ct));
+    vaultKey = key; // keep in memory for this session
+    return JSON.parse(new TextDecoder().decode(pt));
+  } catch { return null; } // wrong PIN
+}
+
+function clearVault() {
+  vaultKey = null;
+  localStorage.removeItem(VAULT_KEY);
+}
+
+// Simple client-side PIN attempt throttle (real brute-force protection
+// is server-side failed_attempts; this just adds friction).
+let pinAttempts = 0, pinLockedUntil = 0;
+
+// ================================================================ //
 //  API calls
 // ================================================================ //
 
@@ -474,6 +623,7 @@ async function doKnock() {
       currentIP = result.ip || currentIP;
       setStatus("ok", "Connected");
       infoIP.textContent = currentIP || "-";
+      refreshAdminFlag();
 
       if (result.changed) {
         const old = result.old_ip ? ` (was ${result.old_ip})` : "";
@@ -550,10 +700,19 @@ function updateCountdownDisplay() {
 async function connect(username, secret, remember) {
   credentials = { username, secret };
 
-  // Save or clear localStorage
+  // Persist credentials encrypted when "Remember" is on. A PIN is required
+  // to encrypt — if the user did not set one, we fall back to the legacy
+  // plaintext store so existing one-click reconnect still works. The admin
+  // console ALWAYS requires PIN unlock regardless.
   if (remember) {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({ username, secret }));
+    const pin = pendingPin;
+    if (pin) {
+      await encryptVault(pin, { username, secret });
+    } else {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({ username, secret }));
+    }
   }
+  pendingPin = null;
 
   // Switch views
   loginView.hidden = true;
@@ -592,7 +751,10 @@ function disconnect(reason) {
 
 function forgetCredentials() {
   localStorage.removeItem(STORAGE_KEY);
+  clearVault();
 }
+
+let pendingPin = null; // PIN captured at login, used to encrypt vault
 
 // ================================================================ //
 //  UI helpers
@@ -653,6 +815,7 @@ loginForm.addEventListener("submit", async (e) => {
   const user = fUser.value.trim();
   const secret = fSecret.value;
   if (!user || !secret) return;
+  pendingPin = fLoginPin.value || null;
   btnConnect.disabled = true;
   btnConnect.textContent = "Connecting...";
   await connect(user, secret, fRemember.checked);
@@ -675,21 +838,230 @@ btnDisconnect.addEventListener("click", () => {
 //  Auto-connect from saved credentials
 // ================================================================ //
 
+// Two storage modes:
+//  (a) plaintext legacy (STORAGE_KEY) -> direct auto-connect, no PIN
+//  (b) encrypted vault (VAULT_KEY) -> requires PIN to unlock before connect
 (function autoConnect() {
   try {
-    const saved = localStorage.getItem(STORAGE_KEY);
-    if (!saved) return;
-    const { username, secret } = JSON.parse(saved);
-    if (username && secret) {
-      // Pre-fill and auto-connect
-      fUser.value = username;
-      fSecret.value = secret;
-      connect(username, secret, true);
+    const plain = localStorage.getItem(STORAGE_KEY);
+    if (plain) {
+      const { username, secret } = JSON.parse(plain);
+      if (username && secret) {
+        fUser.value = username;
+        fSecret.value = secret;
+        connect(username, secret, true);
+      }
+      return;
+    }
+    // Encrypted vault present -> show PIN entry to unlock credentials.
+    if (readVaultBlob()) {
+      pinView.hidden = false;
+      loginView.hidden = true;
+      fPin.focus();
     }
   } catch {
     localStorage.removeItem(STORAGE_KEY);
   }
 })();
+
+// PIN unlock handler
+pinForm.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  pinError.style.display = "none";
+  if (Date.now() < pinLockedUntil) {
+    pinError.textContent = `Locked. Wait ${Math.ceil((pinLockedUntil - Date.now()) / 1000)}s.`;
+    pinError.style.display = "block";
+    return;
+  }
+  const pin = fPin.value;
+  const data = await unlockVault(pin);
+  if (!data) {
+    pinAttempts += 1;
+    if (pinAttempts >= 5) {
+      pinLockedUntil = Date.now() + 30000; // 30s cooldown
+      pinError.textContent = "Too many wrong PINs. Locked 30s.";
+    } else {
+      pinError.textContent = `Wrong PIN (${pinAttempts}/5)`;
+    }
+    pinError.style.display = "block";
+    return;
+  }
+  pinAttempts = 0;
+  pinView.hidden = true;
+  loginView.hidden = false;
+  fUser.value = data.username;
+  fSecret.value = data.secret;
+  pendingPin = pin; // re-encrypt with same PIN on next save
+  await connect(data.username, data.secret, true);
+});
+
+btnPinCancel.addEventListener("click", () => {
+  pinView.hidden = true;
+  loginView.hidden = false;
+  fPin.value = "";
+});
+
+// ================================================================ //
+//  Admin console (gated by PIN unlock)
+// ================================================================ //
+
+async function apiAdmin(method, path, body) {
+  const auth = await buildAuth(credentials.username, credentials.secret);
+  const resp = await fetch(path, {
+    method,
+    headers: { "Authorization": auth, "Content-Type": "application/json" },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  return resp.json();
+}
+
+// After a successful knock, probe admin status to reveal the Admin button.
+async function refreshAdminFlag() {
+  if (!credentials) return;
+  try {
+    const auth = await buildAuth(credentials.username, credentials.secret);
+    const r = await (await fetch("/api/status", { headers: { Authorization: auth } })).json();
+    isAdmin = !!(r.ok && r.is_admin);
+    btnAdmin.hidden = !isAdmin;
+  } catch { /* ignore */ }
+}
+
+// Open the admin console. Vault must be unlocked (key in memory) or PIN needed.
+btnAdmin.addEventListener("click", async () => {
+  // If credentials came from plaintext (no vault), require a PIN now to
+  // protect the admin page; otherwise the in-memory vault key is sufficient.
+  if (!vaultKey) {
+    if (readVaultBlob()) {
+      // encrypted vault exists but not unlocked this session
+      dashView.hidden = true;
+      pinView.hidden = false;
+      fPin.focus();
+      return;
+    }
+    // No vault yet: prompt to set a PIN to lock admin going forward.
+    const pin = prompt("Set an admin PIN to lock the admin console (encrypts your saved credentials):");
+    if (!pin) return;
+    await encryptVault(pin, { username: credentials.username, secret: credentials.secret });
+    localStorage.removeItem(STORAGE_KEY); // drop plaintext now that vault exists
+    await unlockVault(pin);
+  }
+  dashView.hidden = true;
+  adminView.hidden = false;
+  await loadAdminConsole();
+});
+
+btnAdminBack.addEventListener("click", () => {
+  adminView.hidden = true;
+  dashView.hidden = false;
+});
+
+btnLock.addEventListener("click", () => {
+  vaultKey = null;
+  adminView.hidden = true;
+  // Return to dashboard if still connected, else to login.
+  if (credentials) {
+    dashView.hidden = false;
+    addLog("Admin locked", "warn");
+  } else {
+    loginView.hidden = false;
+  }
+});
+
+async function loadAdminConsole() {
+  adminError.style.display = "none";
+  try {
+    const [users, groups, mine] = await Promise.all([
+      apiAdmin("GET", "/api/admin/users"),
+      apiAdmin("GET", "/api/admin/groups"),
+      apiAdmin("GET", "/api/me/groups"),
+    ]);
+    renderUsers(users.users || []);
+    renderGroups(groups.groups || []);
+    renderMyGroups(mine.groups || []);
+  } catch (err) {
+    adminError.textContent = `Load failed: ${err.message}`;
+    adminError.style.display = "block";
+  }
+}
+
+function renderUsers(users) {
+  adminUsersEl.innerHTML = users.map(u => {
+    const ip = esc(u.current_ip || "—");
+    const admin = u.is_admin ? " [admin]" : "";
+    return `<div>${esc(u.id)}: ${esc(u.username)}${admin} <span style="color:var(--text2)">ip=${ip}</span></div>`;
+  }).join("");
+}
+
+function renderGroups(groups) {
+  adminGroupsEl.innerHTML = groups.map(g =>
+    `<div>${esc(g.id)}: ${esc(g.name)} → ${esc(g.port)}/${esc(g.proto)}</div>`
+  ).join("");
+}
+
+// My group authorization: checkboxes, first checked by default.
+let myGroupsState = [];
+function renderMyGroups(groups) {
+  myGroupsState = groups.map((g, i) => ({ ...g, checked: i === 0 ? true : !!g.enabled }));
+  myGroupsEl.innerHTML = myGroupsState.map((g, i) => `
+    <div class="checkbox" style="margin-bottom:.25rem">
+      <input type="checkbox" data-idx="${i}" id="mg-${esc(g.id)}" ${g.checked ? "checked" : ""}>
+      <label for="mg-${esc(g.id)}" style="margin-bottom:0;font-weight:400">${esc(g.name)} (port ${esc(g.port)})</label>
+    </div>
+  `).join("");
+  myGroupsEl.querySelectorAll('input[type="checkbox"]').forEach(cb => {
+    cb.addEventListener("change", () => {
+      myGroupsState[+cb.dataset.idx].checked = cb.checked;
+    });
+  });
+}
+
+// Save: toggle each group to match selection via the self-membership route.
+// Server enforces re-enable only for previously-authorized groups (VULN-A).
+// Selection is NOT replayed across sessions — UI rebuilds from /api/me/groups
+// each time the admin console opens.
+btnSaveAuth.addEventListener("click", async () => {
+  adminError.style.display = "none";
+  let denied = [];
+  for (const g of myGroupsState) {
+    const want = g.checked ? 1 : 0;
+    if (g.enabled === want) continue;
+    const r = await apiAdmin("PATCH", `/api/me/membership/${g.id}`, { enabled: !!want });
+    if (!r.ok) denied.push(`${g.name}: ${r.error || "failed"}`);
+  }
+  await loadAdminConsole();
+  if (denied.length) {
+    adminError.textContent = "Some denied: " + denied.join("; ");
+    adminError.style.display = "block";
+    addLog(`Authorization partial: ${denied.length} denied`, "warn");
+  } else {
+    addLog("Authorization saved", "ok");
+  }
+});
+
+btnAddUser.addEventListener("click", async () => {
+  const username = $("#new-user").value.trim();
+  if (!username) return;
+  const is_admin = $("#new-user-admin").checked;
+  const r = await apiAdmin("POST", "/api/admin/users", { username, is_admin });
+  if (r.ok) {
+    addLog(`Created ${username} (full secret returned in response — copy it now)`, "ok");
+    $("#new-user").value = "";
+    await loadAdminConsole();
+  } else { adminError.textContent = r.error || "failed"; adminError.style.display = "block"; }
+});
+
+btnAddGroup.addEventListener("click", async () => {
+  const name = $("#new-group-name").value.trim();
+  const port = parseInt($("#new-group-port").value, 10);
+  if (!name || !port) return;
+  const r = await apiAdmin("POST", "/api/admin/groups", { name, port });
+  if (r.ok) {
+    addLog(`Created group ${name}`, "ok");
+    $("#new-group-name").value = "";
+    $("#new-group-port").value = "";
+    await loadAdminConsole();
+  } else { adminError.textContent = r.error || "failed"; adminError.style.display = "block"; }
+});
 
 })();
 </script>
