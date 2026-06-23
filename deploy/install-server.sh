@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# UFW OkBoy - Server Installation Script
+# UFW OkBoy - Server Installation Script (lightweight standalone entry)
+#
+# For full deployment (SSL/nginx/systemd) use deploy/deploy.sh instead.
+# This script installs the app + Python deps + systemd services only.
 #
 # Run as root on the server:
 #   bash install-server.sh
@@ -9,6 +12,8 @@ set -euo pipefail
 APP_DIR="/opt/ufw-okboy"
 DATA_DIR="/var/lib/ufw-okboy"
 LOG_DIR="/var/log/ufw-okboy"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 echo "=== UFW OkBoy Server Installation ==="
 
@@ -18,20 +23,62 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-command -v ufw   >/dev/null 2>&1 || { echo "Error: ufw is not installed."; exit 1; }
+command -v ufw     >/dev/null 2>&1 || { echo "Error: ufw is not installed."; exit 1; }
 command -v python3 >/dev/null 2>&1 || { echo "Error: python3 is not installed."; exit 1; }
+
+# Detect distribution (RHEL-family needs EPEL for ufw)
+if [[ -f /etc/os-release ]]; then
+    . /etc/os-release
+    DISTRO_ID="$ID"
+else
+    echo "Error: Cannot detect distribution (/etc/os-release missing)."
+    exit 1
+fi
+echo "[INFO] Detected distribution: $DISTRO_ID"
+
+# Ensure ufw is available (RHEL-family: ufw lives in EPEL)
+case "$DISTRO_ID" in
+    ubuntu|debian|linuxmint|raspbian)
+        : # ufw is in the default repos
+        ;;
+    centos|rhel|rocky|almalinux|amzn)
+        if ! rpm -q ufw >/dev/null 2>&1 && ! command -v ufw >/dev/null 2>&1; then
+            echo "[INFO] Installing EPEL (provides ufw on RHEL-family)..."
+            if command -v dnf >/dev/null 2>&1; then
+                dnf install -y epel-release
+            else
+                yum install -y epel-release
+            fi
+            # ufw check at top already failed if still missing; re-check below
+            command -v ufw >/dev/null 2>&1 || dnf install -y ufw 2>/dev/null || yum install -y ufw
+        fi
+        ;;
+    fedora)
+        : # ufw in default repos
+        ;;
+    *)
+        echo "Warning: Unsupported distribution '$DISTRO_ID'. Proceeding anyway."
+        ;;
+esac
 
 # Create directories
 echo "[1/5] Creating directories..."
-mkdir -p "$APP_DIR" "$DATA_DIR" "$LOG_DIR"
+mkdir -p "$APP_DIR/server" "$DATA_DIR" "$LOG_DIR"
 
-# Copy application files
+# Copy application files (ALL server modules — v2.0 split db.py/auth.py MUST be included)
 echo "[2/5] Copying application files..."
-cp -r server/* "$APP_DIR/server/" 2>/dev/null || {
-    # If running from repo root
-    mkdir -p "$APP_DIR/server"
-    cp server/app.py server/ufw_ops.py server/requirements.txt "$APP_DIR/server/"
-}
+cp "$REPO_DIR/server/app.py" \
+   "$REPO_DIR/server/ufw_ops.py" \
+   "$REPO_DIR/server/db.py" \
+   "$REPO_DIR/server/auth.py" \
+   "$REPO_DIR/server/requirements.txt" \
+   "$REPO_DIR/server/config.example.yaml" \
+   "$APP_DIR/server/" 2>/dev/null || true
+# Copy static + tests
+[[ -d "$REPO_DIR/server/static" ]] && cp -r "$REPO_DIR/server/static" "$APP_DIR/server/"
+[[ -d "$REPO_DIR/server/tests" ]]  && { mkdir -p "$APP_DIR/server/tests"; cp -r "$REPO_DIR/server/tests/"* "$APP_DIR/server/tests/" 2>/dev/null || true; }
+# Copy VERSION so the installed app can report its version (for upgrade checks)
+[[ -f "$REPO_DIR/VERSION" ]] && cp "$REPO_DIR/VERSION" "$APP_DIR/"
 
 # Create virtual environment and install dependencies
 echo "[3/5] Setting up Python virtual environment..."
@@ -42,7 +89,6 @@ python3 -m venv "$APP_DIR/venv"
 # Config file
 echo "[4/5] Setting up configuration..."
 if [[ ! -f "$APP_DIR/server/config.yaml" ]]; then
-    cp server/config.example.yaml "$APP_DIR/server/config.yaml" 2>/dev/null || \
     cp "$APP_DIR/server/config.example.yaml" "$APP_DIR/server/config.yaml" 2>/dev/null || true
     echo "  -> config.yaml created at $APP_DIR/server/config.yaml"
     echo "  -> IMPORTANT: Edit it and set real user secrets!"
@@ -53,9 +99,9 @@ fi
 
 # Install systemd services
 echo "[5/5] Installing systemd services..."
-cp deploy/ufw-okboy.service /etc/systemd/system/ 2>/dev/null || true
-cp deploy/ufw-okboy-cleanup.service /etc/systemd/system/ 2>/dev/null || true
-cp deploy/ufw-okboy-cleanup.timer /etc/systemd/system/ 2>/dev/null || true
+cp "$REPO_DIR/deploy/ufw-okboy.service" /etc/systemd/system/ 2>/dev/null || true
+cp "$REPO_DIR/deploy/ufw-okboy-cleanup.service" /etc/systemd/system/ 2>/dev/null || true
+cp "$REPO_DIR/deploy/ufw-okboy-cleanup.timer" /etc/systemd/system/ 2>/dev/null || true
 systemctl daemon-reload
 
 echo ""
@@ -64,7 +110,9 @@ echo ""
 echo "Next steps:"
 echo "  1. Edit config:    nano $APP_DIR/server/config.yaml"
 echo "  2. Generate secrets: $APP_DIR/venv/bin/python $APP_DIR/server/app.py gen-secret alice"
-echo "  3. Configure Nginx:  cp nginx/ufw-okboy.conf /etc/nginx/sites-available/"
-echo "  4. Start server:     systemctl enable --now ufw-okboy"
-echo "  5. Enable cleanup:   systemctl enable --now ufw-okboy-cleanup.timer"
-echo "  6. Check status:     systemctl status ufw-okboy"
+echo "  3. Create admin:     $APP_DIR/venv/bin/python $APP_DIR/server/app.py -c $APP_DIR/server/config.yaml user-add <admin> --admin"
+echo "  4. Configure Nginx:  cp nginx/ufw-okboy.conf /etc/nginx/sites-available/  (or use deploy.sh for full SSL setup)"
+echo "  5. Start server:     systemctl enable --now ufw-okboy"
+echo "  6. Enable cleanup:   systemctl enable --now ufw-okboy-cleanup.timer"
+echo "  7. Check status:     systemctl status ufw-okboy"
+echo "  8. Version:          $APP_DIR/venv/bin/python $APP_DIR/server/app.py --version"
