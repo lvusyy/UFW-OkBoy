@@ -46,7 +46,22 @@ body {
 header {
   text-align: center;
   margin-bottom: 1.5rem;
+  position: relative;
 }
+
+.lang-toggle {
+  position: absolute;
+  top: 0;
+  right: 0;
+  padding: 0.25rem 0.625rem;
+  font-size: 0.75rem;
+  font-weight: 600;
+  background: var(--card);
+  color: var(--text2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.lang-toggle:hover { background: var(--bg); color: var(--text); }
 
 header h1 {
   font-size: 1.5rem;
@@ -312,8 +327,9 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 
 <div class="container">
   <header>
+    <button type="button" id="btn-lang" class="lang-toggle">中文 / EN</button>
     <h1>UFW OkBoy</h1>
-    <p>Dynamic Firewall Allowlist</p>
+    <p data-i18n="app_subtitle">Dynamic Firewall Allowlist</p>
   </header>
 
   <!-- Login View -->
@@ -321,22 +337,22 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
     <div id="login-error" class="login-error"></div>
     <form id="login-form">
       <div class="field">
-        <label for="f-user">Username</label>
+        <label for="f-user" data-i18n="login_username">Username</label>
         <input type="text" id="f-user" autocomplete="username" required>
       </div>
       <div class="field">
-        <label for="f-secret">Secret</label>
+        <label for="f-secret" data-i18n="login_secret">Secret</label>
         <input type="password" id="f-secret" autocomplete="current-password" required>
       </div>
       <div class="field checkbox">
         <input type="checkbox" id="f-remember" checked>
-        <label for="f-remember">Remember credentials</label>
+        <label for="f-remember" data-i18n="login_remember">Remember credentials</label>
       </div>
       <div class="field">
-        <label for="f-login-pin">PIN (optional — encrypts saved credentials & locks admin)</label>
-        <input type="password" id="f-login-pin" autocomplete="off" placeholder="leave blank for plaintext fallback">
+        <label for="f-login-pin" data-i18n="login_pin_label">PIN (optional — encrypts saved credentials & locks admin)</label>
+        <input type="password" id="f-login-pin" autocomplete="off" data-i18n-ph="login_pin_ph" placeholder="leave blank for plaintext fallback">
       </div>
-      <button type="submit" class="btn-primary" id="btn-connect">Connect</button>
+      <button type="submit" class="btn-primary" id="btn-connect" data-i18n="login_connect">Connect</button>
     </form>
   </div>
 
@@ -344,20 +360,20 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
   <div id="dash-view" class="card" hidden>
     <div id="status-bar" class="status-bar off">
       <span class="dot"></span>
-      <span id="status-text">Connecting...</span>
+      <span id="status-text" data-i18n="status_connecting">Connecting...</span>
     </div>
 
     <div class="info-grid">
       <div class="info-item">
-        <div class="label">User</div>
+        <div class="label" data-i18n="dash_user">User</div>
         <div class="value" id="info-user">-</div>
       </div>
       <div class="info-item">
-        <div class="label">Next Knock</div>
+        <div class="label" data-i18n="dash_next_knock">Next Knock</div>
         <div class="value" id="info-countdown">-</div>
       </div>
       <div class="info-item span2">
-        <div class="label">Registered IP</div>
+        <div class="label" data-i18n="dash_registered_ip">Registered IP</div>
         <div class="value" id="info-ip">-</div>
       </div>
     </div>
@@ -367,14 +383,14 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
     </div>
 
     <div class="log-section">
-      <h3>Activity</h3>
+      <h3 data-i18n="dash_activity">Activity</h3>
       <div id="log" class="log"></div>
     </div>
 
     <div class="actions">
-      <button class="btn-secondary btn-small" id="btn-knock">Knock Now</button>
-      <button class="btn-secondary btn-small" id="btn-admin" hidden>Admin</button>
-      <button class="btn-danger btn-small" id="btn-disconnect">Disconnect</button>
+      <button class="btn-secondary btn-small" id="btn-knock" data-i18n="dash_knock_now">Knock Now</button>
+      <button class="btn-secondary btn-small" id="btn-admin" data-i18n="dash_admin" hidden>Admin</button>
+      <button class="btn-danger btn-small" id="btn-disconnect" data-i18n="dash_disconnect">Disconnect</button>
     </div>
   </div>
 
@@ -383,58 +399,58 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
     <div id="pin-error" class="login-error"></div>
     <form id="pin-form">
       <div class="field">
-        <label for="f-pin">Admin PIN (unlock encrypted vault)</label>
+        <label for="f-pin" data-i18n="pin_label">Admin PIN (unlock encrypted vault)</label>
         <input type="password" id="f-pin" autocomplete="off" required>
       </div>
-      <button type="submit" class="btn-primary" id="btn-unlock">Unlock</button>
-      <button type="button" class="btn-secondary btn-small" id="btn-pin-cancel" style="margin-top:.5rem">Cancel</button>
+      <button type="submit" class="btn-primary" id="btn-unlock" data-i18n="pin_unlock">Unlock</button>
+      <button type="button" class="btn-secondary btn-small" id="btn-pin-cancel" style="margin-top:.5rem" data-i18n="pin_cancel">Cancel</button>
     </form>
   </div>
 
   <!-- Admin View -->
   <div id="admin-view" class="card" hidden>
-    <h2 style="font-size:1.1rem;margin-bottom:.75rem">Admin Console</h2>
+    <h2 style="font-size:1.1rem;margin-bottom:.75rem" data-i18n="admin_title">Admin Console</h2>
     <div id="admin-error" class="login-error"></div>
 
     <div class="log-section">
-      <h3>Users</h3>
+      <h3 data-i18n="admin_users">Users</h3>
       <div id="admin-users" class="log" style="max-height:none"></div>
       <div class="actions" style="margin-top:.5rem">
-        <input type="text" id="new-user" placeholder="username" style="flex:1">
-        <input type="checkbox" id="new-user-admin"><label for="new-user-admin" style="font-size:.8rem">admin</label>
-        <button class="btn-secondary btn-small" id="btn-add-user">Add</button>
+        <input type="text" id="new-user" data-i18n-ph="admin_username_ph" placeholder="username" style="flex:1">
+        <input type="checkbox" id="new-user-admin"><label for="new-user-admin" style="font-size:.8rem" data-i18n="admin_admin">admin</label>
+        <button class="btn-secondary btn-small" id="btn-add-user" data-i18n="admin_add">Add</button>
       </div>
     </div>
 
     <div class="log-section">
-      <h3>Groups</h3>
+      <h3 data-i18n="admin_groups">Groups</h3>
       <div id="admin-groups" class="log" style="max-height:none"></div>
       <div class="actions" style="margin-top:.5rem">
-        <input type="text" id="new-group-name" placeholder="name" style="flex:1">
-        <input type="number" id="new-group-port" placeholder="port" style="width:5rem">
-        <button class="btn-secondary btn-small" id="btn-add-group">Add</button>
+        <input type="text" id="new-group-name" data-i18n-ph="admin_name_ph" placeholder="name" style="flex:1">
+        <input type="number" id="new-group-port" data-i18n-ph="admin_port_ph" placeholder="port" style="width:5rem">
+        <button class="btn-secondary btn-small" id="btn-add-group" data-i18n="admin_add">Add</button>
       </div>
     </div>
 
     <div class="log-section">
-      <h3>Audit Log</h3>
+      <h3 data-i18n="admin_audit">Audit Log</h3>
       <div id="admin-audit" class="log" style="max-height:14rem"></div>
-      <button class="btn-secondary btn-small" id="btn-refresh-audit" style="margin-top:.5rem">Refresh</button>
+      <button class="btn-secondary btn-small" id="btn-refresh-audit" style="margin-top:.5rem" data-i18n="admin_refresh">Refresh</button>
     </div>
 
     <div class="log-section">
-      <h3>My Group Authorization</h3>
-      <p style="font-size:.75rem;color:var(--text2);margin-bottom:.5rem">
+      <h3 data-i18n="admin_my_auth">My Group Authorization</h3>
+      <p style="font-size:.75rem;color:var(--text2);margin-bottom:.5rem" data-i18n="admin_my_auth_hint">
         Select which groups to authorize your IP for. First group is checked by default.
         Save to apply. Selection is not replayed across sessions.
       </p>
       <div id="my-groups"></div>
-      <button class="btn-primary btn-small" id="btn-save-auth" style="margin-top:.5rem">Save Authorization</button>
+      <button class="btn-primary btn-small" id="btn-save-auth" style="margin-top:.5rem" data-i18n="admin_save_auth">Save Authorization</button>
     </div>
 
     <div class="log-section">
-      <h3>Two-Factor (TOTP)</h3>
-      <p style="font-size:.75rem;color:var(--text2);margin-bottom:.5rem">
+      <h3 data-i18n="admin_totp">Two-Factor (TOTP)</h3>
+      <p style="font-size:.75rem;color:var(--text2);margin-bottom:.5rem" data-i18n="admin_totp_hint">
         Protects sensitive actions (revoke, delete). Add the secret to an
         authenticator app, then confirm a code to activate.
       </p>
@@ -442,19 +458,19 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
       <div id="totp-enroll" hidden>
         <div id="totp-secret" class="log" style="max-height:none;word-break:break-all;font-size:.7rem"></div>
         <div class="actions" style="margin-top:.5rem">
-          <input type="text" id="totp-code" placeholder="6-digit code" inputmode="numeric" style="flex:1">
-          <button class="btn-primary btn-small" id="btn-totp-activate">Activate</button>
+          <input type="text" id="totp-code" data-i18n-ph="admin_totp_code_ph" placeholder="6-digit code" inputmode="numeric" style="flex:1">
+          <button class="btn-primary btn-small" id="btn-totp-activate" data-i18n="admin_totp_activate">Activate</button>
         </div>
       </div>
       <div class="actions" style="margin-top:.5rem">
-        <button class="btn-secondary btn-small" id="btn-totp-enroll">Enroll / Re-enroll</button>
-        <button class="btn-danger btn-small" id="btn-totp-disable">Disable</button>
+        <button class="btn-secondary btn-small" id="btn-totp-enroll" data-i18n="admin_totp_enroll">Enroll / Re-enroll</button>
+        <button class="btn-danger btn-small" id="btn-totp-disable" data-i18n="admin_totp_disable">Disable</button>
       </div>
     </div>
 
     <div class="actions" style="margin-top:1rem">
-      <button class="btn-secondary btn-small" id="btn-admin-back">Back to Dashboard</button>
-      <button class="btn-danger btn-small" id="btn-lock">Lock</button>
+      <button class="btn-secondary btn-small" id="btn-admin-back" data-i18n="admin_back">Back to Dashboard</button>
+      <button class="btn-danger btn-small" id="btn-lock" data-i18n="admin_lock">Lock</button>
     </div>
   </div>
 </div>
@@ -471,6 +487,286 @@ const KNOCK_INTERVAL = 30;          // seconds
 const STORAGE_KEY    = "ufw-okboy"; // localStorage key
 const MAX_LOG        = 50;          // max log entries kept
 const API_BASE       = "";          // same origin (empty = relative)
+const LANG_KEY       = "ufw_lang";  // localStorage key for chosen language
+
+// ================================================================ //
+//  i18n — bilingual string dictionary (en / zh). Every user-facing
+//  string across all four views and all JS messages lives here. Static
+//  HTML uses data-i18n / data-i18n-ph attributes resolved by applyI18n();
+//  dynamic JS strings call t(key, ...args) so they switch on toggle too.
+//  t() supports simple {0}, {1}... positional placeholder substitution.
+// ================================================================ //
+
+const I18N = {
+  en: {
+    app_subtitle: "Dynamic Firewall Allowlist",
+    // ---- Login view ----
+    login_username: "Username",
+    login_secret: "Secret",
+    login_remember: "Remember credentials",
+    login_pin_label: "PIN (optional — encrypts saved credentials & locks admin)",
+    login_pin_ph: "leave blank for plaintext fallback",
+    login_connect: "Connect",
+    login_connecting: "Connecting...",
+    // ---- Dashboard view ----
+    status_connecting: "Connecting...",
+    status_connected: "Connected",
+    status_warning: "Warning",
+    status_anomaly: "Warning: Anomaly Detected",
+    status_network_error: "Network Error",
+    dash_user: "User",
+    dash_next_knock: "Next Knock",
+    dash_registered_ip: "Registered IP",
+    dash_activity: "Activity",
+    dash_knock_now: "Knock Now",
+    dash_admin: "Admin",
+    dash_disconnect: "Disconnect",
+    dash_detecting: "detecting...",
+    // ---- PIN view ----
+    pin_label: "Admin PIN (unlock encrypted vault)",
+    pin_unlock: "Unlock",
+    pin_cancel: "Cancel",
+    pin_locked: "Locked. Wait {0}s.",
+    pin_too_many: "Too many wrong PINs. Locked 30s.",
+    pin_wrong: "Wrong PIN ({0}/5)",
+    // ---- Admin view (static) ----
+    admin_title: "Admin Console",
+    admin_users: "Users",
+    admin_groups: "Groups",
+    admin_audit: "Audit Log",
+    admin_my_auth: "My Group Authorization",
+    admin_my_auth_hint: "Select which groups to authorize your IP for. First group is checked by default. Save to apply. Selection is not replayed across sessions.",
+    admin_save_auth: "Save Authorization",
+    admin_totp: "Two-Factor (TOTP)",
+    admin_totp_hint: "Protects sensitive actions (revoke, delete). Add the secret to an authenticator app, then confirm a code to activate.",
+    admin_back: "Back to Dashboard",
+    admin_lock: "Lock",
+    admin_add: "Add",
+    admin_admin: "admin",
+    admin_refresh: "Refresh",
+    admin_username_ph: "username",
+    admin_name_ph: "name",
+    admin_port_ph: "port",
+    admin_totp_code_ph: "6-digit code",
+    admin_totp_activate: "Activate",
+    admin_totp_enroll: "Enroll / Re-enroll",
+    admin_totp_disable: "Disable",
+    // ---- Admin view (dynamic JS-built) ----
+    admin_tag_admin: "[admin]",
+    admin_revoke: "Revoke",
+    admin_delete: "Delete",
+    admin_make_admin: "Make admin",
+    admin_remove_admin: "Remove admin",
+    admin_manage_groups: "Manage groups",
+    admin_groups_loading: "Loading groups...",
+    admin_no_groups: "(no groups)",
+    admin_audit_none: "(no entries)",
+    admin_port_label: "port {0}",
+    // ---- confirm() / prompt() texts ----
+    confirm_revoke: "Revoke {0}?\n\nCloses their open ports, clears their session, and rotates their secret. They must re-authenticate with a NEW secret you deliver to them.",
+    confirm_delete_user: "Delete user {0}?\n\nThis removes the user, closes their open ports, and cannot be undone.",
+    confirm_delete_group: "Delete group {0}?\n\nThis removes the group and closes its members' ports. This cannot be undone.",
+    prompt_totp_revoke: "Enter your 6-digit TOTP code to confirm revoking {0}:",
+    prompt_totp_delete_user: "Enter your 6-digit TOTP code to confirm deleting {0}:",
+    prompt_totp_delete_group: "Enter your 6-digit TOTP code to confirm deleting group {0}:",
+    prompt_totp_set_admin: "Enter your 6-digit TOTP code to confirm changing admin rights for {0}:",
+    prompt_set_admin_pin: "Set an admin PIN to lock the admin console (encrypts your saved credentials):",
+    prompt_new_secret: "New secret for {0} (copy & deliver securely — shown once):",
+    prompt_totp_disable: "Enter your current TOTP code to disable 2FA:",
+    // ---- addLog / status messages ----
+    log_connecting: "Connecting...",
+    log_ip_updated: "IP updated: {0}{1}",
+    log_was_ip: " (was {0})",
+    log_heartbeat: "Heartbeat OK - {0}",
+    log_auth_failed: "Auth failed: {0}",
+    log_server: "Server: {0}",
+    log_error: "Error: {0}",
+    log_unknown_error: "unknown error",
+    log_tab_resumed: "Tab resumed, knocking now",
+    log_manual_knock: "Manual knock",
+    log_admin_locked: "Admin locked",
+    log_created_user: "Created {0} (full secret returned in response — copy it now)",
+    log_created_group: "Created group {0}",
+    log_revoked_new_secret: "Revoked {0} — new secret issued (shown once)",
+    log_revoked: "Revoked {0}",
+    log_deleted_user: "Deleted user {0}",
+    log_deleted_group: "Deleted group {0}",
+    log_admin_granted: "{0} is now an admin",
+    log_admin_revoked: "{0} is no longer an admin",
+    log_group_added: "Added {0} to {1}",
+    log_group_removed: "Removed {0} from {1}",
+    log_auth_partial: "Authorization partial: {0} denied",
+    log_auth_saved: "Authorization saved",
+    log_totp_started: "TOTP enrollment started — add the secret to your authenticator, then activate",
+    log_totp_activated: "TOTP activated",
+    log_totp_disabled: "TOTP disabled",
+    // ---- error texts ----
+    err_load_failed: "Load failed: {0}",
+    err_some_denied: "Some denied: {0}",
+    err_failed: "failed",
+    err_revoke_failed: "revoke failed",
+    err_delete_failed: "delete failed",
+    err_set_admin_failed: "failed to change admin rights",
+    err_group_change_failed: "failed to change group",
+    err_enroll_failed: "enroll failed",
+    err_activate_failed: "activate failed",
+    err_disable_failed: "disable failed",
+    // ---- TOTP status ----
+    totp_on: "● Enabled — sensitive actions require a 6-digit code",
+    totp_off: "○ Disabled — sensitive actions are not 2FA-protected",
+    totp_secret_html: "Secret (manual entry): <b>{0}</b><br><br>otpauth URI (for QR import):<br>{1}",
+  },
+  zh: {
+    app_subtitle: "动态防火墙白名单",
+    // ---- Login view ----
+    login_username: "用户名",
+    login_secret: "密钥",
+    login_remember: "记住凭据",
+    login_pin_label: "PIN 码（可选 — 加密保存的凭据并锁定管理后台）",
+    login_pin_ph: "留空则使用明文回退",
+    login_connect: "连接",
+    login_connecting: "连接中…",
+    // ---- Dashboard view ----
+    status_connecting: "连接中…",
+    status_connected: "已连接",
+    status_warning: "警告",
+    status_anomaly: "警告：检测到异常",
+    status_network_error: "网络错误",
+    dash_user: "用户",
+    dash_next_knock: "下次心跳",
+    dash_registered_ip: "已注册 IP",
+    dash_activity: "活动日志",
+    dash_knock_now: "立即心跳",
+    dash_admin: "管理后台",
+    dash_disconnect: "断开连接",
+    dash_detecting: "检测中…",
+    // ---- PIN view ----
+    pin_label: "管理 PIN 码（解锁加密保险库）",
+    pin_unlock: "解锁",
+    pin_cancel: "取消",
+    pin_locked: "已锁定，请等待 {0} 秒。",
+    pin_too_many: "PIN 码错误次数过多，已锁定 30 秒。",
+    pin_wrong: "PIN 码错误（{0}/5）",
+    // ---- Admin view (static) ----
+    admin_title: "管理控制台",
+    admin_users: "用户",
+    admin_groups: "分组",
+    admin_audit: "审计日志",
+    admin_my_auth: "我的分组授权",
+    admin_my_auth_hint: "选择要为你的 IP 授权的分组。默认勾选第一个分组。保存以生效。选择不会跨会话保留。",
+    admin_save_auth: "保存授权",
+    admin_totp: "双因素认证（TOTP）",
+    admin_totp_hint: "保护敏感操作（吊销、删除）。将密钥添加到验证器应用，然后输入验证码以激活。",
+    admin_back: "返回仪表盘",
+    admin_lock: "锁定",
+    admin_add: "添加",
+    admin_admin: "管理员",
+    admin_refresh: "刷新",
+    admin_username_ph: "用户名",
+    admin_name_ph: "名称",
+    admin_port_ph: "端口",
+    admin_totp_code_ph: "6 位验证码",
+    admin_totp_activate: "激活",
+    admin_totp_enroll: "注册 / 重新注册",
+    admin_totp_disable: "禁用",
+    // ---- Admin view (dynamic JS-built) ----
+    admin_tag_admin: "[管理员]",
+    admin_revoke: "吊销",
+    admin_delete: "删除",
+    admin_make_admin: "设为管理员",
+    admin_remove_admin: "取消管理员",
+    admin_manage_groups: "管理分组",
+    admin_groups_loading: "加载分组中…",
+    admin_no_groups: "（暂无分组）",
+    admin_audit_none: "（暂无记录）",
+    admin_port_label: "端口 {0}",
+    // ---- confirm() / prompt() texts ----
+    confirm_revoke: "吊销 {0}？\n\n将关闭其已开放的端口、清除其会话，并轮换其密钥。该用户必须使用你交付的新密钥重新认证。",
+    confirm_delete_user: "删除用户 {0}？\n\n这将移除该用户、关闭其已开放的端口，且无法撤销。",
+    confirm_delete_group: "删除分组 {0}？\n\n这将移除该分组并关闭其成员的端口。此操作无法撤销。",
+    prompt_totp_revoke: "请输入你的 6 位 TOTP 验证码以确认吊销 {0}：",
+    prompt_totp_delete_user: "请输入你的 6 位 TOTP 验证码以确认删除 {0}：",
+    prompt_totp_delete_group: "请输入你的 6 位 TOTP 验证码以确认删除分组 {0}：",
+    prompt_totp_set_admin: "请输入你的 6 位 TOTP 验证码以确认更改 {0} 的管理员权限：",
+    prompt_set_admin_pin: "设置管理 PIN 码以锁定管理控制台（加密保存的凭据）：",
+    prompt_new_secret: "{0} 的新密钥（请安全复制并交付 — 仅显示一次）：",
+    prompt_totp_disable: "请输入你当前的 TOTP 验证码以禁用双因素认证：",
+    // ---- addLog / status messages ----
+    log_connecting: "连接中…",
+    log_ip_updated: "IP 已更新：{0}{1}",
+    log_was_ip: "（原为 {0}）",
+    log_heartbeat: "心跳正常 - {0}",
+    log_auth_failed: "认证失败：{0}",
+    log_server: "服务器：{0}",
+    log_error: "错误：{0}",
+    log_unknown_error: "未知错误",
+    log_tab_resumed: "标签页恢复，立即发送心跳",
+    log_manual_knock: "手动心跳",
+    log_admin_locked: "管理后台已锁定",
+    log_created_user: "已创建 {0}（完整密钥已在响应中返回 — 请立即复制）",
+    log_created_group: "已创建分组 {0}",
+    log_revoked_new_secret: "已吊销 {0} — 已签发新密钥（仅显示一次）",
+    log_revoked: "已吊销 {0}",
+    log_deleted_user: "已删除用户 {0}",
+    log_deleted_group: "已删除分组 {0}",
+    log_admin_granted: "{0} 现在是管理员",
+    log_admin_revoked: "{0} 不再是管理员",
+    log_group_added: "已将 {0} 添加到 {1}",
+    log_group_removed: "已将 {0} 从 {1} 移除",
+    log_auth_partial: "授权部分完成：{0} 项被拒绝",
+    log_auth_saved: "授权已保存",
+    log_totp_started: "已开始 TOTP 注册 — 将密钥添加到验证器后再激活",
+    log_totp_activated: "TOTP 已激活",
+    log_totp_disabled: "TOTP 已禁用",
+    // ---- error texts ----
+    err_load_failed: "加载失败：{0}",
+    err_some_denied: "部分被拒绝：{0}",
+    err_failed: "失败",
+    err_revoke_failed: "吊销失败",
+    err_delete_failed: "删除失败",
+    err_set_admin_failed: "更改管理员权限失败",
+    err_group_change_failed: "更改分组失败",
+    err_enroll_failed: "注册失败",
+    err_activate_failed: "激活失败",
+    err_disable_failed: "禁用失败",
+    // ---- TOTP status ----
+    totp_on: "● 已启用 — 敏感操作需要 6 位验证码",
+    totp_off: "○ 已禁用 — 敏感操作未受双因素保护",
+    totp_secret_html: "密钥（手动输入）：<b>{0}</b><br><br>otpauth URI（用于二维码导入）：<br>{1}",
+  },
+};
+
+function detectLang() {
+  const saved = localStorage.getItem(LANG_KEY);
+  if (saved === "en" || saved === "zh") return saved;
+  const nav = (navigator.language || "en").toLowerCase();
+  return nav.startsWith("zh") ? "zh" : "en";
+}
+
+let lang = detectLang();
+
+// t(key, ...args): localized string with {0}, {1}... positional substitution.
+// Falls back to the English table, then to the raw key, so a missing key is
+// always visible rather than silently blank.
+const t = (k, ...args) => {
+  const tbl = I18N[lang] || I18N.en;
+  let s = (k in tbl) ? tbl[k] : (I18N.en[k] != null ? I18N.en[k] : k);
+  return String(s).replace(/\{(\d+)\}/g, (m, i) => {
+    const v = args[+i];
+    return v === undefined ? m : String(v);
+  });
+};
+
+// Walk static HTML and set textContent / placeholder from the dictionary.
+function applyI18n() {
+  document.documentElement.lang = (lang === "zh") ? "zh-CN" : "en";
+  document.querySelectorAll("[data-i18n]").forEach(el => {
+    el.textContent = t(el.dataset.i18n);
+  });
+  document.querySelectorAll("[data-i18n-ph]").forEach(el => {
+    el.setAttribute("placeholder", t(el.dataset.i18nPh));
+  });
+}
 
 // ================================================================ //
 //  DOM references
@@ -529,6 +825,7 @@ const infoIP       = $("#info-ip");
 const infoCountdown = $("#info-countdown");
 const progressFill = $("#progress");
 const logEl        = $("#log");
+const btnLang      = $("#btn-lang");
 
 // ================================================================ //
 //  State
@@ -660,20 +957,20 @@ async function doKnock() {
 
     if (result.ok) {
       currentIP = result.ip || currentIP;
-      setStatus("ok", "Connected");
+      setStatus("ok", t("status_connected"));
       infoIP.textContent = currentIP || "-";
       refreshAdminFlag();
 
       if (result.changed) {
-        const old = result.old_ip ? ` (was ${result.old_ip})` : "";
-        addLog(`IP updated: ${currentIP}${old}`, "ok");
+        const old = result.old_ip ? t("log_was_ip", result.old_ip) : "";
+        addLog(t("log_ip_updated", currentIP, old), "ok");
       } else {
-        addLog(`Heartbeat OK - ${currentIP}`, "ok");
+        addLog(t("log_heartbeat", currentIP), "ok");
       }
 
       // Show anomaly warning if credential sharing is suspected
       if (result.warning) {
-        setStatus("warn", "Warning: Anomaly Detected");
+        setStatus("warn", t("status_anomaly"));
         addLog(result.warning, "warn");
       }
     } else {
@@ -683,16 +980,16 @@ async function doKnock() {
         result.error.includes("Invalid signature") ||
         result.error.includes("expired")
       )) {
-        addLog(`Auth failed: ${result.error}`, "err");
+        addLog(t("log_auth_failed", result.error), "err");
         disconnect(result.error);
         return;
       }
-      setStatus("warn", "Warning");
-      addLog(`Server: ${result.error || "unknown error"}`, "warn");
+      setStatus("warn", t("status_warning"));
+      addLog(t("log_server", result.error || t("log_unknown_error")), "warn");
     }
   } catch (err) {
-    setStatus("err", "Network Error");
-    addLog(`Error: ${err.message}`, "err");
+    setStatus("err", t("status_network_error"));
+    addLog(t("log_error", err.message), "err");
   } finally {
     isKnocking = false;
     resetCountdown();
@@ -757,10 +1054,10 @@ async function connect(username, secret, remember) {
   loginView.hidden = true;
   dashView.hidden = false;
   infoUser.textContent = username;
-  infoIP.textContent = "detecting...";
-  setStatus("warn", "Connecting...");
+  infoIP.textContent = t("dash_detecting");
+  setStatus("warn", t("status_connecting"));
   clearLog();
-  addLog("Connecting...", "warn");
+  addLog(t("log_connecting"), "warn");
 
   // First knock
   await doKnock();
@@ -836,7 +1133,7 @@ document.addEventListener("visibilitychange", () => {
   if (document.hidden || !credentials) return;
   const elapsed = (Date.now() - lastKnockTs) / 1000;
   if (elapsed >= KNOCK_INTERVAL) {
-    addLog("Tab resumed, knocking now", "warn");
+    addLog(t("log_tab_resumed"), "warn");
     doKnock();
     // Reset the periodic timer to avoid double-knock
     stopTimers();
@@ -856,14 +1153,14 @@ loginForm.addEventListener("submit", async (e) => {
   if (!user || !secret) return;
   pendingPin = fLoginPin.value || null;
   btnConnect.disabled = true;
-  btnConnect.textContent = "Connecting...";
+  btnConnect.textContent = t("login_connecting");
   await connect(user, secret, fRemember.checked);
   btnConnect.disabled = false;
-  btnConnect.textContent = "Connect";
+  btnConnect.textContent = t("login_connect");
 });
 
 btnKnock.addEventListener("click", () => {
-  addLog("Manual knock", "warn");
+  addLog(t("log_manual_knock"), "warn");
   stopTimers();
   doKnock().then(() => { if (credentials) startTimers(); });
 });
@@ -908,7 +1205,7 @@ pinForm.addEventListener("submit", async (e) => {
   e.preventDefault();
   pinError.style.display = "none";
   if (Date.now() < pinLockedUntil) {
-    pinError.textContent = `Locked. Wait ${Math.ceil((pinLockedUntil - Date.now()) / 1000)}s.`;
+    pinError.textContent = t("pin_locked", Math.ceil((pinLockedUntil - Date.now()) / 1000));
     pinError.style.display = "block";
     return;
   }
@@ -918,9 +1215,9 @@ pinForm.addEventListener("submit", async (e) => {
     pinAttempts += 1;
     if (pinAttempts >= 5) {
       pinLockedUntil = Date.now() + 30000; // 30s cooldown
-      pinError.textContent = "Too many wrong PINs. Locked 30s.";
+      pinError.textContent = t("pin_too_many");
     } else {
-      pinError.textContent = `Wrong PIN (${pinAttempts}/5)`;
+      pinError.textContent = t("pin_wrong", pinAttempts);
     }
     pinError.style.display = "block";
     return;
@@ -978,7 +1275,7 @@ btnAdmin.addEventListener("click", async () => {
       return;
     }
     // No vault yet: prompt to set a PIN to lock admin going forward.
-    const pin = prompt("Set an admin PIN to lock the admin console (encrypts your saved credentials):");
+    const pin = prompt(t("prompt_set_admin_pin"));
     if (!pin) return;
     await encryptVault(pin, { username: credentials.username, secret: credentials.secret });
     localStorage.removeItem(STORAGE_KEY); // drop plaintext now that vault exists
@@ -1000,7 +1297,7 @@ btnLock.addEventListener("click", () => {
   // Return to dashboard if still connected, else to login.
   if (credentials) {
     dashView.hidden = false;
-    addLog("Admin locked", "warn");
+    addLog(t("log_admin_locked"), "warn");
   } else {
     loginView.hidden = false;
   }
@@ -1021,46 +1318,106 @@ async function loadAdminConsole() {
     renderAudit(audit.audit || []);
     await refreshTotp();
   } catch (err) {
-    adminError.textContent = `Load failed: ${err.message}`;
+    adminError.textContent = t("err_load_failed", err.message);
     adminError.style.display = "block";
   }
 }
 
+// Cache of the last-rendered user list so a language toggle (or membership
+// mutation) can re-render without another round-trip. Also tracks which user
+// rows currently have their inline "Manage groups" panel expanded so the state
+// survives a re-render.
+let lastUsers = [];
+const openGroupPanels = new Set();
+
 function renderUsers(users) {
+  lastUsers = users;
   adminUsersEl.innerHTML = users.map(u => {
     const ip = esc(u.current_ip || "—");
-    const admin = u.is_admin ? " [admin]" : "";
+    const admin = u.is_admin ? ` ${esc(t("admin_tag_admin"))}` : "";
     const isSelf = credentials && u.username === credentials.username;
-    const revoke = isSelf ? "" :
-      `<button class="btn-danger btn-small" data-revoke="${esc(u.id)}" data-name="${esc(u.username)}" style="float:right">Revoke</button>`;
-    return `<div style="padding:.2rem 0;clear:both">${esc(u.id)}: ${esc(u.username)}${admin} <span style="color:var(--text2)">ip=${ip}</span>${revoke}</div>`;
+    const adminLbl = u.is_admin ? t("admin_remove_admin") : t("admin_make_admin");
+    const panelOpen = openGroupPanels.has(String(u.id));
+    // Self-row: hide Delete + admin-toggle to prevent self-lockout; keep groups.
+    const adminBtn = isSelf ? "" :
+      `<button class="btn-secondary btn-small" data-setadmin="${esc(u.id)}" data-name="${esc(u.username)}" data-isadmin="${u.is_admin ? "1" : "0"}">${esc(adminLbl)}</button>`;
+    const delBtn = isSelf ? "" :
+      `<button class="btn-danger btn-small" data-deluser="${esc(u.id)}" data-name="${esc(u.username)}">${esc(t("admin_delete"))}</button>`;
+    const revokeBtn = isSelf ? "" :
+      `<button class="btn-danger btn-small" data-revoke="${esc(u.id)}" data-name="${esc(u.username)}">${esc(t("admin_revoke"))}</button>`;
+    return `<div style="padding:.35rem 0;border-bottom:1px solid var(--border)">
+      <div>${esc(u.id)}: ${esc(u.username)}${admin} <span style="color:var(--text2)">ip=${ip}</span></div>
+      <div class="actions" style="margin-top:.25rem;flex-wrap:wrap;gap:.25rem">
+        <button class="btn-secondary btn-small" data-groups="${esc(u.id)}" data-name="${esc(u.username)}">${esc(t("admin_manage_groups"))}</button>
+        ${adminBtn}${revokeBtn}${delBtn}
+      </div>
+      <div class="group-panel" data-panel="${esc(u.id)}" ${panelOpen ? "" : "hidden"} style="margin-top:.35rem;padding-left:.5rem">${panelOpen ? `<span style="color:var(--text2);font-size:.75rem">${esc(t("admin_groups_loading"))}</span>` : ""}</div>
+    </div>`;
   }).join("");
+  // Re-fetch group panels that were left open across the re-render.
+  openGroupPanels.forEach(id => { loadUserGroups(id); });
 }
 
+let lastGroups = [];
 function renderGroups(groups) {
+  lastGroups = groups;
   adminGroupsEl.innerHTML = groups.map(g =>
-    `<div>${esc(g.id)}: ${esc(g.name)} → ${esc(g.port)}/${esc(g.proto)}</div>`
+    `<div style="padding:.2rem 0;clear:both">${esc(g.id)}: ${esc(g.name)} → ${esc(g.port)}/${esc(g.proto)}
+      <button class="btn-danger btn-small" data-delgroup="${esc(g.id)}" data-name="${esc(g.name)}" style="float:right">${esc(t("admin_delete"))}</button>
+    </div>`
   ).join("");
 }
 
+// Fetch + render the per-user group checkboxes into that user's inline panel.
+async function loadUserGroups(userId) {
+  const panel = adminUsersEl.querySelector(`[data-panel="${CSS.escape(String(userId))}"]`);
+  if (!panel) return;
+  try {
+    const r = await apiAdmin("GET", `/api/admin/users/${userId}/groups`);
+    const groups = r.groups || [];
+    if (!groups.length) {
+      panel.innerHTML = `<span style="color:var(--text2);font-size:.75rem">${esc(t("admin_no_groups"))}</span>`;
+      return;
+    }
+    panel.innerHTML = groups.map(g => {
+      const checked = (g.is_member && g.enabled) ? "checked" : "";
+      return `<div class="checkbox" style="margin-bottom:.2rem">
+        <input type="checkbox" data-gmember="${esc(userId)}" data-gid="${esc(g.id)}" data-gname="${esc(g.name)}" id="ug-${esc(userId)}-${esc(g.id)}" ${checked}>
+        <label for="ug-${esc(userId)}-${esc(g.id)}" style="margin-bottom:0;font-weight:400">${esc(g.name)} (${esc(t("admin_port_label", g.port))})</label>
+      </div>`;
+    }).join("");
+  } catch (err) {
+    panel.innerHTML = `<span style="color:var(--red);font-size:.75rem">${esc(err.message)}</span>`;
+  }
+}
+
 // Audit log: newest-first event trail (actor / action / target / detail).
+let lastAudit = [];
 function renderAudit(entries) {
+  lastAudit = entries;
   adminAuditEl.innerHTML = entries.map(e => {
     const when = esc((e.created_at || "").replace("T", " "));
     const tgt = e.target ? ` → ${esc(e.target)}` : "";
     const det = e.detail ? ` <span style="color:var(--text2)">(${esc(e.detail)})</span>` : "";
     return `<div style="font-size:.75rem;padding:.1rem 0">${when} <b>${esc(e.actor)}</b> ${esc(e.action)}${tgt}${det}</div>`;
-  }).join("") || '<div style="color:var(--text2);font-size:.75rem">(no entries)</div>';
+  }).join("") || `<div style="color:var(--text2);font-size:.75rem">${esc(t("admin_audit_none"))}</div>`;
 }
 
 // My group authorization: checkboxes, first checked by default.
 let myGroupsState = [];
 function renderMyGroups(groups) {
-  myGroupsState = groups.map((g, i) => ({ ...g, checked: i === 0 ? true : !!g.enabled }));
+  // On a fresh server load each group has no `checked` field yet: default the
+  // first group to checked, others to their enabled state. On a re-render of an
+  // existing myGroupsState (e.g. language toggle) preserve the in-session
+  // `checked` selection so toggling language does not reset the user's choices.
+  myGroupsState = groups.map((g, i) => ({
+    ...g,
+    checked: ("checked" in g) ? g.checked : (i === 0 ? true : !!g.enabled),
+  }));
   myGroupsEl.innerHTML = myGroupsState.map((g, i) => `
     <div class="checkbox" style="margin-bottom:.25rem">
       <input type="checkbox" data-idx="${i}" id="mg-${esc(g.id)}" ${g.checked ? "checked" : ""}>
-      <label for="mg-${esc(g.id)}" style="margin-bottom:0;font-weight:400">${esc(g.name)} (port ${esc(g.port)})</label>
+      <label for="mg-${esc(g.id)}" style="margin-bottom:0;font-weight:400">${esc(g.name)} (${esc(t("admin_port_label", g.port))})</label>
     </div>
   `).join("");
   myGroupsEl.querySelectorAll('input[type="checkbox"]').forEach(cb => {
@@ -1081,15 +1438,15 @@ btnSaveAuth.addEventListener("click", async () => {
     const want = g.checked ? 1 : 0;
     if (g.enabled === want) continue;
     const r = await apiAdmin("PATCH", `/api/me/membership/${g.id}`, { enabled: !!want });
-    if (!r.ok) denied.push(`${g.name}: ${r.error || "failed"}`);
+    if (!r.ok) denied.push(`${g.name}: ${r.error || t("err_failed")}`);
   }
   await loadAdminConsole();
   if (denied.length) {
-    adminError.textContent = "Some denied: " + denied.join("; ");
+    adminError.textContent = t("err_some_denied", denied.join("; "));
     adminError.style.display = "block";
-    addLog(`Authorization partial: ${denied.length} denied`, "warn");
+    addLog(t("log_auth_partial", denied.length), "warn");
   } else {
-    addLog("Authorization saved", "ok");
+    addLog(t("log_auth_saved"), "ok");
   }
 });
 
@@ -1099,10 +1456,10 @@ btnAddUser.addEventListener("click", async () => {
   const is_admin = $("#new-user-admin").checked;
   const r = await apiAdmin("POST", "/api/admin/users", { username, is_admin });
   if (r.ok) {
-    addLog(`Created ${username} (full secret returned in response — copy it now)`, "ok");
+    addLog(t("log_created_user", username), "ok");
     $("#new-user").value = "";
     await loadAdminConsole();
-  } else { adminError.textContent = r.error || "failed"; adminError.style.display = "block"; }
+  } else { adminError.textContent = r.error || t("err_failed"); adminError.style.display = "block"; }
 });
 
 btnAddGroup.addEventListener("click", async () => {
@@ -1111,11 +1468,11 @@ btnAddGroup.addEventListener("click", async () => {
   if (!name || !port) return;
   const r = await apiAdmin("POST", "/api/admin/groups", { name, port });
   if (r.ok) {
-    addLog(`Created group ${name}`, "ok");
+    addLog(t("log_created_group", name), "ok");
     $("#new-group-name").value = "";
     $("#new-group-port").value = "";
     await loadAdminConsole();
-  } else { adminError.textContent = r.error || "failed"; adminError.style.display = "block"; }
+  } else { adminError.textContent = r.error || t("err_failed"); adminError.style.display = "block"; }
 });
 
 // Revoke (event-delegated): close ports + clear state + rotate secret =
@@ -1124,23 +1481,142 @@ adminUsersEl.addEventListener("click", async (e) => {
   const btn = e.target.closest("[data-revoke]");
   if (!btn) return;
   const id = btn.dataset.revoke, name = btn.dataset.name;
-  if (!confirm(`Revoke ${name}?\n\nCloses their open ports, clears their session, and rotates their secret. They must re-authenticate with a NEW secret you deliver to them.`)) return;
+  if (!confirm(t("confirm_revoke", name))) return;
   let r = await apiAdmin("POST", `/api/admin/users/${id}/revoke`, { rotate_secret: true });
   if (!r.ok && r.totp_required) {
-    const code = prompt(`Enter your 6-digit TOTP code to confirm revoking ${name}:`);
+    const code = prompt(t("prompt_totp_revoke", name));
     if (!code) return;
     r = await apiAdmin("POST", `/api/admin/users/${id}/revoke`, { rotate_secret: true, totp_code: code });
   }
   if (r.ok) {
     if (r.secret) {
-      addLog(`Revoked ${name} — new secret issued (shown once)`, "ok");
-      prompt(`New secret for ${name} (copy & deliver securely — shown once):`, r.secret);
+      addLog(t("log_revoked_new_secret", name), "ok");
+      prompt(t("prompt_new_secret", name), r.secret);
     } else {
-      addLog(`Revoked ${name}`, "ok");
+      addLog(t("log_revoked", name), "ok");
     }
     await loadAdminConsole();
   } else {
-    adminError.textContent = r.error || "revoke failed";
+    adminError.textContent = r.error || t("err_revoke_failed");
+    adminError.style.display = "block";
+  }
+});
+
+// Delete user (event-delegated, sensitive → TOTP step-up retry like Revoke).
+adminUsersEl.addEventListener("click", async (e) => {
+  const btn = e.target.closest("[data-deluser]");
+  if (!btn) return;
+  const id = btn.dataset.deluser, name = btn.dataset.name;
+  if (!confirm(t("confirm_delete_user", name))) return;
+  let r = await apiAdmin("DELETE", `/api/admin/users/${id}`);
+  if (!r.ok && r.totp_required) {
+    const code = prompt(t("prompt_totp_delete_user", name));
+    if (!code) return;
+    r = await apiAdmin("DELETE", `/api/admin/users/${id}`, { totp_code: code });
+  }
+  if (r.ok) {
+    openGroupPanels.delete(String(id));
+    addLog(t("log_deleted_user", name), "ok");
+    await loadAdminConsole();
+  } else {
+    adminError.textContent = r.error || t("err_delete_failed");
+    adminError.style.display = "block";
+  }
+});
+
+// Make/Remove admin toggle (event-delegated, sensitive → TOTP step-up retry).
+adminUsersEl.addEventListener("click", async (e) => {
+  const btn = e.target.closest("[data-setadmin]");
+  if (!btn) return;
+  const id = btn.dataset.setadmin, name = btn.dataset.name;
+  const next = btn.dataset.isadmin !== "1"; // flip current state
+  let r = await apiAdmin("POST", `/api/admin/users/${id}/admin`, { is_admin: next });
+  if (!r.ok && r.totp_required) {
+    const code = prompt(t("prompt_totp_set_admin", name));
+    if (!code) return;
+    r = await apiAdmin("POST", `/api/admin/users/${id}/admin`, { is_admin: next, totp_code: code });
+  }
+  if (r.ok) {
+    addLog(next ? t("log_admin_granted", name) : t("log_admin_revoked", name), "ok");
+    await loadAdminConsole();
+  } else {
+    adminError.textContent = r.error || t("err_set_admin_failed");
+    adminError.style.display = "block";
+  }
+});
+
+// Manage-groups toggle (event-delegated): open/close the inline panel and
+// lazily fetch the per-user group membership state on first open.
+adminUsersEl.addEventListener("click", (e) => {
+  const btn = e.target.closest("[data-groups]");
+  if (!btn) return;
+  const id = String(btn.dataset.groups);
+  const panel = adminUsersEl.querySelector(`[data-panel="${CSS.escape(id)}"]`);
+  if (!panel) return;
+  if (panel.hidden) {
+    panel.hidden = false;
+    openGroupPanels.add(id);
+    panel.innerHTML = `<span style="color:var(--text2);font-size:.75rem">${esc(t("admin_groups_loading"))}</span>`;
+    loadUserGroups(id);
+  } else {
+    panel.hidden = true;
+    openGroupPanels.delete(id);
+  }
+});
+
+// Per-user group membership checkbox (event-delegated, change). Checked =
+// authorize (POST .../groups enabled:true); unchecked = remove membership by
+// username + group name. Re-fetch the panel afterwards to reflect server truth.
+adminUsersEl.addEventListener("change", async (e) => {
+  const cb = e.target.closest("[data-gmember]");
+  if (!cb) return;
+  const userId = cb.dataset.gmember;
+  const groupId = cb.dataset.gid;
+  const groupName = cb.dataset.gname;
+  // The username for this row comes from the cached user list.
+  const row = lastUsers.find(u => String(u.id) === String(userId));
+  const username = row ? row.username : "";
+  adminError.style.display = "none";
+  cb.disabled = true;
+  try {
+    let r;
+    if (cb.checked) {
+      r = await apiAdmin("POST", `/api/admin/users/${userId}/groups`, { group_id: Number(groupId), enabled: true });
+      if (r.ok) addLog(t("log_group_added", username, groupName), "ok");
+    } else {
+      r = await apiAdmin("POST", "/api/admin/memberships/remove", { username, group_name: groupName });
+      if (r.ok) addLog(t("log_group_removed", username, groupName), "warn");
+    }
+    if (!r.ok) {
+      adminError.textContent = r.error || t("err_group_change_failed");
+      adminError.style.display = "block";
+    }
+  } catch (err) {
+    adminError.textContent = err.message;
+    adminError.style.display = "block";
+  } finally {
+    // Re-fetch to reflect server truth (also re-enables the checkbox).
+    await loadUserGroups(userId);
+  }
+});
+
+// Delete group (event-delegated, sensitive → TOTP step-up retry like Revoke).
+adminGroupsEl.addEventListener("click", async (e) => {
+  const btn = e.target.closest("[data-delgroup]");
+  if (!btn) return;
+  const id = btn.dataset.delgroup, name = btn.dataset.name;
+  if (!confirm(t("confirm_delete_group", name))) return;
+  let r = await apiAdmin("DELETE", `/api/admin/groups/${id}`);
+  if (!r.ok && r.totp_required) {
+    const code = prompt(t("prompt_totp_delete_group", name));
+    if (!code) return;
+    r = await apiAdmin("DELETE", `/api/admin/groups/${id}`, { totp_code: code });
+  }
+  if (r.ok) {
+    addLog(t("log_deleted_group", name), "ok");
+    await loadAdminConsole();
+  } else {
+    adminError.textContent = r.error || t("err_delete_failed");
     adminError.style.display = "block";
   }
 });
@@ -1155,17 +1631,15 @@ async function refreshTotp() {
   const a = await buildAuth(credentials.username, credentials.secret);
   const r = await (await fetch("/api/status", { headers: { Authorization: a } })).json();
   const on = !!(r.ok && r.totp_enabled);
-  totpStatus.textContent = on
-    ? "● Enabled — sensitive actions require a 6-digit code"
-    : "○ Disabled — sensitive actions are not 2FA-protected";
+  totpStatus.textContent = on ? t("totp_on") : t("totp_off");
 }
 
 btnTotpEnroll.addEventListener("click", async () => {
   const r = await apiAdmin("POST", "/api/admin/totp/enroll");
-  if (!r.ok) { adminError.textContent = r.error || "enroll failed"; adminError.style.display = "block"; return; }
-  totpSecretEl.innerHTML = `Secret (manual entry): <b>${esc(r.secret)}</b><br><br>otpauth URI (for QR import):<br>${esc(r.otpauth_uri)}`;
+  if (!r.ok) { adminError.textContent = r.error || t("err_enroll_failed"); adminError.style.display = "block"; return; }
+  totpSecretEl.innerHTML = t("totp_secret_html", esc(r.secret), esc(r.otpauth_uri));
   totpEnrollBox.hidden = false;
-  addLog("TOTP enrollment started — add the secret to your authenticator, then activate", "warn");
+  addLog(t("log_totp_started"), "warn");
 });
 
 btnTotpActivate.addEventListener("click", async () => {
@@ -1173,20 +1647,45 @@ btnTotpActivate.addEventListener("click", async () => {
   if (!code) return;
   const r = await apiAdmin("POST", "/api/admin/totp/activate", { totp_code: code });
   if (r.ok) {
-    addLog("TOTP activated", "ok");
+    addLog(t("log_totp_activated"), "ok");
     $("#totp-code").value = "";
     totpEnrollBox.hidden = true;
     await refreshTotp();
-  } else { adminError.textContent = r.error || "activate failed"; adminError.style.display = "block"; }
+  } else { adminError.textContent = r.error || t("err_activate_failed"); adminError.style.display = "block"; }
 });
 
 btnTotpDisable.addEventListener("click", async () => {
-  const code = prompt("Enter your current TOTP code to disable 2FA:");
+  const code = prompt(t("prompt_totp_disable"));
   if (code === null) return;
   const r = await apiAdmin("DELETE", "/api/admin/totp", { totp_code: code });
-  if (r.ok) { addLog("TOTP disabled", "warn"); await refreshTotp(); }
-  else { adminError.textContent = r.error || "disable failed"; adminError.style.display = "block"; }
+  if (r.ok) { addLog(t("log_totp_disabled"), "warn"); await refreshTotp(); }
+  else { adminError.textContent = r.error || t("err_disable_failed"); adminError.style.display = "block"; }
 });
+
+// ================================================================ //
+//  Language toggle (中文 / EN)
+// ================================================================ //
+
+// Flip language, persist, re-apply static translations, and re-run any
+// dynamic renders that are currently on screen so JS-built strings switch too.
+btnLang.addEventListener("click", () => {
+  lang = (lang === "zh") ? "en" : "zh";
+  localStorage.setItem(LANG_KEY, lang);
+  applyI18n();
+  // Re-render dynamic content that does not live in [data-i18n] nodes.
+  if (!adminView.hidden) {
+    renderUsers(lastUsers);
+    renderGroups(lastGroups);
+    renderMyGroups(myGroupsState);
+    renderAudit(lastAudit);
+    refreshTotp();
+  }
+  // Refresh the connect button label if it is mid-flight ("Connecting...").
+  if (btnConnect.disabled) btnConnect.textContent = t("login_connecting");
+});
+
+// Localize static HTML on first load (before first paint).
+applyI18n();
 
 })();
 </script>
