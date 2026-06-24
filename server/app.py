@@ -1344,8 +1344,10 @@ def main():
         description="UFW OkBoy - Dynamic Firewall Allowlist Manager",
     )
     parser.add_argument(
-        "-c", "--config", default="config.yaml",
-        help="Path to config file (default: config.yaml)",
+        "-c", "--config",
+        default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.yaml"),
+        help="Path to config file (default: config.yaml next to app.py, so "
+             "management commands work from any working directory)",
     )
     parser.add_argument(
         "-V", "--version", action="version",
