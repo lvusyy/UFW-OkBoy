@@ -331,6 +331,12 @@ def create_app(config_path: str = "config.yaml",
                 "ok": False, "error": "Request body must include 'enabled' (bool)",
             }), 400
 
+        # Existence check FIRST (404) so a typo'd group_id is reported as
+        # not-found rather than a misleading 403 unauthorized (fixes H-10).
+        group = db.get_group(group_id)
+        if not group:
+            return jsonify({"ok": False, "error": "Group not found"}), 404
+
         # Self-enable authorization check (VULN-A): re-enable only if the
         # user was previously authorized for this group.
         if enabled and not auth.is_admin(db, username):
@@ -347,10 +353,6 @@ def create_app(config_path: str = "config.yaml",
                              "authorized group. Ask an admin to grant access.",
                 }), 403
 
-        group = db.get_group(group_id)
-        if not group:
-            return jsonify({"ok": False, "error": "Group not found"}), 404
-
         db.set_membership_enabled(requester["id"], group_id, 1 if enabled else 0)
 
         user_ip = requester["current_ip"]
@@ -361,9 +363,12 @@ def create_app(config_path: str = "config.yaml",
                     group["proto"], group["name"],
                 )
             else:
-                ufw.add_rule(
-                    user_ip, group["port"], requester["username"],
-                    group["proto"], group["name"],
+                # Idempotent add via reconcile: checks existence first so
+                # re-enabling a group whose rule already exists is a no-op
+                # rather than a duplicate-add error (fixes H-11).
+                ufw.reconcile_user_rules(
+                    requester["username"], user_ip,
+                    {group["name"]: (group["port"], group["proto"])},
                 )
 
         db.log_audit(
@@ -404,6 +409,15 @@ def create_app(config_path: str = "config.yaml",
                 "error": "Request body must include 'enabled' (bool)",
             }), 400
 
+        # Existence checks FIRST (404) so typos are reported as not-found
+        # rather than misleading 403 unauthorized (fixes H-10).
+        group = db.get_group(group_id)
+        if not group:
+            return jsonify({"ok": False, "error": "Group not found"}), 404
+        target = db.get_user(user_id)
+        if not target:
+            return jsonify({"ok": False, "error": "User not found"}), 404
+
         # Self-enable authorization check (VULN-A): a non-admin user may only
         # re-enable a group they were previously authorized for. Enabling a
         # group they have never been granted requires an admin (join API).
@@ -421,13 +435,6 @@ def create_app(config_path: str = "config.yaml",
                              "previously authorized for. Ask an admin to grant access.",
                 }), 403
 
-        group = db.get_group(group_id)
-        if not group:
-            return jsonify({"ok": False, "error": "Group not found"}), 404
-        target = db.get_user(user_id)
-        if not target:
-            return jsonify({"ok": False, "error": "User not found"}), 404
-
         db.set_membership_enabled(user_id, group_id, 1 if enabled else 0)
 
         user_ip = target["current_ip"]
@@ -438,9 +445,10 @@ def create_app(config_path: str = "config.yaml",
                     group["proto"], group["name"],
                 )
             else:
-                ufw.add_rule(
-                    user_ip, group["port"], target["username"],
-                    group["proto"], group["name"],
+                # Idempotent add via reconcile (fixes H-11).
+                ufw.reconcile_user_rules(
+                    target["username"], user_ip,
+                    {group["name"]: (group["port"], group["proto"])},
                 )
 
         db.log_audit(
