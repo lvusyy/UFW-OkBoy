@@ -39,11 +39,20 @@
 | **版本号体系** | `VERSION` 文件单一真源 + `app.py --version`，构建/升级统一读取 |
 | **暴力/滥用限流** | 同一 IP 认证失败过多自动 429（按 IP，不误伤正常用户）；Nginx limit_req 协同；`failed_attempts` 索引加速 |
 | **用户下线 + 强制重认证** | 一键 `revoke`：关端口 + 清在线态 + 轮换密钥（旧凭据即时失效）；管理页 Revoke 按钮 |
-| **管理员 TOTP 二次验证** | 删除/下线等敏感操作需 6 位动态码（RFC 6238，兼容 Authenticator），管理页 Two-Factor 面板自助启用 |
+| **管理员 TOTP 二次验证** | **所有管理写操作**（建/删用户·分组、成员变更、下线、提权）启用 TOTP 后需 6 位动态码（RFC 6238，兼容 Authenticator），管理页 Two-Factor 面板自助启用 |
 | **审计日志查看** | 管理页 Audit Log 面板直接查看操作审计，无需登录服务器 |
 | **数据备份 / 恢复** | `backup`/`restore`：SQLite 在线备份 API + SHA-256 校验和 + 滚动保留 + 篡改拒绝 |
 | **防 IP 伪造 (H-9)** | X-Real-IP / X-Forwarded-For 仅信任 `trusted_proxies` 列表内的直连来源，杜绝伪造 IP 入白名单 |
 | **knock 原子化** | IP 变更的状态更新与 ip_change 日志合并为单事务，消除撕裂窗口 |
+
+## v2.1.1 安全修复
+
+| 修复 | 说明 |
+|------|------|
+| **step-up 越权封堵** | 建用户/建分组/成员增删等管理写操作此前缺二次验证，偷到 admin 密钥（无 TOTP）者可绕过校验直接新建管理员；现所有管理写操作统一纳入 step-up |
+| **防 2FA 接管** | `totp/enroll` 再注册需当前动态码，杜绝用泄露会话覆盖/关闭管理员 2FA |
+| **防 IP 伪造** | `X-Forwarded-For` 取最右 hop（紧邻可信代理），客户端无法伪造最左项把任意 IP 注册进白名单 |
+| **TOTP 重放保护** | 用过的动态码在窗口内重放即拒（RFC 6238 §5.2）；step-up 失败计入 IP 限流；可由 `totp_replay_protection` 开关 |
 
 ## 为什么需要它
 
@@ -174,7 +183,7 @@ server/
   static/index.html   Web 客户端（单文件 SPA，无需构建）
   config.example.yaml 配置模板
   requirements.txt    依赖清单
-  tests/              单元测试（52 tests）
+  tests/              单元测试（120 tests）
 client/
   knock.py            Python 客户端（仅标准库）
   knock.sh            Shell 客户端（curl + openssl）
@@ -185,6 +194,7 @@ deploy/
   deploy.sh           一键部署脚本（多发行版 + 自签/Let's Encrypt）
   quick-install.sh    curl | bash 一行安装
   install-client.sh   客户端一键安装
+  upgrade.sh          一键升级（备份→迁移→重启→失败回滚）
   build-release.sh    发布包构建脚本
   ufw-okboy.service   Systemd 服务（Gunicorn）
   ufw-okboy-cleanup.* 过期规则清理定时器

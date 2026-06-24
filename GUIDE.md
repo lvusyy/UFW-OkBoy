@@ -808,7 +808,9 @@ LIMIT 20;
 
 ### 管理员二次验证（TOTP / 2FA）
 
-删除用户 / 删除分组 / 下线等敏感操作可要求一次性动态码（RFC 6238，兼容 Google Authenticator、Authy）。管理页 **Two-Factor** 面板 → **Enroll** → 把密钥/`otpauth://` 加入验证器 App → 输入 6 位码 **Activate** 即启用。之后敏感操作会弹窗要求当前码；命令行/API 用 `X-TOTP-Code` 头或请求体 `totp_code` 提供。设 `require_admin_totp: true` 可强制所有管理员先启用。
+**所有管理写操作**（建/删用户、建/删分组、成员增删、下线 revoke、提权 set-admin）在启用 TOTP 后均要求一次性动态码（RFC 6238，兼容 Google Authenticator、Authy）。管理页 **Two-Factor** 面板 → **Enroll**（已启用时再注册需当前码，防 2FA 接管）→ 把密钥/`otpauth://` 加入验证器 App → 输入 6 位码 **Activate** 即启用。之后敏感操作会弹窗要求当前码；命令行/API 用 `X-TOTP-Code` 头或请求体 `totp_code` 提供。设 `require_admin_totp: true` 可强制所有管理员先启用。
+
+> **重放保护**（默认开）：已用过的动态码在窗口内重放即拒（RFC 6238 §5.2），step-up 失败计入 IP 限流。如需同一 30s 窗口内连续多次敏感操作复用同一码，可设 `totp_replay_protection: false`。
 
 ### 审计日志
 
@@ -885,7 +887,7 @@ v2.1 引入 `schema_version` 表与迁移注册表。`Database.init()` 启动时
 ```bash
 # 版本号自动从 VERSION 文件读取，无需手动传参
 bash deploy/build-release.sh
-# 或显式指定：bash deploy/build-release.sh v2.1.0
+# 或显式指定：bash deploy/build-release.sh v2.1.1
 ```
 
 ---
