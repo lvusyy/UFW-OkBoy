@@ -53,10 +53,17 @@ trusted_proxies:
 throttle_max_failures: 10
 throttle_window: 300
 
-# Require a 6-digit TOTP code for sensitive admin actions (revoke / delete user /
-# delete group) once an admin enrolls 2FA in the admin console. Set to true to
-# also BLOCK un-enrolled admins from those actions (forces enrollment).
+# Require a 6-digit TOTP code for sensitive admin actions (create/delete user,
+# create/delete group, membership changes, revoke, promote) once an admin enrolls
+# 2FA in the admin console. Set to true to also BLOCK un-enrolled admins from
+# those actions (forces enrollment).
 require_admin_totp: false
+
+# Reject replay of an already-consumed TOTP step-up code (RFC 6238 §5.2): each
+# sensitive action needs a fresh code. Set false to restore the prior stateless
+# behavior (a code stays valid for its full ±step window) if you do many
+# back-to-back admin actions and prefer reusing one code per 30s window.
+totp_replay_protection: true
 
 # ---------- Anomaly Detection ---------- #
 

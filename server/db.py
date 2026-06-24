@@ -33,6 +33,7 @@ SCHEMA: dict[str, str] = {
             last_knock INTEGER,
             totp_secret TEXT,
             totp_enabled INTEGER NOT NULL DEFAULT 0,
+            totp_last_counter INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL DEFAULT (datetime('now'))
         )
     """,
@@ -96,6 +97,8 @@ SCHEMA: dict[str, str] = {
 MIGRATIONS: list[tuple[int, str]] = [
     (1, "baseline 6-table schema + legacy JSON import"),
     (2, "add TOTP step-up columns (totp_secret, totp_enabled) to users"),
+    (3, "add totp_last_counter to users (TOTP replay protection)"),
+    (4, "add UNIQUE(port, proto) index on groups when data permits"),
 ]
 
 CURRENT_SCHEMA_VERSION: int = MIGRATIONS[-1][0]
@@ -216,6 +219,10 @@ class Database:
                 continue
             if version == 2:
                 self._migration_002_totp()
+            elif version == 3:
+                self._migration_003_totp_counter()
+            elif version == 4:
+                self._migration_004_groups_port_proto_unique()
             self._record_migration(version)
             applied.append(version)
         if applied:
@@ -233,6 +240,51 @@ class Database:
             self.conn.execute("ALTER TABLE users ADD COLUMN totp_secret TEXT")
         if "totp_enabled" not in cols:
             self.conn.execute("ALTER TABLE users ADD COLUMN totp_enabled INTEGER NOT NULL DEFAULT 0")
+        self.conn.commit()
+
+    def _migration_003_totp_counter(self) -> None:
+        """v3: add totp_last_counter to users (idempotent ALTER).
+
+        Tracks the last TOTP counter consumed by a step-up so a code cannot be
+        replayed within its validity window (RFC 6238 §5.2). Fresh installs have
+        it from SCHEMA; this brings an older users table up to date.
+        """
+        cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(users)")}
+        if "totp_last_counter" not in cols:
+            self.conn.execute(
+                "ALTER TABLE users ADD COLUMN totp_last_counter INTEGER NOT NULL DEFAULT 0"
+            )
+        self.conn.commit()
+
+    def _migration_004_groups_port_proto_unique(self) -> None:
+        """v4: add a UNIQUE(port, proto) index on groups — defensively.
+
+        Closes the TOCTOU window where two concurrent admin creates both pass the
+        app-level duplicate-port check and both insert. Applied only when SAFE: a
+        legacy groups table without port/proto columns, or one that already holds
+        duplicate (port, proto) rows (historical same-port groups), is left
+        UNTOUCHED — the migration must never crash or drop data. Such installs
+        keep relying on the app-level 409 check; once duplicates are removed a
+        later run adds the index.
+        """
+        cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(groups)")}
+        if not {"port", "proto"} <= cols:
+            logger.info("groups table predates port/proto; skipping unique index")
+            return
+        dups = self.conn.execute(
+            "SELECT port, proto, COUNT(*) AS c FROM groups "
+            "GROUP BY port, proto HAVING c > 1"
+        ).fetchall()
+        if dups:
+            logger.warning(
+                "groups: %d duplicate (port,proto) present; skipping UNIQUE index "
+                "(app-level 409 check still blocks new duplicates)", len(dups),
+            )
+            return
+        self.conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_groups_port_proto "
+            "ON groups(port, proto)"
+        )
         self.conn.commit()
 
     def close(self) -> None:
@@ -297,9 +349,13 @@ class Database:
         self.conn.commit()
 
     def set_totp_secret(self, user_id: int, secret: str) -> None:
-        """Store a pending TOTP secret (enrollment); stays disabled until activated."""
+        """Store a pending TOTP secret (enrollment); stays disabled until activated.
+
+        Resets totp_last_counter so the fresh secret starts with a clean replay
+        window.
+        """
         self.conn.execute(
-            "UPDATE users SET totp_secret=?, totp_enabled=0 WHERE id=?",
+            "UPDATE users SET totp_secret=?, totp_enabled=0, totp_last_counter=0 WHERE id=?",
             (secret, user_id),
         )
         self.conn.commit()
@@ -315,6 +371,22 @@ class Database:
         """Remove TOTP enrollment for a user (clears the secret and the flag)."""
         self.conn.execute(
             "UPDATE users SET totp_secret=NULL, totp_enabled=0 WHERE id=?", (user_id,),
+        )
+        self.conn.commit()
+
+    def get_totp_last_counter(self, user_id: int) -> int:
+        """Return the last TOTP counter consumed by this user (0 if never)."""
+        row = self.conn.execute(
+            "SELECT totp_last_counter FROM users WHERE id=?", (user_id,),
+        ).fetchone()
+        if not row or row["totp_last_counter"] is None:
+            return 0
+        return int(row["totp_last_counter"])
+
+    def set_totp_last_counter(self, user_id: int, counter: int) -> None:
+        """Record the latest TOTP counter consumed (step-up replay protection)."""
+        self.conn.execute(
+            "UPDATE users SET totp_last_counter=? WHERE id=?", (counter, user_id),
         )
         self.conn.commit()
 
@@ -556,27 +628,39 @@ class Database:
         )
         self.conn.commit()
 
-    def record_ip_change(self, user_id: int, username: str, ip: str,
-                         old_ip: str | None) -> None:
-        """Atomically apply an IP change in a single transaction.
+    def record_ip_change(self, user_id: int, username: str, ip: str) -> str | None:
+        """Atomically claim *ip* for the user and return the prior current_ip.
 
-        Updates current_ip + last_knock AND appends the ip_change operation-log
-        row together, so an interrupted knock can never leave the audit/anomaly
-        trail out of sync with the stored IP (closes ORPHAN-D's torn-write
-        window). The ``with self.conn`` block commits on success / rolls back on
-        error.
+        Reads the user's current_ip and writes the new one in ONE transaction,
+        together with the current_ip/last_knock update and — only when the IP
+        actually changed — the ip_change operation-log row, so the stored IP, the
+        audit/anomaly trail, and the returned prior value can never disagree
+        (closes ORPHAN-D's torn-write window). The prior IP is read inside the
+        same transaction, so the knock path logs the true superseded IP and
+        decides heartbeat-vs-change from it rather than a separate stale read.
+        UFW cleanup of the prior IP's rules is handled comprehensively by
+        reconcile_user_rules on every knock.
+
+        Returns the prior current_ip (None on a first knock; equal to *ip* on a
+        heartbeat with no change).
         """
         now = int(time.time())
         with self.conn:
+            row = self.conn.execute(
+                "SELECT current_ip FROM users WHERE id=?", (user_id,),
+            ).fetchone()
+            prior = row["current_ip"] if row else None
             self.conn.execute(
                 "UPDATE users SET current_ip=?, last_knock=? WHERE id=?",
                 (ip, now, user_id),
             )
-            self.conn.execute(
-                "INSERT INTO operation_log (username, action, ip, detail) "
-                "VALUES (?, 'ip_change', ?, ?)",
-                (username, ip, f"old={old_ip}"),
-            )
+            if prior != ip:
+                self.conn.execute(
+                    "INSERT INTO operation_log (username, action, ip, detail) "
+                    "VALUES (?, 'ip_change', ?, ?)",
+                    (username, ip, f"old={prior}"),
+                )
+        return prior
 
     def count_recent_ip_changes(self, username: str, window_seconds: int) -> int:
         """Count ip_change operation_log rows for a user within the time window."""

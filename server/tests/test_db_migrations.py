@@ -58,6 +58,40 @@ class TestMigrations(unittest.TestCase):
         self.assertGreaterEqual(CURRENT_SCHEMA_VERSION, 1)
         self.assertTrue(any(v == 1 for v, _ in MIGRATIONS))
 
+    def test_port_proto_unique_index_created_on_clean_db(self) -> None:
+        """A fresh DB gets the defensive UNIQUE(port, proto) index on groups."""
+        db = Database(self.db_path)
+        db.init()
+        idx = db.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' "
+            "AND name='idx_groups_port_proto'"
+        ).fetchone()
+        self.assertIsNotNone(idx)
+        db.close()
+
+    def test_port_proto_index_skipped_when_duplicates_exist(self) -> None:
+        """A legacy DB with duplicate (port, proto) groups must NOT crash the
+        migration or lose data — the index is skipped; the app-level 409 check
+        still guards new duplicates."""
+        db = Database(self.db_path)
+        db.init()
+        db.conn.execute("DROP INDEX IF EXISTS idx_groups_port_proto")
+        db.create_group("g1", 9000, "tcp")
+        # Insert a raw duplicate (the index is gone, so SQLite allows it).
+        db.conn.execute("INSERT INTO groups (name, port, proto) VALUES ('g2', 9000, 'tcp')")
+        db.conn.commit()
+        db._migration_004_groups_port_proto_unique()  # must not raise
+        idx = db.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' "
+            "AND name='idx_groups_port_proto'"
+        ).fetchone()
+        self.assertIsNone(idx)  # skipped — duplicates present
+        count = db.conn.execute(
+            "SELECT COUNT(*) AS c FROM groups WHERE port=9000"
+        ).fetchone()["c"]
+        self.assertEqual(count, 2)  # no data loss
+        db.close()
+
 
 if __name__ == "__main__":
     unittest.main()

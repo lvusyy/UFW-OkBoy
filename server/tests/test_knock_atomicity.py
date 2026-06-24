@@ -45,7 +45,9 @@ class TestRecordIpChange(unittest.TestCase):
         self.db.close()
 
     def test_applies_ip_knock_and_log_together(self) -> None:
-        self.db.record_ip_change(self.uid, "u", "2.2.2.2", "1.1.1.1")
+        self.db.set_user_ip(self.uid, "1.1.1.1")
+        prior = self.db.record_ip_change(self.uid, "u", "2.2.2.2")
+        self.assertEqual(prior, "1.1.1.1")
         user = self.db.get_user(self.uid)
         self.assertEqual(user["current_ip"], "2.2.2.2")
         self.assertIsNotNone(user["last_knock"])
@@ -56,12 +58,23 @@ class TestRecordIpChange(unittest.TestCase):
         self.assertEqual(rows[0]["ip"], "2.2.2.2")
         self.assertEqual(rows[0]["detail"], "old=1.1.1.1")
 
+    def test_same_ip_is_heartbeat_no_log(self) -> None:
+        self.db.set_user_ip(self.uid, "5.5.5.5")
+        prior = self.db.record_ip_change(self.uid, "u", "5.5.5.5")
+        self.assertEqual(prior, "5.5.5.5")
+        # No actual change → no ip_change row logged.
+        count = self.db.conn.execute(
+            "SELECT COUNT(*) AS c FROM operation_log WHERE action='ip_change'",
+        ).fetchone()["c"]
+        self.assertEqual(count, 0)
+
     def test_rolls_back_completely_on_failure(self) -> None:
         self.db.set_user_ip(self.uid, "1.1.1.1")
         # username=None violates operation_log.username NOT NULL → the INSERT
-        # fails AFTER the UPDATE; the whole transaction must roll back.
+        # fails AFTER the UPDATE; the whole transaction must roll back. (prior IP
+        # 1.1.1.1 != 2.2.2.2, so the ip_change INSERT is attempted.)
         with self.assertRaises(sqlite3.IntegrityError):
-            self.db.record_ip_change(self.uid, None, "2.2.2.2", "1.1.1.1")
+            self.db.record_ip_change(self.uid, None, "2.2.2.2")
         # UPDATE reverted — current_ip unchanged, no partial log row.
         self.assertEqual(self.db.get_user(self.uid)["current_ip"], "1.1.1.1")
         count = self.db.conn.execute(

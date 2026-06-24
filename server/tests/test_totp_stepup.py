@@ -268,6 +268,24 @@ class TestTOTPStepUp(unittest.TestCase):
         self.assertEqual(ok.status_code, 200)
         self.assertIn("secret", ok.get_json())
 
+    def test_stepup_code_cannot_be_replayed(self) -> None:
+        """A consumed step-up code is rejected on reuse within its window
+        (RFC 6238 §5.2 replay protection)."""
+        secret = self._enroll_admin()
+        code = auth.totp_now(secret)
+        first = self.client.post(
+            f"/api/admin/users/{self.alice_id}/revoke",
+            headers={"Authorization": self._admin_header(), "X-TOTP-Code": code},
+        )
+        self.assertEqual(first.status_code, 200)
+        # Same code, same window → replay rejected.
+        second = self.client.post(
+            f"/api/admin/users/{self.alice_id}/revoke",
+            headers={"Authorization": self._admin_header(), "X-TOTP-Code": code},
+        )
+        self.assertEqual(second.status_code, 403)
+        self.assertTrue(second.get_json()["totp_required"])
+
 
 class TestSchemaMigration(unittest.TestCase):
     """The additive column migration upgrades an old users table in place."""

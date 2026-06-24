@@ -134,6 +134,11 @@ def create_app(config_path: str = "config.yaml",
     throttle_window = cfg.get("throttle_window", 300)
     # When true, admins without TOTP are blocked from sensitive ops until enrolled.
     require_admin_totp = cfg.get("require_admin_totp", False)
+    # Reject replay of an already-consumed TOTP step-up code (RFC 6238 §5.2).
+    # Knob: set false to restore the prior stateless behavior (a code stays valid
+    # for its full ±window). Keep on unless rapid back-to-back step-ups reusing
+    # the same code are required.
+    totp_replay_protection = cfg.get("totp_replay_protection", True)
 
     def _auth():
         return auth.verify_hmac(
@@ -205,18 +210,24 @@ def create_app(config_path: str = "config.yaml",
         enabled_groups_ports = {
             grp["name"]: (grp["port"], grp["proto"]) for grp in enabled_groups
         }
-        old_ip = db.get_user_ip(username)
-
         # Idempotent reconcile: align UFW rules with the user's enabled groups.
-        # Runs on BOTH the heartbeat path (IP unchanged) and the IP-change path,
-        # so any desync (recent join/leave, concurrent membership change, stale
-        # rules from a crashed knock, stale old-IP rules) is self-healed every
-        # knock. Fixes BUG-A/C; per-group proto preserved (fixes H-2).
+        # In ONE numbered pass it adds the client_ip rules and removes every rule
+        # whose IP differs from client_ip (or whose group is no longer enabled),
+        # so it is the comprehensive self-heal — any transient cross-knock orphan
+        # is cleaned on the next heartbeat. Fixes BUG-A/C; per-group proto
+        # preserved (fixes H-2).
         ufw.reconcile_user_rules(username, client_ip, enabled_groups_ports)
 
-        # IP unchanged - just refresh the timestamp
+        # Atomic state write: read the prior IP and write current_ip + last_knock
+        # (+ an ip_change log row only when it actually changed) in ONE
+        # transaction (fixes ORPHAN-D torn write). Returns the TRUE superseded IP,
+        # so heartbeat-vs-change, the "old=" log, and the targeted old-IP removal
+        # below are all accurate under concurrent knocks — no separate stale read.
+        old_ip = db.record_ip_change(user_id, username, client_ip)
+
+        # IP unchanged - reconcile refreshed the rules, the write bumped the
+        # timestamp; report a heartbeat.
         if old_ip == client_ip:
-            db.update_knock_time(user_id, client_ip)
             logger.info("Knock: %s@%s (unchanged, reconciled)", username, client_ip)
             return jsonify({
                 "ok": True,
@@ -225,16 +236,14 @@ def create_app(config_path: str = "config.yaml",
                 "message": "IP unchanged, heartbeat recorded",
             })
 
-        # IP changed - the reconcile above already added the new-ip rules;
-        # now remove rules bound to the old IP for every enabled group.
+        # IP changed: targeted removal of any rule still bound to the prior IP for
+        # each enabled group, driven by the true superseded IP from the atomic
+        # swap (not a stale read), so it always hits the right address.
         if old_ip:
             for grp in enabled_groups:
                 ufw.remove_rule(old_ip, grp["port"], username, grp["proto"], grp["name"])
             logger.info("Removed old-IP rules for %s (was %s)", username, old_ip)
 
-        # Atomic state write: current_ip + last_knock + ip_change log in ONE
-        # transaction (fixes ORPHAN-D torn write between the old 3 commits).
-        db.record_ip_change(user_id, username, client_ip, old_ip)
         logger.info("Knock: %s@%s (was %s)", username, client_ip, old_ip or "new")
 
         # Check for anomalous IP change patterns (possible credential sharing)
@@ -503,9 +512,14 @@ def create_app(config_path: str = "config.yaml",
         if enabled:
             code = (request.headers.get("X-TOTP-Code")
                     or (request.get_json(silent=True) or {}).get("totp_code"))
-            if not auth.verify_totp(user["totp_secret"], code):
-                db.log_audit(user["username"], "stepup_failed", user["username"], None)
-                # Count a bad step-up code toward the IP throttle; otherwise an
+            matched = auth.verify_totp_counter(user["totp_secret"], code)
+            last = user["totp_last_counter"] if "totp_last_counter" in user.keys() else 0
+            replayed = (totp_replay_protection and matched is not None
+                        and matched <= last)
+            if matched is None or replayed:
+                db.log_audit(user["username"], "stepup_failed", user["username"],
+                             "replay" if replayed else None)
+                # Count a bad/replayed step-up code toward the IP throttle; else an
                 # already-admin-authenticated caller could brute-force the 6-digit
                 # code unbounded (the HMAC throttle never sees these attempts).
                 db.record_failed_attempt(user["username"], _client_ip(), "Invalid TOTP step-up")
@@ -513,6 +527,8 @@ def create_app(config_path: str = "config.yaml",
                     "ok": False, "error": "Valid TOTP code required",
                     "totp_required": True,
                 }), 403
+            if totp_replay_protection:
+                db.set_totp_last_counter(user["id"], matched)
         elif require_admin_totp:
             return jsonify({
                 "ok": False,
@@ -644,6 +660,12 @@ def create_app(config_path: str = "config.yaml",
         try:
             group_id = db.create_group(name, port_int, proto)
         except sqlite3.IntegrityError:
+            # Two UNIQUE constraints can fire: groups.name, and (on clean DBs) the
+            # defensive (port, proto) index. Name the real cause.
+            if db.get_group_by_port_proto(port_int, proto):
+                return jsonify({
+                    "ok": False, "error": f"Port {port_int}/{proto} is already in use",
+                }), 409
             return jsonify({"ok": False, "error": f"Group '{name}' already exists"}), 409
         db.log_audit(user["username"], "group_add", name, f"port={port_int} proto={proto}")
         return jsonify({

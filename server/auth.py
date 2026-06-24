@@ -212,23 +212,35 @@ def totp_now(secret: str, t: int | None = None,
     return _hotp(_b32decode(secret), t // step, digits)
 
 
-def verify_totp(secret: str | None, code: str | None, t: int | None = None,
-                step: int = 30, digits: int = 6, window: int = 1) -> bool:
-    """Constant-time verify *code* against *secret*, tolerating ±*window* steps.
+def verify_totp_counter(secret: str | None, code: str | None, t: int | None = None,
+                        step: int = 30, digits: int = 6, window: int = 1) -> int | None:
+    """Constant-time verify *code* and return the MATCHED absolute counter
+    (``t // step + w``), or None if no match within ±*window* steps.
 
-    The window absorbs clock skew between the server and the authenticator
-    (default ±1 step = ±30s). Returns False for empty secret/code.
+    The window absorbs clock skew between server and authenticator (default ±1
+    step = ±30s). The caller can persist the returned counter to reject replay of
+    an already-consumed code (RFC 6238 §5.2). Returns None for empty secret/code.
     """
     if not secret or not code:
-        return False
+        return None
     code = code.strip()
     t = int(time.time()) if t is None else t
     key = _b32decode(secret)
     counter = t // step
     for w in range(-window, window + 1):
         if hmac.compare_digest(_hotp(key, counter + w, digits), code):
-            return True
-    return False
+            return counter + w
+    return None
+
+
+def verify_totp(secret: str | None, code: str | None, t: int | None = None,
+                step: int = 30, digits: int = 6, window: int = 1) -> bool:
+    """Constant-time verify *code* against *secret*, tolerating ±*window* steps.
+
+    Thin bool wrapper over verify_totp_counter (the step-up path uses the counter
+    form for replay protection). Returns False for empty secret/code.
+    """
+    return verify_totp_counter(secret, code, t, step, digits, window) is not None
 
 
 def totp_uri(secret: str, username: str, issuer: str = "UFW-OkBoy") -> str:
