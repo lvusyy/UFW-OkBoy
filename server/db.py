@@ -340,6 +340,16 @@ class Database:
             "SELECT * FROM groups WHERE name=?", (name,),
         ).fetchone()
 
+    def get_group_by_port_proto(self, port: int, proto: str) -> sqlite3.Row | None:
+        """Return the group bound to (*port*, *proto*), or None.
+
+        A port maps to a single access group; this lets the create paths reject
+        a duplicate (port, proto) so the firewall model stays unambiguous.
+        """
+        return self.conn.execute(
+            "SELECT * FROM groups WHERE port=? AND proto=?", (port, proto),
+        ).fetchone()
+
     def list_groups(self) -> list[sqlite3.Row]:
         """Return all group rows ordered by name."""
         return self.conn.execute(

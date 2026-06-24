@@ -96,6 +96,20 @@ class TestAdminManagement(unittest.TestCase):
         )
         self.assertEqual(r.status_code, 403)
 
+    def test_create_group_rejects_duplicate_port_proto(self) -> None:
+        # 'web' already binds 8080/tcp → a new group on 8080/tcp is rejected.
+        dup = self.client.post(
+            "/api/admin/groups", headers=self._admin(),
+            json={"name": "web2", "port": 8080, "proto": "tcp"},
+        )
+        self.assertEqual(dup.status_code, 409)
+        # A different proto on the same port IS allowed.
+        ok = self.client.post(
+            "/api/admin/groups", headers=self._admin(),
+            json={"name": "web-udp", "port": 8080, "proto": "udp"},
+        )
+        self.assertEqual(ok.status_code, 201)
+
 
 if __name__ == "__main__":
     unittest.main()

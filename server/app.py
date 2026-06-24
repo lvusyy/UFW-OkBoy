@@ -618,6 +618,15 @@ def create_app(config_path: str = "config.yaml",
                 "ok": False,
                 "error": f"Port {port_int} is not in the allowed_ports whitelist",
             }), 400
+        # One group per (port, proto): a port maps to a single access group, so
+        # reject a duplicate — avoids admin ambiguity and cross-group same-port
+        # rule collisions. A different proto (443/tcp vs 443/udp) is allowed.
+        dup = db.get_group_by_port_proto(port_int, proto)
+        if dup:
+            return jsonify({
+                "ok": False,
+                "error": f"Port {port_int}/{proto} is already used by group '{dup['name']}'",
+            }), 409
         try:
             group_id = db.create_group(name, port_int, proto)
         except sqlite3.IntegrityError:
@@ -1213,6 +1222,10 @@ def cmd_group_add(args):
     """Create a new port group."""
     cfg = load_config(args.config)
     db = open_database(cfg)
+    dup = db.get_group_by_port_proto(args.port, args.proto)
+    if dup:
+        print(f"Port {args.port}/{args.proto} is already used by group '{dup['name']}'.")
+        return
     db.create_group(args.name, args.port, args.proto)
     print(f"Created group '{args.name}' (port {args.port}/{args.proto})")
     db.log_audit("cli", "group_add", args.name, f"port={args.port} proto={args.proto}")
