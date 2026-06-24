@@ -788,6 +788,48 @@ LIMIT 20;
 
 ---
 
+## 安全加固（限流 / 下线 / TOTP / 备份）
+
+### 暴力 / 滥用限流
+
+同一来源 IP 在 `throttle_window` 秒内认证失败超过 `throttle_max_failures` 次，其后续 `/api/` 请求直接返回 **429**，直到失败记录过期。**按 IP 限流（不按用户名，避免误锁正常用户）**；`throttle_max_failures: 0` 关闭。部署脚本同时在 Nginx 启用 `limit_req` 作为纵深防御。
+
+> `_client_ip` 仅信任 `trusted_proxies` 列表内的直连来源（默认 localhost）才采用 X-Real-IP，杜绝客户端伪造 IP 入白名单（H-9）。Nginx 不在同机时，把其 IP 加入 `trusted_proxies`。
+
+### 用户下线 / 强制重认证
+
+```bash
+# 一键下线：关闭其所有端口 + 清在线态 + 轮换密钥（旧凭据立即失效）
+../venv/bin/python app.py revoke alice
+../venv/bin/python app.py revoke alice --no-rotate   # 仅断开，保留原密钥
+```
+
+管理页也可点用户行的 **Revoke** 按钮；轮换出的新密钥一次性显示，请通过安全渠道转交用户。
+
+### 管理员二次验证（TOTP / 2FA）
+
+删除用户 / 删除分组 / 下线等敏感操作可要求一次性动态码（RFC 6238，兼容 Google Authenticator、Authy）。管理页 **Two-Factor** 面板 → **Enroll** → 把密钥/`otpauth://` 加入验证器 App → 输入 6 位码 **Activate** 即启用。之后敏感操作会弹窗要求当前码；命令行/API 用 `X-TOTP-Code` 头或请求体 `totp_code` 提供。设 `require_admin_totp: true` 可强制所有管理员先启用。
+
+### 审计日志
+
+管理页 **Audit Log** 面板直接查看所有管理操作（也可 `GET /api/admin/audit?limit=50`）。
+
+### 数据备份与恢复
+
+```bash
+# 在线备份（写入 backup_dir，附 .sha256 校验和，按 backup_keep 滚动保留）
+../venv/bin/python app.py backup
+
+# 从备份恢复（先停服；校验和验证 + 自动快照当前库 + 覆盖）
+systemctl stop ufw-okboy
+../venv/bin/python app.py restore /var/lib/ufw-okboy/backups/ufw-okboy-xxx.db
+systemctl start ufw-okboy
+```
+
+> **不要直接 `cp` 数据库文件**——WAL 模式下可能拷到不一致状态，务必用 `backup` 命令（SQLite 在线备份 API）。
+
+---
+
 ## 升级与版本管理
 
 UFW OkBoy 自 v2.1 起内置版本号与升级机制，便于持续迭代。

@@ -52,6 +52,7 @@ signature = HMAC-SHA256(secret, "<username>:<timestamp>")
 
 - **One UFW rule per user per group per port**: old IP removed before adding new IP
 - **UFW comment format**: `ufw-okboy:<username>:<group>` for traceability + precise deletion
+- **Security**: per-IP failure throttle (429); admin TOTP (RFC 6238) step-up on revoke/delete; revoke = close ports + clear state + rotate secret; X-Real-IP trusted only from `trusted_proxies` (H-9); per-IP throttle indexes on failed_attempts
 - **SQLite is the single source of truth**: users/groups/membership/logs in DB (WAL); legacy JSON state one-time migrated
 - **Idempotent reconcile**: knock heartbeat reconciles UFW rules against enabled groups every 30s (self-heals join/leave/concurrent-change/stale-old-IP) — no DB locks needed
 - **Server-side authorization re-validation**: self-toggle may only re-enable previously-authorized groups; new grants require admin; optional `allowed_ports` whitelist
@@ -108,6 +109,9 @@ python app.py group-del <name>          # Delete a group + clean UFW
 python app.py user-join <user> <group>  # Add user to group (immediate UFW sync)
 python app.py user-leave <user> <group> # Remove user from group
 python app.py admin-add <user>          # Grant admin privileges
+python app.py revoke <user> [--no-rotate]  # Force offline: close ports + rotate secret
+python app.py backup                    # Checksummed online DB backup (rolling retention)
+python app.py restore <file>            # Restore DB from a verified backup
 python app.py upgrade --check           # Check GitHub for newer release (notify only)
 python app.py upgrade --force           # Manually upgrade (backup→pull→migrate→restart→health-check→rollback)
 ```
