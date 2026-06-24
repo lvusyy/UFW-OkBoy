@@ -830,6 +830,54 @@ def create_app(config_path: str = "config.yaml",
         db.log_audit(user["username"], "totp_disable", user["username"], None)
         return jsonify({"ok": True, "totp_enabled": False})
 
+    @app.route("/api/admin/users/<int:user_id>/groups", methods=["GET"])
+    def admin_user_groups(user_id: int):
+        """List every group with the target user's membership state (admin only).
+
+        Powers the admin console's per-user group management: each group carries
+        ``is_member`` and ``enabled`` flags for *user_id* so the UI can render a
+        checkbox per group.
+        """
+        user, err = auth.require_admin(
+            db, request.headers.get("Authorization"), ttl, _client_ip(),
+        )
+        if err:
+            return _admin_error_response(err)
+        target = db.get_user(user_id)
+        if not target:
+            return jsonify({"ok": False, "error": "User not found"}), 404
+        member = {
+            r["group_id"]: r["enabled"]
+            for r in db.conn.execute(
+                "SELECT group_id, enabled FROM user_group_membership WHERE user_id=?",
+                (user_id,),
+            ).fetchall()
+        }
+        groups = [{
+            "id": g["id"], "name": g["name"], "port": g["port"], "proto": g["proto"],
+            "is_member": g["id"] in member, "enabled": bool(member.get(g["id"], 0)),
+        } for g in db.list_groups()]
+        return jsonify({"ok": True, "user_id": user_id, "groups": groups})
+
+    @app.route("/api/admin/users/<int:user_id>/admin", methods=["POST"])
+    def admin_set_admin(user_id: int):
+        """Promote/demote a user's admin flag (admin only, step-up protected)."""
+        user, err = auth.require_admin(
+            db, request.headers.get("Authorization"), ttl, _client_ip(),
+        )
+        if err:
+            return _admin_error_response(err)
+        se = _step_up_error(user)
+        if se:
+            return se
+        target = db.get_user(user_id)
+        if not target:
+            return jsonify({"ok": False, "error": "User not found"}), 404
+        is_admin = bool((request.get_json(silent=True) or {}).get("is_admin", True))
+        db.set_user_admin(user_id, is_admin)
+        db.log_audit(user["username"], "set_admin", target["username"], f"is_admin={is_admin}")
+        return jsonify({"ok": True, "user_id": user_id, "is_admin": is_admin})
+
     return app
 
 # ====================================================================== #
