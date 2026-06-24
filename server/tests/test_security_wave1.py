@@ -107,6 +107,22 @@ class TestSecurityWave1(unittest.TestCase):
         finally:
             db.close()
 
+    # -- Client IP extraction (H-9 spoof resistance) ------------------- #
+
+    def test_xff_uses_rightmost_hop_not_spoofable_leftmost(self) -> None:
+        """Behind a trusted proxy with only X-Forwarded-For, the rightmost entry
+        (what the proxy actually saw) is used; a client-prepended leftmost value
+        cannot spoof the registered IP. nginx APPENDS the real peer, so a client
+        sending 'X-Forwarded-For: 1.2.3.4' yields '1.2.3.4, <real>' and we must
+        take <real> — the last hop."""
+        resp = self.client.post(
+            "/api/knock",
+            headers={"Authorization": self._alice_header(),
+                     "X-Forwarded-For": "1.2.3.4, 203.0.113.77"},
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.get_json()["ip"], "203.0.113.77")
+
     # -- Revoke: close ports + clear state + rotate secret ------------- #
 
     def test_revoke_closes_ports_clears_state_and_rotates(self) -> None:

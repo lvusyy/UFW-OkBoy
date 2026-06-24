@@ -273,12 +273,12 @@ class UFWManager:
     # ------------------------------------------------------------------ #
 
     def cleanup_stale(self, max_age_seconds: int,
-                      user_group_ports: dict[str, list[tuple[str, int]]] | None = None,
+                      user_group_ports: dict[str, list[tuple[str, int, str]]] | None = None,
                       ports: list[int] | None = None,
                       proto: str = "tcp") -> list[str]:
         """Remove firewall rules for users who haven't knocked within *max_age_seconds*.
 
-        *user_group_ports* maps ``username -> [(group_name, port), ...]`` from
+        *user_group_ports* maps ``username -> [(group_name, port, proto), ...]`` from
         each user's actual enabled groups (the caller — app.py — builds it from
         the DB). When provided, cleanup only removes rules for the ports the
         user is actually authorized for, avoiding orphaned rules on custom
@@ -333,7 +333,7 @@ class UFWManager:
         ]
 
     def sync_state_from_ufw(self, ports: list[int],
-                            user_group_ports: dict[str, list[tuple[str, int]]] | None = None,
+                            user_group_ports: dict[str, list[tuple[str, int, str]]] | None = None,
                             proto: str = "tcp") -> dict:
         """Recover user IPs by parsing current UFW rules into the database.
 
@@ -341,7 +341,7 @@ class UFWManager:
         users already present in the DB can be updated; unknown usernames
         are logged as warnings.
 
-        When *user_group_ports* (``username -> [(group_name, port), ...]`` of
+        When *user_group_ports* (``username -> [(group_name, port, proto), ...]`` of
         ENABLED groups) is provided, each recovered user's rules are reconciled
         against their currently-enabled groups: rules for disabled groups are
         removed, so UFW ends up consistent with DB enabled state (fixes ORPHAN-B).

@@ -152,9 +152,13 @@ def create_app(config_path: str = "config.yaml",
         peer = request.remote_addr or ""
         trusted = cfg.get("trusted_proxies", ["127.0.0.1", "::1"])
         if peer in trusted:
+            xff = request.headers.get("X-Forwarded-For", "")
             return (
                 request.headers.get("X-Real-IP")
-                or request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
+                # Rightmost XFF entry = the address the trusted proxy actually
+                # saw; the leftmost is client-supplied and spoofable (nginx
+                # APPENDS the real peer via $proxy_add_x_forwarded_for).
+                or (xff.split(",")[-1].strip() if xff.strip() else "")
                 or peer
             )
         # Not behind a trusted proxy: the peer IS the real client.
@@ -501,6 +505,10 @@ def create_app(config_path: str = "config.yaml",
                     or (request.get_json(silent=True) or {}).get("totp_code"))
             if not auth.verify_totp(user["totp_secret"], code):
                 db.log_audit(user["username"], "stepup_failed", user["username"], None)
+                # Count a bad step-up code toward the IP throttle; otherwise an
+                # already-admin-authenticated caller could brute-force the 6-digit
+                # code unbounded (the HMAC throttle never sees these attempts).
+                db.record_failed_attempt(user["username"], _client_ip(), "Invalid TOTP step-up")
                 return jsonify({
                     "ok": False, "error": "Valid TOTP code required",
                     "totp_required": True,
@@ -537,6 +545,9 @@ def create_app(config_path: str = "config.yaml",
         )
         if err:
             return _admin_error_response(err)
+        se = _step_up_error(user)  # creating a user (esp. is_admin) is sensitive
+        if se:
+            return se
         data = request.get_json(force=True, silent=True) or {}
         username = data.get("username")
         if not username:
@@ -593,6 +604,9 @@ def create_app(config_path: str = "config.yaml",
         )
         if err:
             return _admin_error_response(err)
+        se = _step_up_error(user)
+        if se:
+            return se
         data = request.get_json(force=True, silent=True) or {}
         name = data.get("name")
         port = data.get("port")
@@ -666,6 +680,9 @@ def create_app(config_path: str = "config.yaml",
         )
         if err:
             return _admin_error_response(err)
+        se = _step_up_error(user)  # opens a firewall port for the target user
+        if se:
+            return se
         target = db.get_user(user_id)
         if not target:
             return jsonify({"ok": False, "error": "User not found"}), 404
@@ -699,6 +716,9 @@ def create_app(config_path: str = "config.yaml",
         )
         if err:
             return _admin_error_response(err)
+        se = _step_up_error(user)
+        if se:
+            return se
         data = request.get_json(force=True, silent=True) or {}
         target = db.get_user_by_username(data.get("username", ""))
         group = db.get_group_by_name(data.get("group_name", ""))
@@ -797,6 +817,19 @@ def create_app(config_path: str = "config.yaml",
         )
         if err:
             return _admin_error_response(err)
+        # Re-enrollment must prove current possession: set_totp_secret overwrites
+        # the secret AND resets totp_enabled=0, so without this an attacker with a
+        # stolen admin session (but no code) could replace/disable an enabled
+        # admin's 2FA. A first-time enroll (not yet enabled) is always allowed so
+        # require_admin_totp cannot deadlock the very enrollment it demands.
+        if user["totp_enabled"]:
+            recode = (request.headers.get("X-TOTP-Code")
+                      or (request.get_json(silent=True) or {}).get("totp_code"))
+            if not auth.verify_totp(user["totp_secret"], recode):
+                return jsonify({
+                    "ok": False, "error": "Valid TOTP code required to re-enroll",
+                    "totp_required": True,
+                }), 403
         secret = auth.generate_totp_secret()
         db.set_totp_secret(user["id"], secret)
         db.log_audit(user["username"], "totp_enroll_start", user["username"], None)

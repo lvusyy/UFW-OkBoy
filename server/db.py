@@ -118,6 +118,9 @@ class Database:
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.execute("PRAGMA journal_mode = WAL")
+        # Wait (up to 5s) for a competing writer instead of erroring out with
+        # SQLITE_BUSY: under WAL two gunicorn workers can attempt writes at once.
+        self.conn.execute("PRAGMA busy_timeout = 5000")
 
     # ------------------------------------------------------------------ #
     #  Schema

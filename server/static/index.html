@@ -1644,8 +1644,16 @@ function renderUsers(users) {
     </div>`;
   }).join("");
   renderPager(usersPagerEl, pg.page, pg.total, (p) => { userPage = p; renderUsers(lastUsers); });
-  // Re-fetch group panels that were left open AND visible on this page.
-  openGroupPanels.forEach(id => { loadUserGroups(id); });
+  // Re-fetch ONLY the open panels whose row is on the current page. Iterating
+  // the whole Set fired an N+1 fetch storm on every re-render (each search
+  // keystroke, pager click, language toggle) and targeted off-page rows whose
+  // panel DOM does not exist. Also prune tracking for users that no longer
+  // exist (deleted), keyed off the full unfiltered list so an active search
+  // filter does not drop a still-open panel.
+  const liveIds = new Set(users.map(u => String(u.id)));
+  for (const id of [...openGroupPanels]) if (!liveIds.has(id)) openGroupPanels.delete(id);
+  const visibleIds = new Set(pg.slice.map(u => String(u.id)));
+  openGroupPanels.forEach(id => { if (visibleIds.has(id)) loadUserGroups(id); });
 }
 
 let lastGroups = [];
@@ -1730,20 +1738,28 @@ function renderMyGroups(groups) {
 // each time the admin console opens.
 btnSaveAuth.addEventListener("click", async () => {
   adminError.style.display = "none";
-  let denied = [];
-  for (const g of myGroupsState) {
-    const want = g.checked ? 1 : 0;
-    if (g.enabled === want) continue;
-    const r = await apiAdmin("PATCH", `/api/me/membership/${g.id}`, { enabled: !!want });
-    if (!r.ok) denied.push(`${g.name}: ${r.error || t("err_failed")}`);
-  }
-  await loadAdminConsole();
-  if (denied.length) {
-    adminError.textContent = t("err_some_denied", denied.join("; "));
-    adminError.style.display = "block";
-    addLog(t("log_auth_partial", denied.length), "warn");
-  } else {
-    addLog(t("log_auth_saved"), "ok");
+  // Guard against double-submit: a second click mid-save would start an
+  // overlapping PATCH loop plus a racing loadAdminConsole re-render.
+  if (btnSaveAuth.disabled) return;
+  btnSaveAuth.disabled = true;
+  try {
+    let denied = [];
+    for (const g of myGroupsState) {
+      const want = g.checked ? 1 : 0;
+      if (g.enabled === want) continue;
+      const r = await apiAdmin("PATCH", `/api/me/membership/${g.id}`, { enabled: !!want });
+      if (!r.ok) denied.push(`${g.name}: ${r.error || t("err_failed")}`);
+    }
+    await loadAdminConsole();
+    if (denied.length) {
+      adminError.textContent = t("err_some_denied", denied.join("; "));
+      adminError.style.display = "block";
+      addLog(t("log_auth_partial", denied.length), "warn");
+    } else {
+      addLog(t("log_auth_saved"), "ok");
+    }
+  } finally {
+    btnSaveAuth.disabled = false;
   }
 });
 

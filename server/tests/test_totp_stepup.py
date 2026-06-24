@@ -190,17 +190,29 @@ class TestTOTPStepUp(unittest.TestCase):
         )
         self.assertEqual(ok.status_code, 200)
 
-    def test_nonsensitive_op_skips_stepup(self) -> None:
-        """Step-up is scoped: listing/creating users needs no code even when enrolled."""
-        self._enroll_admin()
+    def test_stepup_scope_reads_skip_writes_require(self) -> None:
+        """Step-up is scoped: read-only ops (listing) skip the code even when
+        enrolled, but state-changing writes require it. Creating a user is a
+        write that can mint an admin, so it MUST be gated — otherwise a stolen
+        admin session (no code) could bypass the step-up that protects
+        promote/delete/revoke just by creating a fresh admin instead."""
+        secret = self._enroll_admin()
+        # Read-only: listing users never needs a code.
         lst = self.client.get("/api/admin/users",
                               headers={"Authorization": self._admin_header()})
         self.assertEqual(lst.status_code, 200)
-        crt = self.client.post(
+        # Write without a code → blocked.
+        no_code = self.client.post(
             "/api/admin/users", headers={"Authorization": self._admin_header()},
             json={"username": "newbie"},
         )
-        self.assertEqual(crt.status_code, 201)
+        self.assertEqual(no_code.status_code, 403)
+        # Same write with a valid code → allowed.
+        with_code = self.client.post(
+            "/api/admin/users", headers={"Authorization": self._admin_header()},
+            json={"username": "newbie", "totp_code": auth.totp_now(secret)},
+        )
+        self.assertEqual(with_code.status_code, 201)
 
     def test_require_admin_totp_blocks_unenrolled(self) -> None:
         """require_admin_totp=true forces enrollment before sensitive ops."""
@@ -237,6 +249,24 @@ class TestTOTPStepUp(unittest.TestCase):
         )
         self.assertEqual(ok.status_code, 200)
         self.assertFalse(ok.get_json()["totp_enabled"])
+
+    def test_reenroll_when_enabled_requires_current_code(self) -> None:
+        """Re-enrolling while TOTP is enabled must prove current possession;
+        otherwise a stolen admin session (no code) could overwrite the secret
+        and reset totp_enabled=0, hijacking or disabling the admin's 2FA."""
+        secret = self._enroll_admin()
+        no_code = self.client.post(
+            "/api/admin/totp/enroll",
+            headers={"Authorization": self._admin_header()},
+        )
+        self.assertEqual(no_code.status_code, 403)
+        ok = self.client.post(
+            "/api/admin/totp/enroll",
+            headers={"Authorization": self._admin_header()},
+            json={"totp_code": auth.totp_now(secret)},
+        )
+        self.assertEqual(ok.status_code, 200)
+        self.assertIn("secret", ok.get_json())
 
 
 class TestSchemaMigration(unittest.TestCase):

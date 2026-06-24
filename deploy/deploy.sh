@@ -395,7 +395,7 @@ systemctl enable ufw-okboy >/dev/null 2>&1 || true
 # `enable --now` would be a no-op and keep the OLD code running. restart
 # reloads the new code and runs DB migrations on startup.
 systemctl restart ufw-okboy
-systemctl enable --now ufw-okboy-cleanup.timer
+systemctl enable --now ufw-okboy-cleanup.timer 2>/dev/null || true
 
 info "Services installed and started."
 

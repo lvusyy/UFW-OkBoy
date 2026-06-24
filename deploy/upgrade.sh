@@ -50,11 +50,15 @@ cur_version() { "$PY" "$APP_DIR/server/app.py" --version 2>/dev/null | awk '{pri
 OLD_VER="$(cur_version || echo unknown)"
 info "Current version: ${OLD_VER:-unknown}   dir: $APP_DIR   service: $SERVICE"
 
-# 1) Back up the database first (safety net).
+# 1) Back up the database first (safety net). Capture the path so the rollback
+#    hint can name the exact file to restore.
+DB_BAK=""
 if [[ -f "$CONF" ]]; then
     info "Backing up the database..."
-    "$PY" "$APP_DIR/server/app.py" -c "$CONF" backup 2>/dev/null \
+    DB_BAK="$("$PY" "$APP_DIR/server/app.py" -c "$CONF" backup 2>/dev/null \
+        | awk '/Backup written:/{print $NF}')" \
         || warn "DB backup step skipped/failed; make sure you have a backup."
+    [[ -n "$DB_BAK" ]] && info "DB backup: $DB_BAK"
 fi
 
 # 2) Fetch the latest code (unless a local --repo-dir was given).
@@ -63,9 +67,15 @@ if [[ -z "$REPO_DIR" ]]; then
     TMP_DIR="$(mktemp -d)"
     trap '[[ -n "$TMP_DIR" ]] && rm -rf "$TMP_DIR"' EXIT
     info "Fetching latest code ($BRANCH)..."
+    fetched=0
     if command -v git >/dev/null 2>&1; then
-        git clone --depth 1 --branch "$BRANCH" "$REPO_URL" "$TMP_DIR/src" >/dev/null 2>&1
-    else
+        if git clone --depth 1 --branch "$BRANCH" "$REPO_URL" "$TMP_DIR/src" 2>"$TMP_DIR/git.err"; then
+            fetched=1
+        else
+            warn "git clone failed ($(tail -n1 "$TMP_DIR/git.err" 2>/dev/null)); falling back to tarball."
+        fi
+    fi
+    if [[ "$fetched" -eq 0 ]]; then
         curl -fsSL "$REPO_URL/archive/refs/heads/$BRANCH.tar.gz" -o "$TMP_DIR/src.tgz"
         mkdir -p "$TMP_DIR/src"
         tar xzf "$TMP_DIR/src.tgz" -C "$TMP_DIR/src" --strip-components=1
@@ -105,13 +115,22 @@ info "Restarting $SERVICE..."
 systemctl daemon-reload 2>/dev/null || true
 systemctl restart "$SERVICE"
 
-# 6) Health-check.
+# 6) Health-check (retry: gunicorn boot + on-startup DB migration can take a few
+#    seconds — a single probe would false-trigger a rollback of a good upgrade).
 PORT="$(awk -F'[: ]+' '/^listen_port:/{print $2}' "$CONF" 2>/dev/null | tr -d '"' || true)"
 PORT="${PORT:-5000}"
-sleep 2
-if curl -fsS "http://127.0.0.1:$PORT/health" 2>/dev/null | grep -q "ufw-okboy"; then
+healthy=0
+for _ in 1 2 3 4 5 6; do
+    if curl -fsS "http://127.0.0.1:$PORT/health" 2>/dev/null | grep -q '"ok"'; then
+        healthy=1; break
+    fi
+    sleep 2
+done
+if [[ "$healthy" -eq 1 ]]; then
     RUN_VER="$(cur_version || echo unknown)"
     info "Health OK — service is up on version: ${RUN_VER:-unknown}"
+    # Prune old code snapshots (keep the 3 most recent) so $APP_DIR doesn't grow.
+    ls -dt "$APP_DIR"/server.bak-* 2>/dev/null | tail -n +4 | xargs -r rm -rf || true
     echo ""
     echo "  ✓ Upgrade complete: ${OLD_VER:-unknown} -> $NEW_VER"
     echo "    DB backup + code snapshot ($CODE_BAK) kept for safety."
@@ -119,10 +138,22 @@ if curl -fsS "http://127.0.0.1:$PORT/health" 2>/dev/null | grep -q "ufw-okboy"; 
 else
     err "Health check FAILED after restart — rolling back the code."
     systemctl stop "$SERVICE" 2>/dev/null || true
-    rm -rf "$APP_DIR/server"
-    mv "$CODE_BAK" "$APP_DIR/server"
+    # Atomic restore: move the new (failed) tree ASIDE first, copy the snapshot
+    # back (CODE_BAK stays intact as the durable rollback point), and only then
+    # drop the failed tree — never leave NO server dir, even if a step fails
+    # (e.g. a cross-filesystem move).
+    FAILED_DIR="$APP_DIR/server.failed-$(date +%Y%m%d-%H%M%S)"
+    mv "$APP_DIR/server" "$FAILED_DIR" 2>/dev/null || true
+    if cp -r "$CODE_BAK" "$APP_DIR/server"; then
+        rm -rf "$FAILED_DIR"
+    else
+        err "Rollback copy failed — previous code is preserved at: $CODE_BAK"
+    fi
     systemctl start "$SERVICE" 2>/dev/null || true
     err "Rolled back to the previous code. Check: journalctl -u $SERVICE -n 50 --no-pager"
-    err "If the DB schema changed, restore the pre-upgrade DB backup too (app.py restore <file>)."
+    if [[ -n "$DB_BAK" ]]; then
+        err "If the schema migrated, also restore the DB:"
+        err "  $PY $APP_DIR/server/app.py -c $CONF restore $DB_BAK"
+    fi
     exit 1
 fi
