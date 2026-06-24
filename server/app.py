@@ -129,18 +129,51 @@ def create_app(config_path: str = "config.yaml",
     anomaly_window = cfg.get("anomaly_window", 3600)      # 1 hour
     anomaly_max_changes = cfg.get("anomaly_max_changes", 5)  # max IP changes per window
 
+    # Per-IP abuse throttle thresholds (configurable; 0 disables)
+    throttle_max = cfg.get("throttle_max_failures", 10)
+    throttle_window = cfg.get("throttle_window", 300)
+    # When true, admins without TOTP are blocked from sensitive ops until enrolled.
+    require_admin_totp = cfg.get("require_admin_totp", False)
+
     def _auth():
         return auth.verify_hmac(
             db, request.headers.get("Authorization"), ttl, _client_ip(),
         )
 
     def _client_ip() -> str:
-        """Extract real client IP, respecting reverse-proxy headers."""
-        return (
-            request.headers.get("X-Real-IP")
-            or request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
-            or request.remote_addr
-        )
+        """Extract the real client IP, respecting reverse-proxy headers.
+
+        Proxy headers (X-Real-IP / X-Forwarded-For) are trusted ONLY when the
+        direct peer (request.remote_addr) is in the configured trusted_proxies
+        list, so a client reaching Flask directly cannot spoof these headers to
+        register an arbitrary IP in the firewall allowlist (fixes H-9). Default
+        trusted: localhost.
+        """
+        peer = request.remote_addr or ""
+        trusted = cfg.get("trusted_proxies", ["127.0.0.1", "::1"])
+        if peer in trusted:
+            return (
+                request.headers.get("X-Real-IP")
+                or request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
+                or peer
+            )
+        # Not behind a trusted proxy: the peer IS the real client.
+        return peer
+
+    @app.before_request
+    def _throttle_gate():
+        """Reject /api/ requests from an IP with too many recent failures (429).
+
+        Centralized so the throttle covers knock, status, me/*, membership, and
+        every admin endpoint uniformly — defense in depth with nginx limit_req.
+        """
+        if not request.path.startswith("/api/"):
+            return None
+        err = auth.check_ip_throttle(db, _client_ip(), throttle_max, throttle_window)
+        if err:
+            logger.warning("Throttled %s on %s", _client_ip(), request.path)
+            return jsonify({"ok": False, "error": err}), 429
+        return None
 
     # ---- API Routes ---- #
 
@@ -195,9 +228,9 @@ def create_app(config_path: str = "config.yaml",
                 ufw.remove_rule(old_ip, grp["port"], username, grp["proto"], grp["name"])
             logger.info("Removed old-IP rules for %s (was %s)", username, old_ip)
 
-        db.set_user_ip(user_id, client_ip)
-        db.update_knock_time(user_id, client_ip)
-        db.log_operation(username, "ip_change", client_ip, f"old={old_ip}")
+        # Atomic state write: current_ip + last_knock + ip_change log in ONE
+        # transaction (fixes ORPHAN-D torn write between the old 3 commits).
+        db.record_ip_change(user_id, username, client_ip, old_ip)
         logger.info("Knock: %s@%s (was %s)", username, client_ip, old_ip or "new")
 
         # Check for anomalous IP change patterns (possible credential sharing)
@@ -244,6 +277,8 @@ def create_app(config_path: str = "config.yaml",
             "ok": True,
             "username": username,
             "is_admin": bool(user and user["is_admin"]) if user else False,
+            "totp_enabled": bool(user and "totp_enabled" in user.keys()
+                                 and user["totp_enabled"]) if user else False,
             "enabled_groups": enabled_groups,
             **state,
         })
@@ -443,6 +478,33 @@ def create_app(config_path: str = "config.yaml",
         status = 403 if err == "Admin privileges required" else 401
         return jsonify({"ok": False, "error": err}), status
 
+    def _step_up_error(user):
+        """TOTP step-up gate for sensitive ops. Returns a (resp, status) tuple
+        to short-circuit, or None to proceed.
+
+        - admin has TOTP enabled → a valid code is mandatory (``X-TOTP-Code``
+          header or ``totp_code`` body field).
+        - admin without TOTP + ``require_admin_totp`` config → blocked until
+          enrolled. Otherwise (opt-in, not enrolled) → proceed.
+        """
+        enabled = "totp_enabled" in user.keys() and user["totp_enabled"]
+        if enabled:
+            code = (request.headers.get("X-TOTP-Code")
+                    or (request.get_json(silent=True) or {}).get("totp_code"))
+            if not auth.verify_totp(user["totp_secret"], code):
+                db.log_audit(user["username"], "stepup_failed", user["username"], None)
+                return jsonify({
+                    "ok": False, "error": "Valid TOTP code required",
+                    "totp_required": True,
+                }), 403
+        elif require_admin_totp:
+            return jsonify({
+                "ok": False,
+                "error": "Admin TOTP enrollment required before this action",
+                "totp_enroll_required": True,
+            }), 403
+        return None
+
     @app.route("/api/admin/users", methods=["GET"])
     def admin_list_users():
         """List all users (admin only). Secrets are stripped from the response."""
@@ -455,6 +517,7 @@ def create_app(config_path: str = "config.yaml",
         for row in db.list_users():
             d = dict(row)
             d.pop("secret", None)
+            d.pop("totp_secret", None)  # never expose the TOTP seed
             users.append(d)
         return jsonify({"ok": True, "users": users})
 
@@ -490,6 +553,9 @@ def create_app(config_path: str = "config.yaml",
         )
         if err:
             return _admin_error_response(err)
+        se = _step_up_error(user)
+        if se:
+            return se
         target = db.get_user(user_id)
         if not target:
             return jsonify({"ok": False, "error": "User not found"}), 404
@@ -562,6 +628,9 @@ def create_app(config_path: str = "config.yaml",
         )
         if err:
             return _admin_error_response(err)
+        se = _step_up_error(user)
+        if se:
+            return se
         group = db.get_group(group_id)
         if not group:
             return jsonify({"ok": False, "error": "Group not found"}), 404
@@ -639,6 +708,119 @@ def create_app(config_path: str = "config.yaml",
         return jsonify({
             "ok": True, "user_id": target["id"], "group_id": group["id"],
         })
+
+    @app.route("/api/admin/users/<int:user_id>/revoke", methods=["POST"])
+    def admin_revoke_user(user_id: int):
+        """Revoke a user's active access (admin only).
+
+        Closes the user's open UFW ports, clears their runtime state, and (by
+        default) rotates their HMAC secret so the old credential is invalid
+        immediately — the stateless-HMAC way to "force re-login + re-auth".
+        Pass ``{"rotate_secret": false}`` to disconnect without invalidating the
+        credential. When rotated, the new secret is returned ONCE.
+        """
+        user, err = auth.require_admin(
+            db, request.headers.get("Authorization"), ttl, _client_ip(),
+        )
+        if err:
+            return _admin_error_response(err)
+        se = _step_up_error(user)
+        if se:
+            return se
+        target = db.get_user(user_id)
+        if not target:
+            return jsonify({"ok": False, "error": "User not found"}), 404
+
+        if target["current_ip"]:
+            for g in db.get_user_groups(user_id, only_enabled=True):
+                ufw.remove_rule(
+                    target["current_ip"], g["port"], target["username"],
+                    g["proto"], g["name"],
+                )
+        db.clear_user_state(user_id)
+        data = request.get_json(silent=True) or {}
+        rotate = bool(data.get("rotate_secret", True))
+        new_secret = None
+        if rotate:
+            new_secret = secrets.token_hex(32)
+            db.rotate_secret(user_id, new_secret)
+        db.log_audit(user["username"], "revoke", target["username"], f"rotate={rotate}")
+        logger.info("Revoked %s (rotate=%s) by %s", target["username"], rotate, user["username"])
+        resp = {"ok": True, "user_id": user_id, "rotated": rotate}
+        if new_secret:
+            resp["secret"] = new_secret
+        return jsonify(resp)
+
+    @app.route("/api/admin/audit", methods=["GET"])
+    def admin_list_audit():
+        """Return recent audit-log entries, newest first (admin only).
+
+        Query param ``limit`` (default 100, clamped to 1..1000).
+        """
+        user, err = auth.require_admin(
+            db, request.headers.get("Authorization"), ttl, _client_ip(),
+        )
+        if err:
+            return _admin_error_response(err)
+        limit = request.args.get("limit", default=100, type=int) or 100
+        limit = max(1, min(limit, 1000))
+        rows = [dict(r) for r in db.list_audit(limit)]
+        return jsonify({"ok": True, "audit": rows})
+
+    @app.route("/api/admin/totp/enroll", methods=["POST"])
+    def admin_totp_enroll():
+        """Begin TOTP enrollment (admin only): generate a secret + otpauth URI.
+
+        The secret is stored but NOT active until the admin confirms a code via
+        /activate. Returns the base32 secret and an otpauth:// URI for QR or
+        manual entry into an authenticator app.
+        """
+        user, err = auth.require_admin(
+            db, request.headers.get("Authorization"), ttl, _client_ip(),
+        )
+        if err:
+            return _admin_error_response(err)
+        secret = auth.generate_totp_secret()
+        db.set_totp_secret(user["id"], secret)
+        db.log_audit(user["username"], "totp_enroll_start", user["username"], None)
+        return jsonify({
+            "ok": True,
+            "secret": secret,
+            "otpauth_uri": auth.totp_uri(secret, user["username"]),
+        })
+
+    @app.route("/api/admin/totp/activate", methods=["POST"])
+    def admin_totp_activate():
+        """Activate a pending TOTP enrollment by confirming a code (admin only)."""
+        user, err = auth.require_admin(
+            db, request.headers.get("Authorization"), ttl, _client_ip(),
+        )
+        if err:
+            return _admin_error_response(err)
+        if not user["totp_secret"]:
+            return jsonify({"ok": False, "error": "No pending enrollment; call enroll first"}), 400
+        code = (request.get_json(silent=True) or {}).get("totp_code", "")
+        if not auth.verify_totp(user["totp_secret"], code):
+            return jsonify({"ok": False, "error": "Invalid code"}), 400
+        db.enable_totp(user["id"])
+        db.log_audit(user["username"], "totp_activate", user["username"], None)
+        return jsonify({"ok": True, "totp_enabled": True})
+
+    @app.route("/api/admin/totp", methods=["DELETE"])
+    def admin_totp_disable():
+        """Disable TOTP for the calling admin. Requires a current code when enabled."""
+        user, err = auth.require_admin(
+            db, request.headers.get("Authorization"), ttl, _client_ip(),
+        )
+        if err:
+            return _admin_error_response(err)
+        if user["totp_enabled"]:
+            code = (request.get_json(silent=True) or {}).get("totp_code", "")
+            if not auth.verify_totp(user["totp_secret"], code):
+                return jsonify({"ok": False, "error": "Valid TOTP code required to disable"}), 403
+        db.disable_totp(user["id"])
+        db.log_audit(user["username"], "totp_disable", user["username"], None)
+        return jsonify({"ok": True, "totp_enabled": False})
 
     return app
 
@@ -1068,6 +1250,83 @@ def cmd_admin_add(args):
     print(f"Granted admin privileges to '{args.username}'.")
 
 
+def cmd_revoke(args):
+    """Revoke a user's access: close ports, clear state, rotate secret (CLI parity)."""
+    cfg = load_config(args.config)
+    db = open_database(cfg)
+    ufw = UFWManager(rule_prefix=cfg.get("rule_prefix", "ufw-okboy"), db=db)
+    user = db.get_user_by_username(args.username)
+    if not user:
+        print(f"User '{args.username}' not found.")
+        return
+    if user["current_ip"]:
+        for g in db.get_user_groups(user["id"], only_enabled=True):
+            ufw.remove_rule(user["current_ip"], g["port"], args.username, g["proto"], g["name"])
+    db.clear_user_state(user["id"])
+    new_secret = None
+    if not args.no_rotate:
+        new_secret = secrets.token_hex(32)
+        db.rotate_secret(user["id"], new_secret)
+    db.log_audit("cli", "revoke", args.username, f"rotate={not args.no_rotate}")
+    print(f"Revoked '{args.username}'. Ports closed, runtime state cleared.")
+    if new_secret:
+        print(f"New secret (deliver to the user out-of-band): {new_secret}")
+
+
+def cmd_backup(args):
+    """Create a timestamped, checksummed DB backup with rolling retention."""
+    cfg = load_config(args.config)
+    db = open_database(cfg)
+    backup_dir = args.dir or cfg.get("backup_dir", "/var/lib/ufw-okboy/backups")
+    keep = cfg.get("backup_keep", 7)
+    Path(backup_dir).mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    dest = os.path.join(backup_dir, f"ufw-okboy-{stamp}.db")
+    db.backup(dest)
+    digest = db.checksum(dest)
+    with open(dest + ".sha256", "w", encoding="utf-8") as f:
+        f.write(f"{digest}  {os.path.basename(dest)}\n")
+    print(f"Backup written: {dest}")
+    print(f"  sha256: {digest}")
+    if keep > 0:
+        backups = sorted(Path(backup_dir).glob("ufw-okboy-*.db"))
+        for old in backups[:-keep]:
+            old.unlink(missing_ok=True)
+            Path(str(old) + ".sha256").unlink(missing_ok=True)
+            print(f"Pruned old backup: {old.name}")
+
+
+def cmd_restore(args):
+    """Restore the DB from a backup file (verifies checksum; snapshots current first).
+
+    Stop the server before restoring — this replaces the live DB file.
+    """
+    cfg = load_config(args.config)
+    db_path = cfg.get("db_path", "/var/lib/ufw-okboy/ufw-okboy.db")
+    src = args.backup
+    if not os.path.exists(src):
+        sys.exit(f"Backup not found: {src}")
+    sidecar = src + ".sha256"
+    if os.path.exists(sidecar):
+        with open(sidecar, encoding="utf-8") as f:
+            expected = f.read().split()[0]
+        actual = Database.checksum(src)
+        if expected != actual:
+            sys.exit(f"Checksum mismatch (expected {expected}, got {actual}); aborting.")
+        print("Checksum verified.")
+    else:
+        print("WARNING: no .sha256 sidecar — restoring without integrity verification.")
+    if os.path.exists(db_path):
+        shutil.copy2(db_path, db_path + ".pre-restore")
+        print(f"Current DB snapshotted to {db_path}.pre-restore")
+    shutil.copy2(src, db_path)
+    for ext in ("-wal", "-shm"):
+        stale = db_path + ext
+        if os.path.exists(stale):
+            os.remove(stale)
+    print(f"Restored {db_path} from {src}. Restart the server to load it.")
+
+
 # ====================================================================== #
 #  Entry point
 # ====================================================================== #
@@ -1156,6 +1415,20 @@ def main():
     p_upgrade.add_argument("-y", "--yes", action="store_true",
                            help="Skip the interactive confirmation")
 
+    # revoke
+    p_revoke = sub.add_parser("revoke", help="Revoke a user's access (close ports, rotate secret)")
+    p_revoke.add_argument("username", help="Username to revoke")
+    p_revoke.add_argument("--no-rotate", action="store_true",
+                          help="Disconnect without rotating the secret")
+
+    # backup
+    p_backup = sub.add_parser("backup", help="Create a checksummed DB backup (rolling retention)")
+    p_backup.add_argument("--dir", help="Backup directory (default: config backup_dir)")
+
+    # restore
+    p_restore = sub.add_parser("restore", help="Restore the DB from a backup file")
+    p_restore.add_argument("backup", help="Path to the backup .db file")
+
     args = parser.parse_args()
 
     commands = {
@@ -1174,6 +1447,9 @@ def main():
         "user-leave": cmd_user_leave,
         "admin-add": cmd_admin_add,
         "upgrade": cmd_upgrade,
+        "revoke": cmd_revoke,
+        "backup": cmd_backup,
+        "restore": cmd_restore,
     }
 
     handler = commands.get(args.command)

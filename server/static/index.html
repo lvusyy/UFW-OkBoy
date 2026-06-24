@@ -417,6 +417,12 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
     </div>
 
     <div class="log-section">
+      <h3>Audit Log</h3>
+      <div id="admin-audit" class="log" style="max-height:14rem"></div>
+      <button class="btn-secondary btn-small" id="btn-refresh-audit" style="margin-top:.5rem">Refresh</button>
+    </div>
+
+    <div class="log-section">
       <h3>My Group Authorization</h3>
       <p style="font-size:.75rem;color:var(--text2);margin-bottom:.5rem">
         Select which groups to authorize your IP for. First group is checked by default.
@@ -424,6 +430,26 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
       </p>
       <div id="my-groups"></div>
       <button class="btn-primary btn-small" id="btn-save-auth" style="margin-top:.5rem">Save Authorization</button>
+    </div>
+
+    <div class="log-section">
+      <h3>Two-Factor (TOTP)</h3>
+      <p style="font-size:.75rem;color:var(--text2);margin-bottom:.5rem">
+        Protects sensitive actions (revoke, delete). Add the secret to an
+        authenticator app, then confirm a code to activate.
+      </p>
+      <div id="totp-status" style="font-size:.8rem;margin-bottom:.5rem"></div>
+      <div id="totp-enroll" hidden>
+        <div id="totp-secret" class="log" style="max-height:none;word-break:break-all;font-size:.7rem"></div>
+        <div class="actions" style="margin-top:.5rem">
+          <input type="text" id="totp-code" placeholder="6-digit code" inputmode="numeric" style="flex:1">
+          <button class="btn-primary btn-small" id="btn-totp-activate">Activate</button>
+        </div>
+      </div>
+      <div class="actions" style="margin-top:.5rem">
+        <button class="btn-secondary btn-small" id="btn-totp-enroll">Enroll / Re-enroll</button>
+        <button class="btn-danger btn-small" id="btn-totp-disable">Disable</button>
+      </div>
     </div>
 
     <div class="actions" style="margin-top:1rem">
@@ -487,6 +513,14 @@ const btnAddGroup  = $("#btn-add-group");
 const btnSaveAuth  = $("#btn-save-auth");
 const btnAdminBack = $("#btn-admin-back");
 const btnLock      = $("#btn-lock");
+const adminAuditEl = $("#admin-audit");
+const btnRefreshAudit = $("#btn-refresh-audit");
+const totpStatus   = $("#totp-status");
+const totpEnrollBox = $("#totp-enroll");
+const totpSecretEl = $("#totp-secret");
+const btnTotpEnroll = $("#btn-totp-enroll");
+const btnTotpActivate = $("#btn-totp-activate");
+const btnTotpDisable = $("#btn-totp-disable");
 let isAdmin        = false;
 const statusBar    = $("#status-bar");
 const statusText   = $("#status-text");
@@ -538,7 +572,7 @@ async function buildAuth(username, secret) {
 // ================================================================ //
 
 const VAULT_KEY = "ufw-okboy-vault"; // encrypted blob
-const PBKDF2_ITERS = 150000;          // OWASP-tier cost; native Web Crypto
+const PBKDF2_ITERS = 600000;          // OWASP 2023 min for PBKDF2-SHA256; native Web Crypto
 let vaultKey = null;                  // CryptoKey in memory, never stored
 
 function toB64(buf) {
@@ -590,8 +624,13 @@ function clearVault() {
   localStorage.removeItem(VAULT_KEY);
 }
 
-// Simple client-side PIN attempt throttle (real brute-force protection
-// is server-side failed_attempts; this just adds friction).
+// Client-side PIN attempt throttle (UX friction only — trivially bypassed by
+// page reload or console). NOTE: PIN unlock is a LOCAL AES-GCM decrypt of the
+// localStorage vault; it does NOT call the server, so the server-side
+// failed_attempts table (which only tracks HMAC auth failures) does NOT cover
+// PIN brute-force. The real protection against offline attacks is the PBKDF2
+// cost (600k iters) + the vault key never being persisted. Do not rely on this
+// client counter as a security control.
 let pinAttempts = 0, pinLockedUntil = 0;
 
 // ================================================================ //
@@ -970,14 +1009,17 @@ btnLock.addEventListener("click", () => {
 async function loadAdminConsole() {
   adminError.style.display = "none";
   try {
-    const [users, groups, mine] = await Promise.all([
+    const [users, groups, mine, audit] = await Promise.all([
       apiAdmin("GET", "/api/admin/users"),
       apiAdmin("GET", "/api/admin/groups"),
       apiAdmin("GET", "/api/me/groups"),
+      apiAdmin("GET", "/api/admin/audit?limit=50"),
     ]);
     renderUsers(users.users || []);
     renderGroups(groups.groups || []);
     renderMyGroups(mine.groups || []);
+    renderAudit(audit.audit || []);
+    await refreshTotp();
   } catch (err) {
     adminError.textContent = `Load failed: ${err.message}`;
     adminError.style.display = "block";
@@ -988,7 +1030,10 @@ function renderUsers(users) {
   adminUsersEl.innerHTML = users.map(u => {
     const ip = esc(u.current_ip || "—");
     const admin = u.is_admin ? " [admin]" : "";
-    return `<div>${esc(u.id)}: ${esc(u.username)}${admin} <span style="color:var(--text2)">ip=${ip}</span></div>`;
+    const isSelf = credentials && u.username === credentials.username;
+    const revoke = isSelf ? "" :
+      `<button class="btn-danger btn-small" data-revoke="${esc(u.id)}" data-name="${esc(u.username)}" style="float:right">Revoke</button>`;
+    return `<div style="padding:.2rem 0;clear:both">${esc(u.id)}: ${esc(u.username)}${admin} <span style="color:var(--text2)">ip=${ip}</span>${revoke}</div>`;
   }).join("");
 }
 
@@ -996,6 +1041,16 @@ function renderGroups(groups) {
   adminGroupsEl.innerHTML = groups.map(g =>
     `<div>${esc(g.id)}: ${esc(g.name)} → ${esc(g.port)}/${esc(g.proto)}</div>`
   ).join("");
+}
+
+// Audit log: newest-first event trail (actor / action / target / detail).
+function renderAudit(entries) {
+  adminAuditEl.innerHTML = entries.map(e => {
+    const when = esc((e.created_at || "").replace("T", " "));
+    const tgt = e.target ? ` → ${esc(e.target)}` : "";
+    const det = e.detail ? ` <span style="color:var(--text2)">(${esc(e.detail)})</span>` : "";
+    return `<div style="font-size:.75rem;padding:.1rem 0">${when} <b>${esc(e.actor)}</b> ${esc(e.action)}${tgt}${det}</div>`;
+  }).join("") || '<div style="color:var(--text2);font-size:.75rem">(no entries)</div>';
 }
 
 // My group authorization: checkboxes, first checked by default.
@@ -1061,6 +1116,76 @@ btnAddGroup.addEventListener("click", async () => {
     $("#new-group-port").value = "";
     await loadAdminConsole();
   } else { adminError.textContent = r.error || "failed"; adminError.style.display = "block"; }
+});
+
+// Revoke (event-delegated): close ports + clear state + rotate secret =
+// the stateless-HMAC way to force a user to re-authenticate.
+adminUsersEl.addEventListener("click", async (e) => {
+  const btn = e.target.closest("[data-revoke]");
+  if (!btn) return;
+  const id = btn.dataset.revoke, name = btn.dataset.name;
+  if (!confirm(`Revoke ${name}?\n\nCloses their open ports, clears their session, and rotates their secret. They must re-authenticate with a NEW secret you deliver to them.`)) return;
+  let r = await apiAdmin("POST", `/api/admin/users/${id}/revoke`, { rotate_secret: true });
+  if (!r.ok && r.totp_required) {
+    const code = prompt(`Enter your 6-digit TOTP code to confirm revoking ${name}:`);
+    if (!code) return;
+    r = await apiAdmin("POST", `/api/admin/users/${id}/revoke`, { rotate_secret: true, totp_code: code });
+  }
+  if (r.ok) {
+    if (r.secret) {
+      addLog(`Revoked ${name} — new secret issued (shown once)`, "ok");
+      prompt(`New secret for ${name} (copy & deliver securely — shown once):`, r.secret);
+    } else {
+      addLog(`Revoked ${name}`, "ok");
+    }
+    await loadAdminConsole();
+  } else {
+    adminError.textContent = r.error || "revoke failed";
+    adminError.style.display = "block";
+  }
+});
+
+btnRefreshAudit.addEventListener("click", async () => {
+  const r = await apiAdmin("GET", "/api/admin/audit?limit=50");
+  if (r.ok) renderAudit(r.audit || []);
+});
+
+// ---- Two-Factor (TOTP) enrollment ---- //
+async function refreshTotp() {
+  const a = await buildAuth(credentials.username, credentials.secret);
+  const r = await (await fetch("/api/status", { headers: { Authorization: a } })).json();
+  const on = !!(r.ok && r.totp_enabled);
+  totpStatus.textContent = on
+    ? "● Enabled — sensitive actions require a 6-digit code"
+    : "○ Disabled — sensitive actions are not 2FA-protected";
+}
+
+btnTotpEnroll.addEventListener("click", async () => {
+  const r = await apiAdmin("POST", "/api/admin/totp/enroll");
+  if (!r.ok) { adminError.textContent = r.error || "enroll failed"; adminError.style.display = "block"; return; }
+  totpSecretEl.innerHTML = `Secret (manual entry): <b>${esc(r.secret)}</b><br><br>otpauth URI (for QR import):<br>${esc(r.otpauth_uri)}`;
+  totpEnrollBox.hidden = false;
+  addLog("TOTP enrollment started — add the secret to your authenticator, then activate", "warn");
+});
+
+btnTotpActivate.addEventListener("click", async () => {
+  const code = $("#totp-code").value.trim();
+  if (!code) return;
+  const r = await apiAdmin("POST", "/api/admin/totp/activate", { totp_code: code });
+  if (r.ok) {
+    addLog("TOTP activated", "ok");
+    $("#totp-code").value = "";
+    totpEnrollBox.hidden = true;
+    await refreshTotp();
+  } else { adminError.textContent = r.error || "activate failed"; adminError.style.display = "block"; }
+});
+
+btnTotpDisable.addEventListener("click", async () => {
+  const code = prompt("Enter your current TOTP code to disable 2FA:");
+  if (code === null) return;
+  const r = await apiAdmin("DELETE", "/api/admin/totp", { totp_code: code });
+  if (r.ok) { addLog("TOTP disabled", "warn"); await refreshTotp(); }
+  else { adminError.textContent = r.error || "disable failed"; adminError.style.display = "block"; }
 });
 
 })();

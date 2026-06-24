@@ -6,6 +6,7 @@ user_group_membership, audit_log, operation_log, failed_attempts) plus
 CRUD, logging helpers, state queries, and one-time JSON state migration.
 """
 
+import hashlib
 import json
 import logging
 import sqlite3
@@ -30,6 +31,8 @@ SCHEMA: dict[str, str] = {
             is_admin INTEGER NOT NULL DEFAULT 0,
             current_ip TEXT,
             last_knock INTEGER,
+            totp_secret TEXT,
+            totp_enabled INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL DEFAULT (datetime('now'))
         )
     """,
@@ -92,6 +95,7 @@ SCHEMA: dict[str, str] = {
 # The legacy JSON→SQLite import is migration v0→v1 (first-run only).
 MIGRATIONS: list[tuple[int, str]] = [
     (1, "baseline 6-table schema + legacy JSON import"),
+    (2, "add TOTP step-up columns (totp_secret, totp_enabled) to users"),
 ]
 
 CURRENT_SCHEMA_VERSION: int = MIGRATIONS[-1][0]
@@ -129,6 +133,25 @@ class Database:
         # Run any pending schema migrations (records baseline v1 for
         # pre-existing DBs, runs v0→v1 JSON import for fresh DBs).
         self.run_migrations()
+        self._create_indexes()
+
+    def _create_indexes(self) -> None:
+        """Create performance indexes (idempotent).
+
+        Cover the hot paths: count_recent_ip_changes scans operation_log by
+        (username, action, created_at) on every knock; the IP throttle and
+        failed_attempts lookups scan failed_attempts by username/ip. Without
+        these the scans become full table scans that degrade as logs grow.
+        """
+        self.conn.executescript(
+            "CREATE INDEX IF NOT EXISTS idx_oplog_user_action_time "
+            "ON operation_log(username, action, created_at);"
+            "CREATE INDEX IF NOT EXISTS idx_failed_attempts_username "
+            "ON failed_attempts(username, created_at);"
+            "CREATE INDEX IF NOT EXISTS idx_failed_attempts_ip "
+            "ON failed_attempts(ip, created_at);"
+        )
+        self.conn.commit()
 
     def _table_exists(self, name: str) -> bool:
         """Return True if a table named *name* already exists."""
@@ -188,12 +211,26 @@ class Database:
                 self._record_migration(version)
                 applied.append(version)
                 continue
-            # Future migrations (v2+) would dispatch to specific methods here.
+            if version == 2:
+                self._migration_002_totp()
             self._record_migration(version)
             applied.append(version)
         if applied:
             logger.info("DB migrations applied: %s (now at v%d)", applied, self.get_schema_version())
         return applied
+
+    def _migration_002_totp(self) -> None:
+        """v2: add the TOTP step-up columns to users (idempotent ALTER).
+
+        Fresh installs already have the columns from SCHEMA; this brings a
+        pre-v2.1 users table up to date without a destructive rebuild.
+        """
+        cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(users)")}
+        if "totp_secret" not in cols:
+            self.conn.execute("ALTER TABLE users ADD COLUMN totp_secret TEXT")
+        if "totp_enabled" not in cols:
+            self.conn.execute("ALTER TABLE users ADD COLUMN totp_enabled INTEGER NOT NULL DEFAULT 0")
+        self.conn.commit()
 
     def close(self) -> None:
         """Close the underlying connection."""
@@ -240,6 +277,41 @@ class Database:
         self.conn.execute(
             "UPDATE users SET is_admin=? WHERE id=?",
             (1 if is_admin else 0, user_id),
+        )
+        self.conn.commit()
+
+    def rotate_secret(self, user_id: int, new_secret: str) -> None:
+        """Replace a user's HMAC secret.
+
+        Because authentication is stateless HMAC, changing the secret makes
+        every previously-issued signature invalid immediately. This is how an
+        admin "forces re-login": the old credential dies and the client must
+        re-authenticate with the new secret (delivered out-of-band).
+        """
+        self.conn.execute(
+            "UPDATE users SET secret=? WHERE id=?", (new_secret, user_id),
+        )
+        self.conn.commit()
+
+    def set_totp_secret(self, user_id: int, secret: str) -> None:
+        """Store a pending TOTP secret (enrollment); stays disabled until activated."""
+        self.conn.execute(
+            "UPDATE users SET totp_secret=?, totp_enabled=0 WHERE id=?",
+            (secret, user_id),
+        )
+        self.conn.commit()
+
+    def enable_totp(self, user_id: int) -> None:
+        """Activate TOTP for a user (after the enrollment code is verified)."""
+        self.conn.execute(
+            "UPDATE users SET totp_enabled=1 WHERE id=?", (user_id,),
+        )
+        self.conn.commit()
+
+    def disable_totp(self, user_id: int) -> None:
+        """Remove TOTP enrollment for a user (clears the secret and the flag)."""
+        self.conn.execute(
+            "UPDATE users SET totp_secret=NULL, totp_enabled=0 WHERE id=?", (user_id,),
         )
         self.conn.commit()
 
@@ -394,6 +466,14 @@ class Database:
         )
         self.conn.commit()
 
+    def list_audit(self, limit: int = 100) -> list[sqlite3.Row]:
+        """Return the most recent *limit* audit-log rows, newest first."""
+        return self.conn.execute(
+            "SELECT id, actor, action, target, detail, created_at "
+            "FROM audit_log ORDER BY id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+
     def log_operation(self, username: str, action: str,
                       ip: str | None = None, detail: str | None = None) -> None:
         """Record a user operation event (e.g. ip_change, knock)."""
@@ -411,6 +491,23 @@ class Database:
             (username, ip, reason),
         )
         self.conn.commit()
+
+    def count_recent_failed_attempts(self, ip: str | None,
+                                     window_seconds: int) -> int:
+        """Count failed auth attempts from *ip* within the recent time window.
+
+        Drives the per-IP abuse throttle (``auth.check_ip_throttle``). Uses the
+        ``idx_failed_attempts_ip(ip, created_at)`` index. Returns 0 when *ip* is
+        None/empty (an unidentifiable peer cannot be throttled).
+        """
+        if not ip:
+            return 0
+        row = self.conn.execute(
+            "SELECT COUNT(*) AS c FROM failed_attempts "
+            "WHERE ip=? AND created_at >= datetime('now', ?)",
+            (ip, f"-{window_seconds} seconds"),
+        ).fetchone()
+        return row["c"]
 
     # ------------------------------------------------------------------ #
     #  State queries
@@ -445,6 +542,28 @@ class Database:
             (now, ip, user_id),
         )
         self.conn.commit()
+
+    def record_ip_change(self, user_id: int, username: str, ip: str,
+                         old_ip: str | None) -> None:
+        """Atomically apply an IP change in a single transaction.
+
+        Updates current_ip + last_knock AND appends the ip_change operation-log
+        row together, so an interrupted knock can never leave the audit/anomaly
+        trail out of sync with the stored IP (closes ORPHAN-D's torn-write
+        window). The ``with self.conn`` block commits on success / rolls back on
+        error.
+        """
+        now = int(time.time())
+        with self.conn:
+            self.conn.execute(
+                "UPDATE users SET current_ip=?, last_knock=? WHERE id=?",
+                (ip, now, user_id),
+            )
+            self.conn.execute(
+                "INSERT INTO operation_log (username, action, ip, detail) "
+                "VALUES (?, 'ip_change', ?, ?)",
+                (username, ip, f"old={old_ip}"),
+            )
 
     def count_recent_ip_changes(self, username: str, window_seconds: int) -> int:
         """Count ip_change operation_log rows for a user within the time window."""
@@ -523,3 +642,33 @@ class Database:
                 user = self.get_user_by_username(username)
                 if user and group:
                     self.add_membership(user["id"], group["id"], enabled=1)
+
+    # ------------------------------------------------------------------ #
+    #  Backup
+    # ------------------------------------------------------------------ #
+
+    def backup(self, dest_path: str) -> str:
+        """Write a consistent snapshot of the DB to *dest_path*; return it.
+
+        Uses SQLite's online backup API rather than a file copy: under WAL
+        journaling a plain ``cp`` can capture a torn state (committed pages
+        still in the -wal not yet checkpointed into the main file). The backup
+        target is a self-contained, checkpointed database.
+        """
+        Path(dest_path).parent.mkdir(parents=True, exist_ok=True)
+        dest = sqlite3.connect(dest_path)
+        try:
+            with dest:
+                self.conn.backup(dest)
+        finally:
+            dest.close()
+        return dest_path
+
+    @staticmethod
+    def checksum(path: str) -> str:
+        """Return the SHA-256 hex digest of the file at *path* (for integrity)."""
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+        return h.hexdigest()

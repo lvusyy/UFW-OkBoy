@@ -38,6 +38,26 @@ signature_ttl: 300
 #   ALLOW  1.2.3.4  # ufw-okboy:alice
 rule_prefix: "ufw-okboy"
 
+# Trusted reverse-proxy addresses. X-Real-IP / X-Forwarded-For headers are
+# honored ONLY when the direct peer is in this list, so a client reaching Flask
+# directly cannot spoof these headers to register an arbitrary IP (fixes H-9).
+# Default: localhost. Add your nginx/proxy IP here if it is on another host.
+trusted_proxies:
+  - "127.0.0.1"
+  - "::1"
+
+# Per-IP abuse throttle on /api/ endpoints: after `throttle_max_failures` failed
+# auth attempts from one IP within `throttle_window` seconds, further requests
+# from that IP get HTTP 429 until the failures age out. Keyed on IP (not
+# username) to avoid locking out a legitimate user. 0 disables the throttle.
+throttle_max_failures: 10
+throttle_window: 300
+
+# Require a 6-digit TOTP code for sensitive admin actions (revoke / delete user /
+# delete group) once an admin enrolls 2FA in the admin console. Set to true to
+# also BLOCK un-enrolled admins from those actions (forces enrollment).
+require_admin_totp: false
+
 # ---------- Anomaly Detection ---------- #
 
 # Detect possible credential sharing by monitoring IP change frequency.
@@ -60,6 +80,12 @@ db_path: "/var/lib/ufw-okboy/ufw-okboy.db"
 
 # Path to the legacy JSON state file (used only for one-time migration).
 state_file: "/var/lib/ufw-okboy/state.json"
+
+# Directory for `python app.py backup` snapshots (SQLite online backup API, not
+# a raw file copy — safe under WAL). Each backup gets a .sha256 sidecar; the
+# newest `backup_keep` are retained (0 = keep all).
+backup_dir: "/var/lib/ufw-okboy/backups"
+backup_keep: 7
 
 # ---------- Users ---------- #
 # Each user needs a unique secret for HMAC authentication.

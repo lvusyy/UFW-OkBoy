@@ -18,7 +18,8 @@ class TestMigrations(unittest.TestCase):
     def test_fresh_init_records_baseline_v1(self) -> None:
         db = Database(self.db_path)
         db.init()
-        self.assertEqual(db.get_schema_version(), 1)
+        # Fresh init applies all migrations through the latest (v2 = TOTP cols).
+        self.assertEqual(db.get_schema_version(), CURRENT_SCHEMA_VERSION)
         db.close()
 
     def test_pre_existing_db_records_baseline_without_reseed(self) -> None:
@@ -36,8 +37,9 @@ class TestMigrations(unittest.TestCase):
         db.conn.execute("INSERT INTO users (id, username) VALUES (1, 'preexisting')")
         db.conn.commit()
         db.run_migrations()
-        # Baseline recorded, but the pre-existing user is intact (not re-seeded).
-        self.assertEqual(db.get_schema_version(), 1)
+        # Migrations applied through latest; the pre-existing user is intact
+        # (baseline v1 NOT re-seeded from JSON, v2 only ALTERs in TOTP columns).
+        self.assertEqual(db.get_schema_version(), CURRENT_SCHEMA_VERSION)
         row = db.conn.execute("SELECT username FROM users WHERE id=1").fetchone()
         self.assertEqual(row["username"], "preexisting")
         db.close()

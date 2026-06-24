@@ -37,6 +37,13 @@
 | **版本化 DB 迁移** | `schema_version` 表 + 迁移注册表，未来改 schema 不破坏已部署实例，向前兼容不丢数据 |
 | **智能升级** | `app.py upgrade --check` 检测 GitHub 新版本（仅提示）；`--force` 手动升级（备份 DB→拉取→迁移→重启→健康检查→失败自动回滚）。root 服务不自动联网拉代码 |
 | **版本号体系** | `VERSION` 文件单一真源 + `app.py --version`，构建/升级统一读取 |
+| **暴力/滥用限流** | 同一 IP 认证失败过多自动 429（按 IP，不误伤正常用户）；Nginx limit_req 协同；`failed_attempts` 索引加速 |
+| **用户下线 + 强制重认证** | 一键 `revoke`：关端口 + 清在线态 + 轮换密钥（旧凭据即时失效）；管理页 Revoke 按钮 |
+| **管理员 TOTP 二次验证** | 删除/下线等敏感操作需 6 位动态码（RFC 6238，兼容 Authenticator），管理页 Two-Factor 面板自助启用 |
+| **审计日志查看** | 管理页 Audit Log 面板直接查看操作审计，无需登录服务器 |
+| **数据备份 / 恢复** | `backup`/`restore`：SQLite 在线备份 API + SHA-256 校验和 + 滚动保留 + 篡改拒绝 |
+| **防 IP 伪造 (H-9)** | X-Real-IP / X-Forwarded-For 仅信任 `trusted_proxies` 列表内的直连来源，杜绝伪造 IP 入白名单 |
+| **knock 原子化** | IP 变更的状态更新与 ip_change 日志合并为单事务，消除撕裂窗口 |
 
 ## 为什么需要它
 

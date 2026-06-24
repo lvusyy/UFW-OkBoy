@@ -9,11 +9,15 @@ The database is the single source of truth for user secrets, admin flags,
 and group memberships after the TASK-001 migration.
 """
 
+import base64
 import hashlib
 import hmac
 import logging
+import secrets
 import sqlite3
+import struct
 import time
+from urllib.parse import quote
 
 from db import Database
 
@@ -76,6 +80,29 @@ def verify_hmac(db: Database, auth_header: str | None, ttl: int = 300,
         return None, "Invalid signature"
 
     return username, None
+
+
+def check_ip_throttle(db: Database, client_ip: str | None,
+                      max_failures: int, window_seconds: int) -> str | None:
+    """Return an error string if *client_ip* has too many recent failures.
+
+    Throttling is keyed on the **IP**, not the username, on purpose: keying on
+    username would let an attacker lock out a legitimate user just by spamming
+    bad signatures for their name (an account-lockout DoS — flagged Medium in
+    the project risk register). The HMAC secret is 256-bit, so this is not
+    guess-prevention (online guessing is already infeasible); it throttles
+    abuse/probing and narrows the replay surface.
+
+    A non-positive *max_failures* disables the throttle (returns None). The
+    throttle rejection itself is NOT recorded as a new failed attempt, so the
+    window slides cleanly: an IP unlocks once its failures age past
+    *window_seconds*.
+    """
+    if max_failures <= 0 or not client_ip:
+        return None
+    if db.count_recent_failed_attempts(client_ip, window_seconds) >= max_failures:
+        return "Too many failed attempts; try again later"
+    return None
 
 
 def is_admin(db: Database, username: str) -> bool:
@@ -148,3 +175,64 @@ def require_admin(db: Database, auth_header: str | None, ttl: int = 300,
         db.record_failed_attempt(username, client_ip, "Admin privileges required")
         return None, "Admin privileges required"
     return db.get_user_by_username(username), None
+
+
+# ====================================================================== #
+#  TOTP (RFC 6238) — step-up verification for admin-sensitive operations
+# ====================================================================== #
+#
+# Stdlib-only HOTP/TOTP (no pyotp dependency). HMAC-SHA1 is the RFC default
+# and what authenticator apps (Google Authenticator, Authy, ...) expect — the
+# SHA-1 collision weakness does NOT affect HMAC-SHA1's use here. Correctness is
+# pinned to the RFC 6238 Appendix B test vectors in the test suite.
+
+def generate_totp_secret() -> str:
+    """Return a fresh base32 TOTP secret (160-bit, unpadded — app-friendly)."""
+    return base64.b32encode(secrets.token_bytes(20)).decode("ascii").rstrip("=")
+
+
+def _b32decode(secret: str) -> bytes:
+    """Decode an unpadded/padded base32 secret to raw key bytes."""
+    padded = secret.upper() + ("=" * (-len(secret) % 8))
+    return base64.b32decode(padded)
+
+
+def _hotp(key: bytes, counter: int, digits: int = 6) -> str:
+    """RFC 4226 HOTP: dynamic-truncated HMAC-SHA1, zero-padded to *digits*."""
+    mac = hmac.new(key, struct.pack(">Q", counter), hashlib.sha1).digest()
+    offset = mac[-1] & 0x0F
+    binary = struct.unpack(">I", mac[offset:offset + 4])[0] & 0x7FFFFFFF
+    return str(binary % (10 ** digits)).zfill(digits)
+
+
+def totp_now(secret: str, t: int | None = None,
+             step: int = 30, digits: int = 6) -> str:
+    """Return the current TOTP code for *secret* (RFC 6238)."""
+    t = int(time.time()) if t is None else t
+    return _hotp(_b32decode(secret), t // step, digits)
+
+
+def verify_totp(secret: str | None, code: str | None, t: int | None = None,
+                step: int = 30, digits: int = 6, window: int = 1) -> bool:
+    """Constant-time verify *code* against *secret*, tolerating ±*window* steps.
+
+    The window absorbs clock skew between the server and the authenticator
+    (default ±1 step = ±30s). Returns False for empty secret/code.
+    """
+    if not secret or not code:
+        return False
+    code = code.strip()
+    t = int(time.time()) if t is None else t
+    key = _b32decode(secret)
+    counter = t // step
+    for w in range(-window, window + 1):
+        if hmac.compare_digest(_hotp(key, counter + w, digits), code):
+            return True
+    return False
+
+
+def totp_uri(secret: str, username: str, issuer: str = "UFW-OkBoy") -> str:
+    """Build an otpauth:// URI for QR/manual enrollment in an authenticator app."""
+    label = quote(f"{issuer}:{username}")
+    return (f"otpauth://totp/{label}?secret={secret}"
+            f"&issuer={quote(issuer)}&digits=6&period=30")
