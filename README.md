@@ -103,6 +103,14 @@ curl -fsSL https://raw.githubusercontent.com/lvusyy/UFW-OkBoy/master/deploy/quic
 curl -fsSL https://raw.githubusercontent.com/lvusyy/UFW-OkBoy/master/deploy/install-client.sh | bash -s -- --server https://your-server --user alice --secret YOUR_SECRET
 ```
 
+**一键升级（已安装的服务端，自动重启服务）：**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/lvusyy/UFW-OkBoy/master/deploy/upgrade.sh | bash
+```
+
+> 升级前自动备份数据库 + 快照旧代码；更新后**重启服务**并健康检查，失败自动回滚。保留 config / nginx / SSL / 数据库。浏览器端硬刷新（Ctrl-Shift-R）加载新界面。
+
 ## 手动安装
 
 **服务端（管理员）：**

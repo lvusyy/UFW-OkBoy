@@ -834,6 +834,17 @@ systemctl start ufw-okboy
 
 UFW OkBoy 自 v2.1 起内置版本号与升级机制，便于持续迭代。
 
+### 一键升级脚本（推荐）
+
+在**已安装**的服务器上执行——自动 **备份数据库 → 拉取最新代码 → 装依赖 → 重启服务（关键）→ 健康检查**，失败自动回滚。保留 config / nginx / SSL / 数据库：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/lvusyy/UFW-OkBoy/master/deploy/upgrade.sh | bash
+# 自定义安装目录： ... | bash -s -- --app-dir /opt/ufw-okboy
+```
+
+> 这正是修复"一键安装脚本重跑不重启旧服务、导致后台 API 报错"的方案：升级脚本始终 `systemctl restart`，确保新代码与 DB 迁移生效。升级后浏览器端硬刷新（Ctrl-Shift-R）加载新界面。
+
 ### 查看当前版本
 
 ```bash

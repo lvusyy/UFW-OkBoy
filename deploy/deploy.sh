@@ -172,6 +172,8 @@ if [[ -f "$REPO_DIR/server/app.py" ]]; then
         mkdir -p "$APP_DIR/server/tests"
         cp -r "$REPO_DIR/server/tests/"* "$APP_DIR/server/tests/" 2>/dev/null || true
     fi
+    # VERSION file so app.py --version and /health report the real version
+    cp "$REPO_DIR/VERSION" "$APP_DIR/" 2>/dev/null || true
 else
     error "Cannot find application files. Run from repository root or use curl install."
     exit 1
@@ -388,7 +390,11 @@ WantedBy=timers.target
 TIMEREOF
 
 systemctl daemon-reload
-systemctl enable --now ufw-okboy
+systemctl enable ufw-okboy >/dev/null 2>&1 || true
+# restart (NOT just start): on a re-run the service is already active, so
+# `enable --now` would be a no-op and keep the OLD code running. restart
+# reloads the new code and runs DB migrations on startup.
+systemctl restart ufw-okboy
 systemctl enable --now ufw-okboy-cleanup.timer
 
 info "Services installed and started."
