@@ -290,6 +290,49 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 
 .actions button { flex: 1; }
 
+/* Admin list search inputs */
+.list-search {
+  width: 100%;
+  padding: 0.4rem 0.6rem;
+  margin-bottom: 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 0.8125rem;
+  font-family: inherit;
+  outline: none;
+  transition: border-color 0.15s;
+}
+.list-search:focus {
+  border-color: var(--blue);
+  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1);
+}
+
+/* Secret reveal box (after create-user / revoke rotation) */
+.secret-box {
+  background: var(--amber-bg);
+  border: 1px solid var(--amber);
+  border-radius: 8px;
+  padding: 0.75rem;
+  margin-bottom: 1rem;
+}
+.secret-box-msg {
+  font-size: 0.8125rem;
+  font-weight: 600;
+  color: var(--amber);
+  margin-bottom: 0.5rem;
+}
+.secret-box-value {
+  font-family: "SF Mono", "Cascadia Code", "Fira Code", monospace;
+  font-size: 0.8125rem;
+  word-break: break-all;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.5rem;
+  -webkit-user-select: all;
+  user-select: all;
+}
+
 [hidden] { display: none !important; }
 
 /* Mobile refinements */
@@ -297,6 +340,25 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
   body { padding: 1rem 0.75rem; }
   .card { padding: 1.25rem; }
   header h1 { font-size: 1.25rem; }
+
+  /* Header + language toggle: keep the toggle from colliding with the title.
+     Make it static and right-aligned so a long title never overlaps it. */
+  .lang-toggle { position: static; display: inline-block; margin-bottom: 0.5rem; }
+
+  /* Admin per-row action bars: let buttons wrap onto new lines instead of
+     overflowing. Buttons size to content rather than stretching full-width. */
+  #admin-users .actions,
+  #admin-groups .actions {
+    flex-wrap: wrap;
+  }
+  #admin-users .actions button,
+  #admin-groups .actions button {
+    flex: 0 1 auto;
+  }
+  /* Floated group Delete button: drop the float so it wraps cleanly. */
+  #admin-groups [data-delgroup] { float: none; margin-top: 0.25rem; }
+  /* Keep long usernames / IPs from forcing horizontal scroll. */
+  #admin-users, #admin-groups { word-break: break-word; }
 }
 
 /* Dark mode */
@@ -412,8 +474,20 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
     <h2 style="font-size:1.1rem;margin-bottom:.75rem" data-i18n="admin_title">Admin Console</h2>
     <div id="admin-error" class="login-error"></div>
 
+    <!-- Secret reveal box: shown after a user is created or a secret rotated.
+         Stays visible (with Copy + Dismiss) until the admin dismisses it. -->
+    <div id="secret-box" class="secret-box" hidden>
+      <div class="secret-box-msg" id="secret-box-msg"></div>
+      <div class="secret-box-value" id="secret-box-value"></div>
+      <div class="actions" style="margin-top:.5rem">
+        <button class="btn-primary btn-small" id="btn-copy-secret" data-i18n="copy">Copy</button>
+        <button class="btn-secondary btn-small" id="btn-dismiss-secret" data-i18n="pin_cancel">Cancel</button>
+      </div>
+    </div>
+
     <div class="log-section">
       <h3 data-i18n="admin_users">Users</h3>
+      <input type="text" id="search-users" class="list-search" data-i18n-ph="searchUsers" placeholder="Search users…">
       <div id="admin-users" class="log" style="max-height:none"></div>
       <div class="actions" style="margin-top:.5rem">
         <input type="text" id="new-user" data-i18n-ph="admin_username_ph" placeholder="username" style="flex:1">
@@ -424,6 +498,7 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 
     <div class="log-section">
       <h3 data-i18n="admin_groups">Groups</h3>
+      <input type="text" id="search-groups" class="list-search" data-i18n-ph="searchGroups" placeholder="Search groups…">
       <div id="admin-groups" class="log" style="max-height:none"></div>
       <div class="actions" style="margin-top:.5rem">
         <input type="text" id="new-group-name" data-i18n-ph="admin_name_ph" placeholder="name" style="flex:1">
@@ -562,6 +637,12 @@ const I18N = {
     admin_no_groups: "(no groups)",
     admin_audit_none: "(no entries)",
     admin_port_label: "port {0}",
+    // ---- search / copy ----
+    searchUsers: "Search users…",
+    searchGroups: "Search groups…",
+    copy: "Copy",
+    copied: "Copied",
+    newSecretDeliver: "New secret — copy and deliver it securely (shown once)",
     // ---- confirm() / prompt() texts ----
     confirm_revoke: "Revoke {0}?\n\nCloses their open ports, clears their session, and rotates their secret. They must re-authenticate with a NEW secret you deliver to them.",
     confirm_delete_user: "Delete user {0}?\n\nThis removes the user, closes their open ports, and cannot be undone.",
@@ -680,6 +761,12 @@ const I18N = {
     admin_no_groups: "（暂无分组）",
     admin_audit_none: "（暂无记录）",
     admin_port_label: "端口 {0}",
+    // ---- search / copy ----
+    searchUsers: "搜索用户…",
+    searchGroups: "搜索分组…",
+    copy: "复制",
+    copied: "已复制",
+    newSecretDeliver: "新密钥——请复制并安全转交（仅显示一次）",
     // ---- confirm() / prompt() texts ----
     confirm_revoke: "吊销 {0}？\n\n将关闭其已开放的端口、清除其会话，并轮换其密钥。该用户必须使用你交付的新密钥重新认证。",
     confirm_delete_user: "删除用户 {0}？\n\n这将移除该用户、关闭其已开放的端口，且无法撤销。",
@@ -804,6 +891,13 @@ const adminError   = $("#admin-error");
 const adminUsersEl = $("#admin-users");
 const adminGroupsEl= $("#admin-groups");
 const myGroupsEl   = $("#my-groups");
+const searchUsersEl = $("#search-users");
+const searchGroupsEl = $("#search-groups");
+const secretBox    = $("#secret-box");
+const secretBoxMsg = $("#secret-box-msg");
+const secretBoxValue = $("#secret-box-value");
+const btnCopySecret = $("#btn-copy-secret");
+const btnDismissSecret = $("#btn-dismiss-secret");
 const btnAddUser   = $("#btn-add-user");
 const btnAddGroup  = $("#btn-add-group");
 const btnSaveAuth  = $("#btn-save-auth");
@@ -1283,16 +1377,19 @@ btnAdmin.addEventListener("click", async () => {
   }
   dashView.hidden = true;
   adminView.hidden = false;
+  hideSecret(); // never carry a stale revealed secret into a fresh session
   await loadAdminConsole();
 });
 
 btnAdminBack.addEventListener("click", () => {
+  hideSecret();
   adminView.hidden = true;
   dashView.hidden = false;
 });
 
 btnLock.addEventListener("click", () => {
   vaultKey = null;
+  hideSecret();
   adminView.hidden = true;
   // Return to dashboard if still connected, else to login.
   if (credentials) {
@@ -1323,16 +1420,65 @@ async function loadAdminConsole() {
   }
 }
 
+// ---- Secret reveal box (copy-to-clipboard) ---- //
+// Surfaces a one-time secret to the admin in a persistent inline area (not a
+// prompt()), so they can copy it via the clipboard API and dismiss when done.
+let revealedSecret = "";
+function showSecret(secret) {
+  revealedSecret = String(secret == null ? "" : secret);
+  secretBoxMsg.textContent = t("newSecretDeliver");
+  secretBoxValue.textContent = revealedSecret;
+  btnCopySecret.textContent = t("copy");
+  secretBox.hidden = false;
+  // Bring it into view in case the admin is scrolled down the console.
+  secretBox.scrollIntoView({ block: "nearest" });
+}
+function hideSecret() {
+  revealedSecret = "";
+  secretBoxValue.textContent = "";
+  secretBox.hidden = true;
+}
+
+btnCopySecret.addEventListener("click", async () => {
+  const flash = () => {
+    btnCopySecret.textContent = t("copied");
+    setTimeout(() => { btnCopySecret.textContent = t("copy"); }, 1500);
+  };
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(revealedSecret);
+      flash();
+      return;
+    }
+    throw new Error("no clipboard api");
+  } catch {
+    // Fallback: select the secret text so the admin can copy manually.
+    try {
+      const range = document.createRange();
+      range.selectNodeContents(secretBoxValue);
+      const sel = window.getSelection();
+      sel.removeAllRanges();
+      sel.addRange(range);
+      flash();
+    } catch { /* last-resort no-op */ }
+  }
+});
+
+btnDismissSecret.addEventListener("click", hideSecret);
+
 // Cache of the last-rendered user list so a language toggle (or membership
 // mutation) can re-render without another round-trip. Also tracks which user
 // rows currently have their inline "Manage groups" panel expanded so the state
 // survives a re-render.
 let lastUsers = [];
+let userFilter = "";   // case-insensitive substring filter for the Users list
 const openGroupPanels = new Set();
 
 function renderUsers(users) {
   lastUsers = users;
-  adminUsersEl.innerHTML = users.map(u => {
+  const q = userFilter.trim().toLowerCase();
+  const shown = q ? users.filter(u => String(u.username).toLowerCase().includes(q)) : users;
+  adminUsersEl.innerHTML = shown.map(u => {
     const ip = esc(u.current_ip || "—");
     const admin = u.is_admin ? ` ${esc(t("admin_tag_admin"))}` : "";
     const isSelf = credentials && u.username === credentials.username;
@@ -1359,9 +1505,12 @@ function renderUsers(users) {
 }
 
 let lastGroups = [];
+let groupFilter = "";  // case-insensitive substring filter for the Groups list
 function renderGroups(groups) {
   lastGroups = groups;
-  adminGroupsEl.innerHTML = groups.map(g =>
+  const q = groupFilter.trim().toLowerCase();
+  const shown = q ? groups.filter(g => String(g.name).toLowerCase().includes(q)) : groups;
+  adminGroupsEl.innerHTML = shown.map(g =>
     `<div style="padding:.2rem 0;clear:both">${esc(g.id)}: ${esc(g.name)} → ${esc(g.port)}/${esc(g.proto)}
       <button class="btn-danger btn-small" data-delgroup="${esc(g.id)}" data-name="${esc(g.name)}" style="float:right">${esc(t("admin_delete"))}</button>
     </div>`
@@ -1459,6 +1608,7 @@ btnAddUser.addEventListener("click", async () => {
     addLog(t("log_created_user", username), "ok");
     $("#new-user").value = "";
     await loadAdminConsole();
+    if (r.secret) showSecret(r.secret); // surface after re-render so it stays visible
   } else { adminError.textContent = r.error || t("err_failed"); adminError.style.display = "block"; }
 });
 
@@ -1475,6 +1625,18 @@ btnAddGroup.addEventListener("click", async () => {
   } else { adminError.textContent = r.error || t("err_failed"); adminError.style.display = "block"; }
 });
 
+// Client-side search/filter: re-render from the cached full lists on input,
+// without a server round-trip. Open membership panels keep working because
+// loadUserGroups() guards on the panel element existing.
+searchUsersEl.addEventListener("input", () => {
+  userFilter = searchUsersEl.value;
+  renderUsers(lastUsers);
+});
+searchGroupsEl.addEventListener("input", () => {
+  groupFilter = searchGroupsEl.value;
+  renderGroups(lastGroups);
+});
+
 // Revoke (event-delegated): close ports + clear state + rotate secret =
 // the stateless-HMAC way to force a user to re-authenticate.
 adminUsersEl.addEventListener("click", async (e) => {
@@ -1489,13 +1651,14 @@ adminUsersEl.addEventListener("click", async (e) => {
     r = await apiAdmin("POST", `/api/admin/users/${id}/revoke`, { rotate_secret: true, totp_code: code });
   }
   if (r.ok) {
-    if (r.secret) {
+    const newSecret = r.secret;
+    if (newSecret) {
       addLog(t("log_revoked_new_secret", name), "ok");
-      prompt(t("prompt_new_secret", name), r.secret);
     } else {
       addLog(t("log_revoked", name), "ok");
     }
     await loadAdminConsole();
+    if (newSecret) showSecret(newSecret); // persistent reveal, survives re-render
   } else {
     adminError.textContent = r.error || t("err_revoke_failed");
     adminError.style.display = "block";
@@ -1679,6 +1842,12 @@ btnLang.addEventListener("click", () => {
     renderMyGroups(myGroupsState);
     renderAudit(lastAudit);
     refreshTotp();
+  }
+  // The secret box message is set imperatively, not via data-i18n — refresh it
+  // (and the Copy label) if the box is currently open.
+  if (!secretBox.hidden) {
+    secretBoxMsg.textContent = t("newSecretDeliver");
+    btnCopySecret.textContent = t("copy");
   }
   // Refresh the connect button label if it is mid-flight ("Connecting...").
   if (btnConnect.disabled) btnConnect.textContent = t("login_connecting");
