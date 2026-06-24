@@ -333,6 +333,85 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
   user-select: all;
 }
 
+/* ---- Admin console: section panels ---- */
+/* Each admin section (Users / Groups / Audit / My auth / TOTP) is a clearly
+   delineated card-within-the-card: a tinted header bar, inner padding, its own
+   border + shadow, and a clear gap between panels so sections never blur. */
+.panel {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 1px 2px rgba(0,0,0,0.05);
+  margin-bottom: 1.25rem;
+  overflow: hidden;
+}
+.panel:last-child { margin-bottom: 0; }
+
+.panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.5rem 0.75rem;
+  background: var(--bg);
+  border-bottom: 2px solid var(--border);
+  font-size: 0.8125rem;
+  font-weight: 700;
+  color: var(--text);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.panel-body { padding: 0.75rem; }
+
+/* Small caption above a group of related panels (Management / Monitoring / etc.) */
+.panel-caption {
+  font-size: 0.6875rem;
+  font-weight: 700;
+  color: var(--text2);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  margin: 0 0 0.4rem 0.15rem;
+}
+.panel-caption:not(:first-child) { margin-top: 1.5rem; }
+
+/* ---- Compact pager under paginated lists ---- */
+.pager {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.75rem;
+  margin-top: 0.5rem;
+  font-size: 0.8125rem;
+}
+.pager .pager-info {
+  color: var(--text2);
+  font-variant-numeric: tabular-nums;
+  min-width: 4.5rem;
+  text-align: center;
+}
+.pager button { padding: 0.25rem 0.6rem; font-size: 0.8125rem; }
+
+/* ---- Compact per-user action row ---- */
+/* One gracefully-wrapping row; destructive actions de-emphasized as red
+   text-buttons so the row reads lighter while keeping every action visible. */
+.user-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.35rem;
+  margin-top: 0.3rem;
+}
+.btn-link-danger {
+  background: none;
+  border: none;
+  color: var(--red);
+  padding: 0.25rem 0.4rem;
+  font-size: 0.8125rem;
+  font-weight: 600;
+}
+.btn-link-danger:hover { background: var(--red-bg); }
+
 [hidden] { display: none !important; }
 
 /* Mobile refinements */
@@ -348,10 +427,12 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
   /* Admin per-row action bars: let buttons wrap onto new lines instead of
      overflowing. Buttons size to content rather than stretching full-width. */
   #admin-users .actions,
+  #admin-users .user-actions,
   #admin-groups .actions {
     flex-wrap: wrap;
   }
   #admin-users .actions button,
+  #admin-users .user-actions button,
   #admin-groups .actions button {
     flex: 0 1 auto;
   }
@@ -485,61 +566,79 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
       </div>
     </div>
 
-    <div class="log-section">
-      <h3 data-i18n="admin_users">Users</h3>
-      <input type="text" id="search-users" class="list-search" data-i18n-ph="searchUsers" placeholder="Search users…">
-      <div id="admin-users" class="log" style="max-height:none"></div>
-      <div class="actions" style="margin-top:.5rem">
-        <input type="text" id="new-user" data-i18n-ph="admin_username_ph" placeholder="username" style="flex:1">
-        <input type="checkbox" id="new-user-admin"><label for="new-user-admin" style="font-size:.8rem" data-i18n="admin_admin">admin</label>
-        <button class="btn-secondary btn-small" id="btn-add-user" data-i18n="admin_add">Add</button>
-      </div>
-    </div>
+    <div class="panel-caption" data-i18n="admin_cap_management">Management</div>
 
-    <div class="log-section">
-      <h3 data-i18n="admin_groups">Groups</h3>
-      <input type="text" id="search-groups" class="list-search" data-i18n-ph="searchGroups" placeholder="Search groups…">
-      <div id="admin-groups" class="log" style="max-height:none"></div>
-      <div class="actions" style="margin-top:.5rem">
-        <input type="text" id="new-group-name" data-i18n-ph="admin_name_ph" placeholder="name" style="flex:1">
-        <input type="number" id="new-group-port" data-i18n-ph="admin_port_ph" placeholder="port" style="width:5rem">
-        <button class="btn-secondary btn-small" id="btn-add-group" data-i18n="admin_add">Add</button>
-      </div>
-    </div>
-
-    <div class="log-section">
-      <h3 data-i18n="admin_audit">Audit Log</h3>
-      <div id="admin-audit" class="log" style="max-height:14rem"></div>
-      <button class="btn-secondary btn-small" id="btn-refresh-audit" style="margin-top:.5rem" data-i18n="admin_refresh">Refresh</button>
-    </div>
-
-    <div class="log-section">
-      <h3 data-i18n="admin_my_auth">My Group Authorization</h3>
-      <p style="font-size:.75rem;color:var(--text2);margin-bottom:.5rem" data-i18n="admin_my_auth_hint">
-        Select which groups to authorize your IP for. First group is checked by default.
-        Save to apply. Selection is not replayed across sessions.
-      </p>
-      <div id="my-groups"></div>
-      <button class="btn-primary btn-small" id="btn-save-auth" style="margin-top:.5rem" data-i18n="admin_save_auth">Save Authorization</button>
-    </div>
-
-    <div class="log-section">
-      <h3 data-i18n="admin_totp">Two-Factor (TOTP)</h3>
-      <p style="font-size:.75rem;color:var(--text2);margin-bottom:.5rem" data-i18n="admin_totp_hint">
-        Protects sensitive actions (revoke, delete). Add the secret to an
-        authenticator app, then confirm a code to activate.
-      </p>
-      <div id="totp-status" style="font-size:.8rem;margin-bottom:.5rem"></div>
-      <div id="totp-enroll" hidden>
-        <div id="totp-secret" class="log" style="max-height:none;word-break:break-all;font-size:.7rem"></div>
+    <div class="panel">
+      <div class="panel-head"><span data-i18n="admin_users">Users</span></div>
+      <div class="panel-body">
+        <input type="text" id="search-users" class="list-search" data-i18n-ph="searchUsers" placeholder="Search users…">
+        <div id="admin-users" class="log" style="max-height:none"></div>
+        <div id="users-pager" class="pager" hidden></div>
         <div class="actions" style="margin-top:.5rem">
-          <input type="text" id="totp-code" data-i18n-ph="admin_totp_code_ph" placeholder="6-digit code" inputmode="numeric" style="flex:1">
-          <button class="btn-primary btn-small" id="btn-totp-activate" data-i18n="admin_totp_activate">Activate</button>
+          <input type="text" id="new-user" data-i18n-ph="admin_username_ph" placeholder="username" style="flex:1">
+          <input type="checkbox" id="new-user-admin"><label for="new-user-admin" style="font-size:.8rem" data-i18n="admin_admin">admin</label>
+          <button class="btn-secondary btn-small" id="btn-add-user" data-i18n="admin_add">Add</button>
         </div>
       </div>
-      <div class="actions" style="margin-top:.5rem">
-        <button class="btn-secondary btn-small" id="btn-totp-enroll" data-i18n="admin_totp_enroll">Enroll / Re-enroll</button>
-        <button class="btn-danger btn-small" id="btn-totp-disable" data-i18n="admin_totp_disable">Disable</button>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head"><span data-i18n="admin_groups">Groups</span></div>
+      <div class="panel-body">
+        <input type="text" id="search-groups" class="list-search" data-i18n-ph="searchGroups" placeholder="Search groups…">
+        <div id="admin-groups" class="log" style="max-height:none"></div>
+        <div id="groups-pager" class="pager" hidden></div>
+        <div class="actions" style="margin-top:.5rem">
+          <input type="text" id="new-group-name" data-i18n-ph="admin_name_ph" placeholder="name" style="flex:1">
+          <input type="number" id="new-group-port" data-i18n-ph="admin_port_ph" placeholder="port" style="width:5rem">
+          <button class="btn-secondary btn-small" id="btn-add-group" data-i18n="admin_add">Add</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel-caption" data-i18n="admin_cap_monitoring">Monitoring</div>
+
+    <div class="panel">
+      <div class="panel-head"><span data-i18n="admin_audit">Audit Log</span></div>
+      <div class="panel-body">
+        <div id="admin-audit" class="log" style="max-height:14rem"></div>
+        <button class="btn-secondary btn-small" id="btn-refresh-audit" style="margin-top:.5rem" data-i18n="admin_refresh">Refresh</button>
+      </div>
+    </div>
+
+    <div class="panel-caption" data-i18n="admin_cap_account">My account</div>
+
+    <div class="panel">
+      <div class="panel-head"><span data-i18n="admin_my_auth">My Group Authorization</span></div>
+      <div class="panel-body">
+        <p style="font-size:.75rem;color:var(--text2);margin-bottom:.5rem" data-i18n="admin_my_auth_hint">
+          Select which groups to authorize your IP for. First group is checked by default.
+          Save to apply. Selection is not replayed across sessions.
+        </p>
+        <div id="my-groups"></div>
+        <button class="btn-primary btn-small" id="btn-save-auth" style="margin-top:.5rem" data-i18n="admin_save_auth">Save Authorization</button>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head"><span data-i18n="admin_totp">Two-Factor (TOTP)</span></div>
+      <div class="panel-body">
+        <p style="font-size:.75rem;color:var(--text2);margin-bottom:.5rem" data-i18n="admin_totp_hint">
+          Protects sensitive actions (revoke, delete). Add the secret to an
+          authenticator app, then confirm a code to activate.
+        </p>
+        <div id="totp-status" style="font-size:.8rem;margin-bottom:.5rem"></div>
+        <div id="totp-enroll" hidden>
+          <div id="totp-secret" class="log" style="max-height:none;word-break:break-all;font-size:.7rem"></div>
+          <div class="actions" style="margin-top:.5rem">
+            <input type="text" id="totp-code" data-i18n-ph="admin_totp_code_ph" placeholder="6-digit code" inputmode="numeric" style="flex:1">
+            <button class="btn-primary btn-small" id="btn-totp-activate" data-i18n="admin_totp_activate">Activate</button>
+          </div>
+        </div>
+        <div class="actions" style="margin-top:.5rem">
+          <button class="btn-secondary btn-small" id="btn-totp-enroll" data-i18n="admin_totp_enroll">Enroll / Re-enroll</button>
+          <button class="btn-danger btn-small" id="btn-totp-disable" data-i18n="admin_totp_disable">Disable</button>
+        </div>
       </div>
     </div>
 
@@ -563,6 +662,7 @@ const STORAGE_KEY    = "ufw-okboy"; // localStorage key
 const MAX_LOG        = 50;          // max log entries kept
 const API_BASE       = "";          // same origin (empty = relative)
 const LANG_KEY       = "ufw_lang";  // localStorage key for chosen language
+const PAGE_SIZE      = 8;            // admin list rows per page (Users / Groups)
 
 // ================================================================ //
 //  i18n — bilingual string dictionary (en / zh). Every user-facing
@@ -637,6 +737,14 @@ const I18N = {
     admin_no_groups: "(no groups)",
     admin_audit_none: "(no entries)",
     admin_port_label: "port {0}",
+    // ---- section captions ----
+    admin_cap_management: "Management",
+    admin_cap_monitoring: "Monitoring",
+    admin_cap_account: "My account",
+    // ---- pagination ----
+    prev: "‹ Prev",
+    next: "Next ›",
+    pageOf: "{0} / {1}",
     // ---- search / copy ----
     searchUsers: "Search users…",
     searchGroups: "Search groups…",
@@ -761,6 +869,14 @@ const I18N = {
     admin_no_groups: "（暂无分组）",
     admin_audit_none: "（暂无记录）",
     admin_port_label: "端口 {0}",
+    // ---- section captions ----
+    admin_cap_management: "管理",
+    admin_cap_monitoring: "监控",
+    admin_cap_account: "我的账户",
+    // ---- pagination ----
+    prev: "‹ 上一页",
+    next: "下一页 ›",
+    pageOf: "{0} / {1}",
     // ---- search / copy ----
     searchUsers: "搜索用户…",
     searchGroups: "搜索分组…",
@@ -893,6 +1009,8 @@ const adminGroupsEl= $("#admin-groups");
 const myGroupsEl   = $("#my-groups");
 const searchUsersEl = $("#search-users");
 const searchGroupsEl = $("#search-groups");
+const usersPagerEl = $("#users-pager");
+const groupsPagerEl = $("#groups-pager");
 const secretBox    = $("#secret-box");
 const secretBoxMsg = $("#secret-box-msg");
 const secretBoxValue = $("#secret-box-value");
@@ -1470,15 +1588,40 @@ btnDismissSecret.addEventListener("click", hideSecret);
 // mutation) can re-render without another round-trip. Also tracks which user
 // rows currently have their inline "Manage groups" panel expanded so the state
 // survives a re-render.
+// Client-side pagination helper: filter first (done by caller), then show only
+// the current page. Renders a compact pager into pagerEl and hides it entirely
+// when there is only a single page. Page index is clamped to a valid range so a
+// shrinking list (delete / filter) can never strand the view on an empty page.
+function paginate(items, page) {
+  const total = Math.max(1, Math.ceil(items.length / PAGE_SIZE));
+  const cur = Math.min(Math.max(1, page), total);
+  const start = (cur - 1) * PAGE_SIZE;
+  return { slice: items.slice(start, start + PAGE_SIZE), page: cur, total };
+}
+
+function renderPager(pagerEl, page, total, onGo) {
+  if (total <= 1) { pagerEl.hidden = true; pagerEl.innerHTML = ""; return; }
+  pagerEl.hidden = false;
+  pagerEl.innerHTML =
+    `<button class="btn-secondary btn-small" data-pg="prev" ${page <= 1 ? "disabled" : ""}>${esc(t("prev"))}</button>` +
+    `<span class="pager-info">${esc(t("pageOf", page, total))}</span>` +
+    `<button class="btn-secondary btn-small" data-pg="next" ${page >= total ? "disabled" : ""}>${esc(t("next"))}</button>`;
+  pagerEl.querySelector('[data-pg="prev"]').onclick = () => onGo(page - 1);
+  pagerEl.querySelector('[data-pg="next"]').onclick = () => onGo(page + 1);
+}
+
 let lastUsers = [];
 let userFilter = "";   // case-insensitive substring filter for the Users list
+let userPage = 1;      // current page of the (filtered) Users list
 const openGroupPanels = new Set();
 
 function renderUsers(users) {
   lastUsers = users;
   const q = userFilter.trim().toLowerCase();
-  const shown = q ? users.filter(u => String(u.username).toLowerCase().includes(q)) : users;
-  adminUsersEl.innerHTML = shown.map(u => {
+  const filtered = q ? users.filter(u => String(u.username).toLowerCase().includes(q)) : users;
+  const pg = paginate(filtered, userPage);
+  userPage = pg.page;
+  adminUsersEl.innerHTML = pg.slice.map(u => {
     const ip = esc(u.current_ip || "—");
     const admin = u.is_admin ? ` ${esc(t("admin_tag_admin"))}` : "";
     const isSelf = credentials && u.username === credentials.username;
@@ -1488,33 +1631,38 @@ function renderUsers(users) {
     const adminBtn = isSelf ? "" :
       `<button class="btn-secondary btn-small" data-setadmin="${esc(u.id)}" data-name="${esc(u.username)}" data-isadmin="${u.is_admin ? "1" : "0"}">${esc(adminLbl)}</button>`;
     const delBtn = isSelf ? "" :
-      `<button class="btn-danger btn-small" data-deluser="${esc(u.id)}" data-name="${esc(u.username)}">${esc(t("admin_delete"))}</button>`;
+      `<button class="btn-link-danger" data-deluser="${esc(u.id)}" data-name="${esc(u.username)}">${esc(t("admin_delete"))}</button>`;
     const revokeBtn = isSelf ? "" :
-      `<button class="btn-danger btn-small" data-revoke="${esc(u.id)}" data-name="${esc(u.username)}">${esc(t("admin_revoke"))}</button>`;
+      `<button class="btn-link-danger" data-revoke="${esc(u.id)}" data-name="${esc(u.username)}">${esc(t("admin_revoke"))}</button>`;
     return `<div style="padding:.35rem 0;border-bottom:1px solid var(--border)">
       <div>${esc(u.id)}: ${esc(u.username)}${admin} <span style="color:var(--text2)">ip=${ip}</span></div>
-      <div class="actions" style="margin-top:.25rem;flex-wrap:wrap;gap:.25rem">
+      <div class="user-actions">
         <button class="btn-secondary btn-small" data-groups="${esc(u.id)}" data-name="${esc(u.username)}">${esc(t("admin_manage_groups"))}</button>
         ${adminBtn}${revokeBtn}${delBtn}
       </div>
       <div class="group-panel" data-panel="${esc(u.id)}" ${panelOpen ? "" : "hidden"} style="margin-top:.35rem;padding-left:.5rem">${panelOpen ? `<span style="color:var(--text2);font-size:.75rem">${esc(t("admin_groups_loading"))}</span>` : ""}</div>
     </div>`;
   }).join("");
-  // Re-fetch group panels that were left open across the re-render.
+  renderPager(usersPagerEl, pg.page, pg.total, (p) => { userPage = p; renderUsers(lastUsers); });
+  // Re-fetch group panels that were left open AND visible on this page.
   openGroupPanels.forEach(id => { loadUserGroups(id); });
 }
 
 let lastGroups = [];
 let groupFilter = "";  // case-insensitive substring filter for the Groups list
+let groupPage = 1;     // current page of the (filtered) Groups list
 function renderGroups(groups) {
   lastGroups = groups;
   const q = groupFilter.trim().toLowerCase();
-  const shown = q ? groups.filter(g => String(g.name).toLowerCase().includes(q)) : groups;
-  adminGroupsEl.innerHTML = shown.map(g =>
+  const filtered = q ? groups.filter(g => String(g.name).toLowerCase().includes(q)) : groups;
+  const pg = paginate(filtered, groupPage);
+  groupPage = pg.page;
+  adminGroupsEl.innerHTML = pg.slice.map(g =>
     `<div style="padding:.2rem 0;clear:both">${esc(g.id)}: ${esc(g.name)} → ${esc(g.port)}/${esc(g.proto)}
       <button class="btn-danger btn-small" data-delgroup="${esc(g.id)}" data-name="${esc(g.name)}" style="float:right">${esc(t("admin_delete"))}</button>
     </div>`
   ).join("");
+  renderPager(groupsPagerEl, pg.page, pg.total, (p) => { groupPage = p; renderGroups(lastGroups); });
 }
 
 // Fetch + render the per-user group checkboxes into that user's inline panel.
@@ -1630,10 +1778,12 @@ btnAddGroup.addEventListener("click", async () => {
 // loadUserGroups() guards on the panel element existing.
 searchUsersEl.addEventListener("input", () => {
   userFilter = searchUsersEl.value;
+  userPage = 1; // a changed filter always returns to the first page
   renderUsers(lastUsers);
 });
 searchGroupsEl.addEventListener("input", () => {
   groupFilter = searchGroupsEl.value;
+  groupPage = 1; // a changed filter always returns to the first page
   renderGroups(lastGroups);
 });
 
