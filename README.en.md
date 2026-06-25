@@ -10,6 +10,16 @@ English | [中文](README.md)
 
 ---
 
+## What's New in v2.2
+
+| Feature | Description |
+|---------|-------------|
+| **China-friendly install** | Offline package (bundled manylinux wheels — zero-network dep install); automatic PyPI mirror fallback (`--mirror` to override); GitHub mirror `--gh-mirror`; public-IP auto-detection for the self-signed cert SAN (`--ip` to override); self-signed + IP + any high port as the default path — **no filed domain needed**; 10-year self-signed cert. See [国内部署专题](GUIDE.md#国内部署专题) |
+| **Self-signed-friendly clients** | `knock.sh` supports `-k`/`INSECURE`; `knock.py` honors `verify_ssl: false`; fixed an install-client config-format bug that silently broke auto-knock |
+| **Admin console robustness** | Fixed the "Unexpected token '<'" crash after copying a token (root cause: nginx rate-limit returning an HTML error page); safe non-JSON parsing + idempotent-GET backoff on the client; strict JSON error contract for all `/api` paths |
+| **Deeper hardening** | step-up coverage completed (admin toggling another user's membership); TOTP disable/re-enroll now replay-protected; username/group + port validation; generic login error to prevent user enumeration |
+| **Stability** | reconcile tolerates a single failed ufw rule (stale cleanup still runs); DB switched to thread-local connections; credentials persisted only after the first knock validates them |
+
 ## v2.1.1 Security Fixes
 
 | Fix | Description |
