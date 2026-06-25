@@ -25,6 +25,7 @@ import os
 
 import yaml
 from flask import Flask, request, jsonify, send_from_directory
+from werkzeug.exceptions import HTTPException
 
 import auth
 from db import Database
@@ -941,6 +942,29 @@ def create_app(config_path: str = "config.yaml",
         db.set_user_admin(user_id, is_admin)
         db.log_audit(user["username"], "set_admin", target["username"], f"is_admin={is_admin}")
         return jsonify({"ok": True, "user_id": user_id, "is_admin": is_admin})
+
+    # ---- JSON error contract ---- #
+    # The SPA parses every response body as JSON. Without these handlers an
+    # aborted request (unknown route → 404, wrong verb → 405, oversized body →
+    # 413) or an unhandled exception (500) returns Werkzeug's HTML error page,
+    # which the client cannot parse ("Unexpected token '<'"). Force JSON for
+    # /api/ paths so the {ok, error} envelope holds for app-level errors too.
+    # (Intermediary errors — nginx 429/503/502 — never reach Flask and are
+    # handled client-side.)
+    @app.errorhandler(HTTPException)
+    def _json_http_error(e: HTTPException):
+        if request.path.startswith("/api/"):
+            return jsonify({"ok": False, "error": e.description, "code": e.code}), e.code
+        return e
+
+    @app.errorhandler(Exception)
+    def _json_unhandled_error(e: Exception):
+        if isinstance(e, HTTPException):
+            return _json_http_error(e)
+        logger.exception("Unhandled error on %s", request.path)
+        if request.path.startswith("/api/"):
+            return jsonify({"ok": False, "error": "Internal server error"}), 500
+        raise e
 
     return app
 

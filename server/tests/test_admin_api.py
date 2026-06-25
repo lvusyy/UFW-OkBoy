@@ -379,6 +379,37 @@ class TestAdminAPI(unittest.TestCase):
         self.assertTrue(data["ok"])
         self.assertEqual(data["username"], "alice")
 
+    # -- JSON error contract (regression: SPA chokes on HTML error pages) -- #
+
+    def test_unknown_api_route_returns_json(self) -> None:
+        """An unknown /api/ path returns JSON 404, not Werkzeug's HTML page.
+
+        The SPA parses every response as JSON; an HTML body surfaced to the user
+        as the cryptic "Unexpected token '<'".
+        """
+        resp = self.client.get("/api/does-not-exist")
+        self.assertEqual(resp.status_code, 404)
+        self.assertEqual(resp.mimetype, "application/json")
+        self.assertFalse(resp.get_json()["ok"])
+
+    def test_method_not_allowed_returns_json(self) -> None:
+        """A wrong HTTP verb on an /api/ route returns JSON 405, not HTML."""
+        resp = self.client.put("/api/admin/users")
+        self.assertEqual(resp.status_code, 405)
+        self.assertEqual(resp.mimetype, "application/json")
+        self.assertFalse(resp.get_json()["ok"])
+
+    def test_unhandled_exception_returns_json(self) -> None:
+        """An unhandled error inside a handler returns JSON 500, not HTML."""
+        with patch.object(Database, "list_users", side_effect=RuntimeError("boom")):
+            resp = self.client.get(
+                "/api/admin/users",
+                headers={"Authorization": self._admin_header()},
+            )
+        self.assertEqual(resp.status_code, 500)
+        self.assertEqual(resp.mimetype, "application/json")
+        self.assertFalse(resp.get_json()["ok"])
+
 
 if __name__ == "__main__":
     unittest.main()

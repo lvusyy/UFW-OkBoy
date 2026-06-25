@@ -759,6 +759,8 @@ const I18N = {
     prompt_totp_delete_user: "Enter your 6-digit TOTP code to confirm deleting {0}:",
     prompt_totp_delete_group: "Enter your 6-digit TOTP code to confirm deleting group {0}:",
     prompt_totp_set_admin: "Enter your 6-digit TOTP code to confirm changing admin rights for {0}:",
+    prompt_totp_create_user: "Enter your 6-digit TOTP code to confirm creating user {0}:",
+    prompt_totp_create_group: "Enter your 6-digit TOTP code to confirm creating group {0}:",
     prompt_set_admin_pin: "Set an admin PIN to lock the admin console (encrypts your saved credentials):",
     prompt_new_secret: "New secret for {0} (copy & deliver securely — shown once):",
     prompt_totp_disable: "Enter your current TOTP code to disable 2FA:",
@@ -797,6 +799,8 @@ const I18N = {
     err_delete_failed: "delete failed",
     err_set_admin_failed: "failed to change admin rights",
     err_group_change_failed: "failed to change group",
+    err_rate_limited: "Too many requests — please wait a moment and retry.",
+    err_http: "Server returned an unexpected response (HTTP {0}).",
     err_enroll_failed: "enroll failed",
     err_activate_failed: "activate failed",
     err_disable_failed: "disable failed",
@@ -891,6 +895,8 @@ const I18N = {
     prompt_totp_delete_user: "请输入你的 6 位 TOTP 验证码以确认删除 {0}：",
     prompt_totp_delete_group: "请输入你的 6 位 TOTP 验证码以确认删除分组 {0}：",
     prompt_totp_set_admin: "请输入你的 6 位 TOTP 验证码以确认更改 {0} 的管理员权限：",
+    prompt_totp_create_user: "请输入你的 6 位 TOTP 验证码以确认创建用户 {0}：",
+    prompt_totp_create_group: "请输入你的 6 位 TOTP 验证码以确认创建分组 {0}：",
     prompt_set_admin_pin: "设置管理 PIN 码以锁定管理控制台（加密保存的凭据）：",
     prompt_new_secret: "{0} 的新密钥（请安全复制并交付 — 仅显示一次）：",
     prompt_totp_disable: "请输入你当前的 TOTP 验证码以禁用双因素认证：",
@@ -929,6 +935,8 @@ const I18N = {
     err_delete_failed: "删除失败",
     err_set_admin_failed: "更改管理员权限失败",
     err_group_change_failed: "更改分组失败",
+    err_rate_limited: "请求过于频繁，请稍候后重试。",
+    err_http: "服务器返回了非预期响应（HTTP {0}）。",
     err_enroll_failed: "注册失败",
     err_activate_failed: "激活失败",
     err_disable_failed: "禁用失败",
@@ -1146,13 +1154,45 @@ let pinAttempts = 0, pinLockedUntil = 0;
 //  API calls
 // ================================================================ //
 
+// Idempotent (GET) admin calls auto-retry when an intermediary returns a
+// non-JSON error: the admin console loads several endpoints in parallel, which
+// can momentarily exceed the nginx burst allowance (HTTP 503) — a short backoff
+// lets the token bucket refill before giving up.
+const HTTP_RETRY_MAX = 2;
+const HTTP_RETRY_BASE_MS = 350;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Safely turn a fetch Response into the API's {ok, ...} envelope. The backend
+// always speaks JSON, but an intermediary can return an HTML error page (nginx
+// 429/503 rate-limit, 502/504 while the backend restarts). Parsing HTML as JSON
+// throws a cryptic "Unexpected token '<'"; instead, drain the body and return a
+// clean, status-keyed envelope so every caller's existing r.ok / r.error
+// handling keeps working. JSON error bodies (e.g. the app-level 429 throttle)
+// pass through untouched.
+async function readJson(resp) {
+  const ct = resp.headers.get("content-type") || "";
+  if (ct.includes("application/json")) {
+    try { return await resp.json(); }
+    catch { /* malformed JSON — fall through to the generic envelope */ }
+  } else {
+    try { await resp.text(); } catch { /* free the socket; body is unused */ }
+  }
+  const retriable = [429, 502, 503, 504].includes(resp.status);
+  return {
+    ok: false,
+    error: retriable ? t("err_rate_limited") : t("err_http", resp.status),
+    status: resp.status,
+    retriable,
+  };
+}
+
 async function apiKnock(username, secret) {
   const auth = await buildAuth(username, secret);
   const resp = await fetch(`${API_BASE}/api/knock`, {
     method: "POST",
     headers: { "Authorization": auth },
   });
-  return resp.json();
+  return readJson(resp); // 30s knock loop is the retry; just parse safely here
 }
 
 // ================================================================ //
@@ -1454,13 +1494,30 @@ btnPinCancel.addEventListener("click", () => {
 // ================================================================ //
 
 async function apiAdmin(method, path, body) {
-  const auth = await buildAuth(credentials.username, credentials.secret);
-  const resp = await fetch(path, {
-    method,
-    headers: { "Authorization": auth, "Content-Type": "application/json" },
-    body: body ? JSON.stringify(body) : undefined,
-  });
-  return resp.json();
+  // Only GET is safe to auto-retry — replaying a POST/DELETE could double-apply
+  // a mutation. Non-idempotent calls fail fast and surface a clean message.
+  const idempotent = method === "GET";
+  for (let attempt = 0; ; attempt++) {
+    const auth = await buildAuth(credentials.username, credentials.secret);
+    let data;
+    try {
+      const resp = await fetch(path, {
+        method,
+        headers: { "Authorization": auth, "Content-Type": "application/json" },
+        body: body ? JSON.stringify(body) : undefined,
+      });
+      data = await readJson(resp);
+    } catch (err) {
+      // Network-level failure (offline, DNS, TLS): never throw — return an
+      // envelope so callers' r.ok checks handle it uniformly.
+      data = { ok: false, error: err.message, retriable: true };
+    }
+    if (data.retriable && idempotent && attempt < HTTP_RETRY_MAX) {
+      await sleep(HTTP_RETRY_BASE_MS * (attempt + 1));
+      continue;
+    }
+    return data;
+  }
 }
 
 // After a successful knock, probe admin status to reveal the Admin button.
@@ -1468,7 +1525,7 @@ async function refreshAdminFlag() {
   if (!credentials) return;
   try {
     const auth = await buildAuth(credentials.username, credentials.secret);
-    const r = await (await fetch("/api/status", { headers: { Authorization: auth } })).json();
+    const r = await readJson(await fetch("/api/status", { headers: { Authorization: auth } }));
     isAdmin = !!(r.ok && r.is_admin);
     btnAdmin.hidden = !isAdmin;
   } catch { /* ignore */ }
@@ -1527,6 +1584,11 @@ async function loadAdminConsole() {
       apiAdmin("GET", "/api/me/groups"),
       apiAdmin("GET", "/api/admin/audit?limit=50"),
     ]);
+    // apiAdmin returns an {ok:false} envelope (it no longer throws) on a
+    // non-JSON / HTTP error. Abort the whole load on the first failure with one
+    // clean message instead of rendering half-empty lists.
+    const failed = [users, groups, mine, audit].find((r) => !r || !r.ok);
+    if (failed) throw new Error(failed.error || t("err_failed"));
     renderUsers(users.users || []);
     renderGroups(groups.groups || []);
     renderMyGroups(mine.groups || []);
@@ -1679,6 +1741,12 @@ async function loadUserGroups(userId) {
   if (!panel) return;
   try {
     const r = await apiAdmin("GET", `/api/admin/users/${userId}/groups`);
+    // apiAdmin returns an {ok:false} envelope on error (it no longer throws) —
+    // surface it instead of silently rendering "(no groups)".
+    if (!r.ok) {
+      panel.innerHTML = `<span style="color:var(--red);font-size:.75rem">${esc(r.error || t("err_failed"))}</span>`;
+      return;
+    }
     const groups = r.groups || [];
     if (!groups.length) {
       panel.innerHTML = `<span style="color:var(--text2);font-size:.75rem">${esc(t("admin_no_groups"))}</span>`;
@@ -1767,7 +1835,14 @@ btnAddUser.addEventListener("click", async () => {
   const username = $("#new-user").value.trim();
   if (!username) return;
   const is_admin = $("#new-user-admin").checked;
-  const r = await apiAdmin("POST", "/api/admin/users", { username, is_admin });
+  let r = await apiAdmin("POST", "/api/admin/users", { username, is_admin });
+  // Creating a user is a sensitive admin write: when the admin has TOTP enabled
+  // the server demands a step-up code (mirrors revoke / delete-user below).
+  if (!r.ok && r.totp_required) {
+    const code = prompt(t("prompt_totp_create_user", username));
+    if (!code) return;
+    r = await apiAdmin("POST", "/api/admin/users", { username, is_admin, totp_code: code });
+  }
   if (r.ok) {
     addLog(t("log_created_user", username), "ok");
     $("#new-user").value = "";
@@ -1780,7 +1855,12 @@ btnAddGroup.addEventListener("click", async () => {
   const name = $("#new-group-name").value.trim();
   const port = parseInt($("#new-group-port").value, 10);
   if (!name || !port) return;
-  const r = await apiAdmin("POST", "/api/admin/groups", { name, port });
+  let r = await apiAdmin("POST", "/api/admin/groups", { name, port });
+  if (!r.ok && r.totp_required) {
+    const code = prompt(t("prompt_totp_create_group", name));
+    if (!code) return;
+    r = await apiAdmin("POST", "/api/admin/groups", { name, port, totp_code: code });
+  }
   if (r.ok) {
     addLog(t("log_created_group", name), "ok");
     $("#new-group-name").value = "";
@@ -1958,7 +2038,7 @@ btnRefreshAudit.addEventListener("click", async () => {
 // ---- Two-Factor (TOTP) enrollment ---- //
 async function refreshTotp() {
   const a = await buildAuth(credentials.username, credentials.secret);
-  const r = await (await fetch("/api/status", { headers: { Authorization: a } })).json();
+  const r = await readJson(await fetch("/api/status", { headers: { Authorization: a } }));
   const on = !!(r.ok && r.totp_enabled);
   totpStatus.textContent = on ? t("totp_on") : t("totp_off");
 }
