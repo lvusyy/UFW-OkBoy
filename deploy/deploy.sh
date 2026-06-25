@@ -10,7 +10,12 @@
 #
 # Flags:
 #   --domain <domain>   Use Let's Encrypt for this domain (requires DNS A record)
-#   --port <port>       HTTPS port (default: 443)
+#   --port <port>       HTTPS port (default: 443; use a high port in CN setups)
+#   --ip <addr>         Public IP for the self-signed cert + access URL (skip
+#                       auto-detection; useful on NAT'd cloud VPS)
+#   --mirror <url>      PyPI index URL (e.g. https://pypi.tuna.tsinghua.edu.cn/simple).
+#                       If omitted and pypi.org is unreachable, a CN mirror is used.
+#   --offline           Install Python deps from the bundled vendor/ wheels (no network)
 #   --no-nginx          Skip nginx setup (use gunicorn directly with self-signed)
 #   --self-signed       Force self-signed cert even if domain provided
 #   --app-dir <path>    Install directory (default: /opt/ufw-okboy)
@@ -24,11 +29,17 @@ DATA_DIR="/var/lib/ufw-okboy"
 LOG_DIR="/var/log/ufw-okboy"
 HTTPS_PORT=443
 DOMAIN=""
+PUBLIC_IP=""
+PIP_MIRROR=""
+OFFLINE=false
 FORCE_SELF_SIGNED=false
 NO_NGINX=false
 NON_INTERACTIVE=false
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+# Bundled offline wheels (produced by build-release.sh) enable a zero-network
+# Python dependency install — the reliable path where PyPI is slow/blocked.
+VENDOR_DIR="$REPO_DIR/vendor"
 
 # ── Color output ── #
 if [[ -t 1 ]]; then
@@ -46,17 +57,66 @@ warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
 error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 step()  { echo -e "\n${CYAN}=== $* ===${NC}"; }
 
+# Best-effort PUBLIC IP for the self-signed cert SAN + the printed access URL.
+# On a cloud VPS `hostname -I` returns the PRIVATE NIC address, not the address
+# users actually reach — so prefer an explicit --ip, then a public echo service
+# (short timeout; CN-reachable endpoints first), and only then the local NIC IP.
+detect_public_ip() {
+    if [[ -n "$PUBLIC_IP" ]]; then echo "$PUBLIC_IP"; return; fi
+    local ip svc
+    for svc in "https://4.ipw.cn" "https://api.ipify.org" "https://ifconfig.me/ip"; do
+        ip="$(curl -fsS --max-time 4 "$svc" 2>/dev/null | tr -d '[:space:]')"
+        if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then echo "$ip"; return; fi
+    done
+    ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+    [[ -n "$ip" ]] && warn "Public IP auto-detect failed; using local IP $ip (pass --ip on a NAT'd VPS)." >&2
+    echo "${ip:-127.0.0.1}"
+}
+
+# pip install with offline-vendor / mirror fallback. Args: pip-install arguments
+# (e.g. -r requirements.txt). Order: bundled wheels (offline) > --mirror >
+# probe pypi.org, else a CN mirror. This is what makes the install survive the
+# slow/blocked PyPI access typical in mainland China.
+pip_install() {
+    local pip="$APP_DIR/venv/bin/pip"
+    if [[ -d "$VENDOR_DIR" ]]; then
+        info "Installing Python deps OFFLINE from $VENDOR_DIR"
+        if "$pip" install --no-index --find-links "$VENDOR_DIR" "$@"; then return 0; fi
+        [[ "$OFFLINE" == true ]] && { error "Offline install failed and --offline forbids network."; return 1; }
+        warn "Offline install incomplete; falling back to an online index."
+    elif [[ "$OFFLINE" == true ]]; then
+        error "--offline set but no bundled wheels at $VENDOR_DIR (build with build-release.sh)."
+        return 1
+    fi
+    local index="$PIP_MIRROR"
+    if [[ -z "$index" ]]; then
+        if ! curl -fsS --max-time 4 -o /dev/null https://pypi.org/simple/ 2>/dev/null; then
+            index="https://pypi.tuna.tsinghua.edu.cn/simple"
+            warn "pypi.org unreachable — using mirror: $index"
+        fi
+    fi
+    if [[ -n "$index" ]]; then
+        local host; host="$(echo "$index" | awk -F/ '{print $3}')"
+        "$pip" install -i "$index" --trusted-host "$host" "$@"
+    else
+        "$pip" install "$@"
+    fi
+}
+
 # ── Parse args ── #
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --domain)       DOMAIN="$2"; shift 2 ;;
         --port)         HTTPS_PORT="$2"; shift 2 ;;
+        --ip)           PUBLIC_IP="$2"; shift 2 ;;
+        --mirror)       PIP_MIRROR="$2"; shift 2 ;;
+        --offline)      OFFLINE=true; shift ;;
         --no-nginx)     NO_NGINX=true; shift ;;
         --self-signed)  FORCE_SELF_SIGNED=true; shift ;;
         --app-dir)      APP_DIR="$2"; shift 2 ;;
         -y|--yes)       NON_INTERACTIVE=true; shift ;;
         -h|--help)
-            head -20 "$0"
+            head -30 "$0"
             exit 0
             ;;
         *) error "Unknown option: $1"; exit 1 ;;
@@ -182,8 +242,8 @@ fi
 # Create virtual environment
 info "Setting up Python virtual environment..."
 python3 -m venv "$APP_DIR/venv"
-"$APP_DIR/venv/bin/pip" install --upgrade pip --quiet
-"$APP_DIR/venv/bin/pip" install -r "$APP_DIR/server/requirements.txt" --quiet
+pip_install --upgrade pip --quiet || warn "pip self-upgrade skipped (non-fatal)."
+pip_install -r "$APP_DIR/server/requirements.txt" --quiet
 
 # Config file
 if [[ ! -f "$APP_DIR/server/config.yaml" ]]; then
@@ -201,31 +261,33 @@ SSL_CERT=""
 SSL_KEY=""
 
 if [[ "$FORCE_SELF_SIGNED" == true || -z "$DOMAIN" ]]; then
-    # Self-signed certificate
-    info "Generating self-signed certificate..."
+    # Self-signed certificate — the default/recommended path for IP-based access
+    # (no filed domain needed; works on any port). Clients trust it once: the web
+    # UI adds a browser exception; CLI clients set verify_ssl=false / --insecure.
+    info "Generating self-signed certificate (no domain → IP-based HTTPS)..."
     SSL_DIR="/etc/ssl/ufw-okboy"
     mkdir -p "$SSL_DIR"
     SSL_CERT="$SSL_DIR/selfsigned.crt"
     SSL_KEY="$SSL_DIR/selfsigned.key"
 
-    # Determine server IP for cert
-    SERVER_IP=$(hostname -I | awk '{print $1}')
-    if [[ -z "$SERVER_IP" ]]; then
-        SERVER_IP="127.0.0.1"
-    fi
+    # Public IP for the cert SAN (NOT hostname -I, which is the private NIC on a
+    # cloud VPS and would never match the address users connect to).
+    SERVER_IP="$(detect_public_ip)"
 
-    openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+    # 10-year validity: a 1-year self-signed cert would silently expire and break
+    # every knock; for an internal tool a long-lived cert is the kinder default.
+    openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
         -keyout "$SSL_KEY" \
         -out "$SSL_CERT" \
         -subj "/CN=$SERVER_IP" \
         -addext "subjectAltName=IP:$SERVER_IP" 2>/dev/null || \
-    openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+    openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
         -keyout "$SSL_KEY" \
         -out "$SSL_CERT" \
         -subj "/CN=$SERVER_IP" 2>/dev/null
 
     chmod 600 "$SSL_KEY"
-    info "Self-signed cert: $SSL_CERT"
+    info "Self-signed cert: $SSL_CERT  (CN/SAN: $SERVER_IP, valid 10y)"
     info "Access via: https://$SERVER_IP:$HTTPS_PORT"
 else
     # Let's Encrypt via certbot
@@ -241,8 +303,12 @@ else
         mkdir -p "$SSL_DIR"
         SSL_CERT="$SSL_DIR/selfsigned.crt"
         SSL_KEY="$SSL_DIR/selfsigned.key"
-        openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
-            -keyout "$SSL_KEY" -out "$SSL_CERT" -subj "/CN=localhost" 2>/dev/null
+        SERVER_IP="$(detect_public_ip)"
+        openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
+            -keyout "$SSL_KEY" -out "$SSL_CERT" -subj "/CN=$SERVER_IP" \
+            -addext "subjectAltName=IP:$SERVER_IP" 2>/dev/null || \
+        openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
+            -keyout "$SSL_KEY" -out "$SSL_CERT" -subj "/CN=$SERVER_IP" 2>/dev/null
         chmod 600 "$SSL_KEY"
     fi
 fi
@@ -401,6 +467,7 @@ info "Services installed and started."
 
 # ── Open firewall for HTTPS ── #
 ufw allow $HTTPS_PORT/tcp comment "UFW OkBoy HTTPS" 2>/dev/null || true
+warn "Cloud VPS: also open port $HTTPS_PORT/tcp in your provider's security group (安全组) — UFW alone is not enough."
 
 # ── Bootstrap first admin (interactive) ── #
 if [[ "$NON_INTERACTIVE" == false ]]; then
@@ -411,10 +478,13 @@ if [[ "$NON_INTERACTIVE" == false ]]; then
         "$APP_DIR/venv/bin/python" "$APP_DIR/server/app.py" -c "$APP_DIR/server/config.yaml" user-add "$ADMIN_USER" --admin
         echo ""
         warn "Save the secret above! You'll need it for the client config."
-        warn "Client config file format:"
+        warn "Client config file format (~/.config/ufw-okboy/config for knock.sh):"
         echo "  SERVER_URL=https://${DOMAIN:-$SERVER_IP}:$HTTPS_PORT"
         echo "  USERNAME=$ADMIN_USER"
         echo "  SECRET=<the-secret-printed-above>"
+        if [[ -z "$DOMAIN" || "$FORCE_SELF_SIGNED" == true ]]; then
+            echo "  INSECURE=1   # self-signed cert: skip TLS verification"
+        fi
     fi
 fi
 
@@ -431,8 +501,8 @@ if [[ -n "$DOMAIN" && "$FORCE_SELF_SIGNED" == false ]]; then
     echo "  Access URL:      https://$DOMAIN"
 else
     echo "  Access URL:      https://$SERVER_IP:$HTTPS_PORT"
-    warn "  Self-signed cert: browsers will show a security warning."
-    warn "  Add exception or use --no-verify-ssl on clients."
+    warn "  Self-signed cert: the browser shows a one-time warning — click through / add an exception."
+    warn "  CLI clients: set verify_ssl: false (knock.py) or INSECURE=1 (knock.sh) for self-signed."
 fi
 echo ""
 echo "  Management commands (run from any directory):"

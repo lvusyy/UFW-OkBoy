@@ -14,6 +14,45 @@ DATA_DIR="/var/lib/ufw-okboy"
 LOG_DIR="/var/log/ufw-okboy"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+VENDOR_DIR="$REPO_DIR/vendor"   # bundled wheels (offline install) if present
+PIP_MIRROR=""                   # --mirror <url>; else auto CN fallback if PyPI down
+OFFLINE=false                   # --offline forces bundled-wheels-only install
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --mirror)  PIP_MIRROR="$2"; shift 2 ;;
+        --offline) OFFLINE=true; shift ;;
+        --app-dir) APP_DIR="$2"; shift 2 ;;
+        -h|--help) head -8 "$0"; exit 0 ;;
+        *) echo "Unknown option: $1"; exit 1 ;;
+    esac
+done
+
+# pip install with offline-vendor / mirror fallback (survives slow/blocked PyPI).
+pip_install() {
+    local pip="$APP_DIR/venv/bin/pip"
+    if [[ -d "$VENDOR_DIR" ]]; then
+        echo "[INFO] Installing Python deps OFFLINE from $VENDOR_DIR"
+        if "$pip" install --no-index --find-links "$VENDOR_DIR" "$@"; then return 0; fi
+        [[ "$OFFLINE" == true ]] && { echo "[ERROR] Offline install failed and --offline forbids network."; return 1; }
+        echo "[WARN] Offline install incomplete; falling back to an online index."
+    elif [[ "$OFFLINE" == true ]]; then
+        echo "[ERROR] --offline set but no bundled wheels at $VENDOR_DIR."; return 1
+    fi
+    local index="$PIP_MIRROR"
+    if [[ -z "$index" ]]; then
+        if ! curl -fsS --max-time 4 -o /dev/null https://pypi.org/simple/ 2>/dev/null; then
+            index="https://pypi.tuna.tsinghua.edu.cn/simple"
+            echo "[WARN] pypi.org unreachable — using mirror: $index"
+        fi
+    fi
+    if [[ -n "$index" ]]; then
+        local host; host="$(echo "$index" | awk -F/ '{print $3}')"
+        "$pip" install -i "$index" --trusted-host "$host" "$@"
+    else
+        "$pip" install "$@"
+    fi
+}
 
 echo "=== UFW OkBoy Server Installation ==="
 
@@ -83,8 +122,8 @@ cp "$REPO_DIR/server/app.py" \
 # Create virtual environment and install dependencies
 echo "[3/5] Setting up Python virtual environment..."
 python3 -m venv "$APP_DIR/venv"
-"$APP_DIR/venv/bin/pip" install --upgrade pip
-"$APP_DIR/venv/bin/pip" install -r "$APP_DIR/server/requirements.txt"
+pip_install --upgrade pip || echo "[WARN] pip self-upgrade skipped (non-fatal)."
+pip_install -r "$APP_DIR/server/requirements.txt"
 
 # Config file
 echo "[4/5] Setting up configuration..."

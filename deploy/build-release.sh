@@ -78,6 +78,35 @@ cp "$REPO_DIR/CLAUDE.md" "$PKG_DIR/" 2>/dev/null || true
 # Copy VERSION file so installed app can report its version (for upgrade checks)
 cp "$REPO_DIR/VERSION" "$PKG_DIR/" 2>/dev/null || true
 
+# Vendor Python wheels for OFFLINE install — the reliable path where PyPI is slow
+# or blocked (e.g. mainland China). Downloads manylinux x86_64 wheels for a range
+# of CPython versions so `pip install --no-index --find-links vendor` works on a
+# typical server with zero network. --platform + --only-binary pin the target, so
+# this produces Linux wheels even when the release is built on macOS/Windows.
+# Skipped (with a warning) if pip is unavailable — the online/mirror path still works.
+echo "[*] Vendoring Python wheels for offline install..."
+PIPBIN="$(command -v pip3 || command -v pip || true)"
+if [[ -n "$PIPBIN" ]]; then
+    mkdir -p "$PKG_DIR/vendor"
+    for pyver in 3.8 3.9 3.10 3.11 3.12; do
+        "$PIPBIN" download -r "$REPO_DIR/server/requirements.txt" \
+            -d "$PKG_DIR/vendor" \
+            --only-binary=:all: \
+            --platform manylinux2014_x86_64 \
+            --python-version "$pyver" \
+            --implementation cp >/dev/null 2>&1 || true
+    done
+    WHEEL_COUNT=$(find "$PKG_DIR/vendor" -name '*.whl' 2>/dev/null | wc -l | tr -d ' ')
+    if [[ "${WHEEL_COUNT:-0}" -gt 0 ]]; then
+        echo "    Vendored $WHEEL_COUNT wheel(s) -> vendor/ (offline install enabled)"
+    else
+        echo "    [WARN] No wheels vendored (offline build?); release will rely on online/mirror install."
+        rmdir "$PKG_DIR/vendor" 2>/dev/null || true
+    fi
+else
+    echo "    [WARN] pip not found; skipping offline wheels (online/mirror install only)."
+fi
+
 # Create a simple install.sh wrapper in the package root
 cat > "$PKG_DIR/install.sh" << 'INSTALLEOF'
 #!/usr/bin/env bash
@@ -104,10 +133,10 @@ echo "  File:     $OUTPUT_DIR/${PKG_NAME}.tar.gz"
 echo "  Size:     $SIZE"
 echo "  SHA256:   $CHECKSUM"
 echo ""
-echo "  Install from package:"
+echo "  Install from package (OFFLINE — recommended for CN; uses bundled wheels if present):"
 echo "    tar xzf ${PKG_NAME}.tar.gz"
 echo "    cd ${PKG_NAME}"
-echo "    bash install.sh --self-signed -y"
+echo "    bash install.sh --self-signed -y          # auto-detects vendor/ for offline pip"
 echo ""
-echo "  Or one-line install:"
+echo "  Or one-line install (needs GitHub + PyPI reachable; add --gh-mirror / --mirror in CN):"
 echo "    curl -fsSL https://raw.githubusercontent.com/lvusyy/UFW-OkBoy/master/deploy/quick-install.sh | bash"
