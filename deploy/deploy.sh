@@ -18,6 +18,7 @@
 #   --offline           Install Python deps from the bundled vendor/ wheels (no network)
 #   --no-nginx          Skip nginx setup (use gunicorn directly with self-signed)
 #   --self-signed       Force self-signed cert even if domain provided
+#   --admin-user <name> First admin to auto-create (default: admin; use 'skip' to skip)
 #   --app-dir <path>    Install directory (default: /opt/ufw-okboy)
 #   -y, --yes           Non-interactive mode (skip all prompts)
 
@@ -35,6 +36,7 @@ OFFLINE=false
 FORCE_SELF_SIGNED=false
 NO_NGINX=false
 NON_INTERACTIVE=false
+ADMIN_USER=""          # first admin to auto-create; default "admin" (see bootstrap)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 # Bundled offline wheels (produced by build-release.sh) enable a zero-network
@@ -113,10 +115,11 @@ while [[ $# -gt 0 ]]; do
         --offline)      OFFLINE=true; shift ;;
         --no-nginx)     NO_NGINX=true; shift ;;
         --self-signed)  FORCE_SELF_SIGNED=true; shift ;;
+        --admin-user)   ADMIN_USER="$2"; shift 2 ;;
         --app-dir)      APP_DIR="$2"; shift 2 ;;
         -y|--yes)       NON_INTERACTIVE=true; shift ;;
         -h|--help)
-            head -30 "$0"
+            head -31 "$0"
             exit 0
             ;;
         *) error "Unknown option: $1"; exit 1 ;;
@@ -469,22 +472,49 @@ info "Services installed and started."
 ufw allow $HTTPS_PORT/tcp comment "UFW OkBoy HTTPS" 2>/dev/null || true
 warn "Cloud VPS: also open port $HTTPS_PORT/tcp in your provider's security group (安全组) — UFW alone is not enough."
 
-# ── Bootstrap first admin (interactive) ── #
-if [[ "$NON_INTERACTIVE" == false ]]; then
-    echo ""
-    read -rp "Create your first admin user? Enter username (or skip): " ADMIN_USER
-    if [[ -n "$ADMIN_USER" && "$ADMIN_USER" != "skip" ]]; then
-        info "Creating admin user: $ADMIN_USER"
-        "$APP_DIR/venv/bin/python" "$APP_DIR/server/app.py" -c "$APP_DIR/server/config.yaml" user-add "$ADMIN_USER" --admin
+# ── Bootstrap first admin (BOTH interactive and -y) ── #
+# An admin is REQUIRED to do anything, so create one by default — including in
+# non-interactive (-y) mode, where the old script skipped this and left the
+# operator with NO admin and NO credentials.
+PY="$APP_DIR/venv/bin/python"
+APP="$APP_DIR/server/app.py"
+CONF="$APP_DIR/server/config.yaml"
+
+if [[ -z "$ADMIN_USER" ]]; then
+    if [[ "$NON_INTERACTIVE" == true ]]; then
+        ADMIN_USER="admin"
+    else
         echo ""
-        warn "Save the secret above! You'll need it for the client config."
-        warn "Client config file format (~/.config/ufw-okboy/config for knock.sh):"
-        echo "  SERVER_URL=https://${DOMAIN:-$SERVER_IP}:$HTTPS_PORT"
-        echo "  USERNAME=$ADMIN_USER"
-        echo "  SECRET=<the-secret-printed-above>"
+        read -rp "Create your first admin user? Enter username [admin] (or 'skip'): " ADMIN_USER
+        ADMIN_USER="${ADMIN_USER:-admin}"
+    fi
+fi
+
+ADMIN_SECRET=""
+if [[ "$ADMIN_USER" != "skip" && "$ADMIN_USER" != "none" ]]; then
+    info "Creating admin user: $ADMIN_USER"
+    # Detect success by capturing the 64-hex secret it prints. A duplicate (on a
+    # re-run) prints no secret, so we fall through to the manual hint instead of
+    # aborting under `set -e`.
+    ADMIN_OUT="$("$PY" "$APP" -c "$CONF" user-add "$ADMIN_USER" --admin 2>&1)" || true
+    ADMIN_SECRET="$(printf '%s' "$ADMIN_OUT" | grep -oE '[0-9a-f]{64}' | head -n1)"
+    if [[ -n "$ADMIN_SECRET" ]]; then
+        echo ""
+        step "管理员已创建 / Admin created — 请妥善保存（仅此一次显示）"
+        echo "  用户名 / USERNAME: $ADMIN_USER"
+        echo "  密钥   / SECRET:   $ADMIN_SECRET"
+        echo ""
+        echo "  客户端配置 (~/.config/ufw-okboy/config, knock.sh):"
+        echo "    SERVER_URL=https://${DOMAIN:-$SERVER_IP}:$HTTPS_PORT"
+        echo "    USERNAME=$ADMIN_USER"
+        echo "    SECRET=$ADMIN_SECRET"
         if [[ -z "$DOMAIN" || "$FORCE_SELF_SIGNED" == true ]]; then
-            echo "  INSECURE=1   # self-signed cert: skip TLS verification"
+            echo "    INSECURE=1   # self-signed cert: skip TLS verification"
         fi
+    else
+        warn "Admin '$ADMIN_USER' was not created (it may already exist)."
+        warn "Create one manually:  $PY $APP -c $CONF user-add <name> --admin"
+        warn "Rotate an existing user's secret:  $PY $APP -c $CONF revoke <name>"
     fi
 fi
 
@@ -506,9 +536,11 @@ else
 fi
 echo ""
 echo "  Management commands (run from any directory):"
-echo "    $APP_DIR/venv/bin/python $APP_DIR/server/app.py -c $APP_DIR/server/config.yaml user-list"
-echo "    $APP_DIR/venv/bin/python $APP_DIR/server/app.py -c $APP_DIR/server/config.yaml group-add <name> <port>"
-echo "    $APP_DIR/venv/bin/python $APP_DIR/server/app.py -c $APP_DIR/server/config.yaml user-join <user> <group>"
+echo "    $PY $APP -c $CONF user-add <name> --admin     # 创建另一个管理员"
+echo "    $PY $APP -c $CONF user-list"
+echo "    $PY $APP -c $CONF group-add <name> <port>"
+echo "    $PY $APP -c $CONF user-join <user> <group>"
+echo "    $PY $APP -c $CONF revoke <name>               # 轮换某用户密钥（旧凭据失效）"
 echo ""
 echo "  Service status:  systemctl status ufw-okboy"
 echo "  View logs:       journalctl -u ufw-okboy -f"
