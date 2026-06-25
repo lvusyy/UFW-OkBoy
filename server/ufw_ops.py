@@ -178,8 +178,17 @@ class UFWManager:
         for group_name, (port, proto) in enabled_groups.items():
             comment = f"{prefix}{group_name}"
             if (client_ip, port, proto, comment) not in existing:
-                self.add_rule(client_ip, port, username, proto, group_name)
-                added.append(group_name)
+                # Isolate per-group failures (transient UFW lock, bad port, ...)
+                # so one failing add does not abort the whole reconcile and skip
+                # the stale-rule cleanup below — symmetric with the removal loop.
+                try:
+                    self.add_rule(client_ip, port, username, proto, group_name)
+                    added.append(group_name)
+                except RuntimeError:
+                    logger.warning(
+                        "reconcile: failed to add rule for group %s (%s:%s)",
+                        group_name, port, proto,
+                    )
 
         # Remove rules that are stale: group no longer enabled, OR bound to an
         # old IP (stale old-IP rule for an enabled group also gets cleaned up).

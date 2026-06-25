@@ -10,6 +10,7 @@ import hashlib
 import json
 import logging
 import sqlite3
+import threading
 import time
 from pathlib import Path
 
@@ -107,23 +108,40 @@ CURRENT_SCHEMA_VERSION: int = MIGRATIONS[-1][0]
 class Database:
     """SQLite-backed persistence for UFW OkBoy.
 
-    The connection is opened with ``check_same_thread=False`` so it can be
-    shared across Flask/gunicorn worker threads. Callers should keep
-    transactions short.
+    Each thread gets its OWN sqlite3 connection (``threading.local``). A single
+    shared connection is not safe under concurrent gunicorn worker threads —
+    interleaved implicit transactions can commit each other's partial writes.
+    WAL journaling + ``busy_timeout`` let the per-thread connections serialize
+    writes cleanly instead. Callers should keep transactions short.
     """
 
     def __init__(self, db_path: str) -> None:
         self.db_path = db_path
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-        self.conn: sqlite3.Connection = sqlite3.connect(
-            db_path, check_same_thread=False,
-        )
-        self.conn.row_factory = sqlite3.Row
-        self.conn.execute("PRAGMA foreign_keys = ON")
-        self.conn.execute("PRAGMA journal_mode = WAL")
+        # One connection per thread. The constructing thread's connection is
+        # opened eagerly so init()/migrations/CLI/tests run without surprises.
+        self._local = threading.local()
+        self._connect()
+
+    def _connect(self) -> sqlite3.Connection:
+        """Open and configure a SQLite connection for the calling thread."""
+        conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("PRAGMA journal_mode = WAL")
         # Wait (up to 5s) for a competing writer instead of erroring out with
-        # SQLITE_BUSY: under WAL two gunicorn workers can attempt writes at once.
-        self.conn.execute("PRAGMA busy_timeout = 5000")
+        # SQLITE_BUSY: under WAL multiple connections can attempt writes at once.
+        conn.execute("PRAGMA busy_timeout = 5000")
+        self._local.conn = conn
+        return conn
+
+    @property
+    def conn(self) -> sqlite3.Connection:
+        """The calling thread's SQLite connection (lazily created per thread)."""
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = self._connect()
+        return conn
 
     # ------------------------------------------------------------------ #
     #  Schema
@@ -288,8 +306,11 @@ class Database:
         self.conn.commit()
 
     def close(self) -> None:
-        """Close the underlying connection."""
-        self.conn.close()
+        """Close the calling thread's connection (if one was opened)."""
+        conn = getattr(self._local, "conn", None)
+        if conn is not None:
+            conn.close()
+            self._local.conn = None
 
     # ------------------------------------------------------------------ #
     #  User CRUD

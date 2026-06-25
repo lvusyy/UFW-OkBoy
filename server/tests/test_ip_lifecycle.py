@@ -414,5 +414,48 @@ class TestMembershipUpsert(unittest.TestCase):
         self.assertEqual(enabled[0]["name"], "web")
 
 
+class TestReconcileResilience(unittest.TestCase):
+    """A single failing add must not abort the whole reconcile (stale cleanup
+    still runs, other groups still added) — symmetric with the removal loop."""
+
+    def setUp(self) -> None:
+        self.tmpdir = tempfile.mkdtemp(prefix="ufw-okboy-reconcile-test-")
+        self.db = Database(os.path.join(self.tmpdir, "test.db"))
+        self.db.init()
+        self.addCleanup(self.db.close)
+
+    def test_one_failed_add_does_not_abort_reconcile(self) -> None:
+        existing = [{
+            "ip": "203.0.113.1", "port": 8080, "proto": "tcp",
+            "comment": "ufw-okboy:alice:web", "number": 1,  # stale: old IP
+        }]
+        added, deleted = [], []
+
+        class PartialFailUFW(UFWManager):
+            def __init__(self, db):
+                super().__init__(rule_prefix="ufw-okboy", db=db)
+
+            def list_rules_by_comment(self, prefix):
+                return existing
+
+            def add_rule(self, ip, port, username, proto="tcp", group=None):
+                if group == "db":
+                    raise RuntimeError("simulated ufw failure")
+                added.append(group)
+
+            def _run_ufw(self, *args):
+                deleted.append(args)
+                return ""
+
+        ufw = PartialFailUFW(self.db)
+        # Should NOT raise even though the 'db' group add fails.
+        ufw.reconcile_user_rules(
+            "alice", "198.51.100.9",
+            {"web": (8080, "tcp"), "db": (3306, "tcp")},
+        )
+        self.assertIn("web", added)          # healthy group still added
+        self.assertEqual(len(deleted), 1)    # stale old-IP rule still removed
+
+
 if __name__ == "__main__":
     unittest.main()
