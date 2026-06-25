@@ -20,15 +20,21 @@ REPO_URL="https://github.com/lvusyy/UFW-OkBoy"
 BRANCH="master"
 REPO_DIR=""          # use a local checkout instead of cloning (optional)
 ASSUME_YES=0
+GH_MIRROR="${UFW_OKBOY_GH_MIRROR:-}"   # GitHub proxy prefix when GitHub is blocked
+PIP_MIRROR=""                          # --mirror <url>; else auto CN fallback
+OFFLINE=false                          # install deps from bundled vendor/ wheels
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --app-dir)  APP_DIR="$2"; shift 2 ;;
-        --service)  SERVICE="$2"; shift 2 ;;
-        --branch)   BRANCH="$2"; shift 2 ;;
-        --repo-dir) REPO_DIR="$2"; shift 2 ;;
-        -y|--yes)   ASSUME_YES=1; shift ;;
-        -h|--help)  grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --app-dir)   APP_DIR="$2"; shift 2 ;;
+        --service)   SERVICE="$2"; shift 2 ;;
+        --branch)    BRANCH="$2"; shift 2 ;;
+        --repo-dir)  REPO_DIR="$2"; shift 2 ;;
+        --gh-mirror) GH_MIRROR="$2"; shift 2 ;;
+        --mirror)    PIP_MIRROR="$2"; shift 2 ;;
+        --offline)   OFFLINE=true; shift ;;
+        -y|--yes)    ASSUME_YES=1; shift ;;
+        -h|--help)   grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;
     esac
 done
@@ -36,6 +42,35 @@ done
 info() { echo "[INFO] $*"; }
 warn() { echo "[WARN] $*" >&2; }
 err()  { echo "[ERROR] $*" >&2; }
+
+# Prefix a GitHub URL with the mirror when set (ghproxy form: <mirror>/<url>).
+gh_url() { if [[ -n "$GH_MIRROR" ]]; then echo "${GH_MIRROR%/}/$1"; else echo "$1"; fi; }
+
+# pip install with offline-vendor / mirror fallback (survives slow/blocked PyPI).
+pip_install() {
+    local pip="$APP_DIR/venv/bin/pip" vendor="$REPO_DIR/vendor"
+    if [[ -d "$vendor" ]]; then
+        info "Installing Python deps OFFLINE from $vendor"
+        if "$pip" install --no-index --find-links "$vendor" "$@"; then return 0; fi
+        [[ "$OFFLINE" == true ]] && { err "Offline install failed and --offline forbids network."; return 1; }
+        warn "Offline install incomplete; falling back to an online index."
+    elif [[ "$OFFLINE" == true ]]; then
+        err "--offline set but no bundled wheels at $vendor."; return 1
+    fi
+    local index="$PIP_MIRROR"
+    if [[ -z "$index" ]]; then
+        if ! curl -fsS --max-time 4 -o /dev/null https://pypi.org/simple/ 2>/dev/null; then
+            index="https://pypi.tuna.tsinghua.edu.cn/simple"
+            warn "pypi.org unreachable — using mirror: $index"
+        fi
+    fi
+    if [[ -n "$index" ]]; then
+        local host; host="$(echo "$index" | awk -F/ '{print $3}')"
+        "$pip" install -i "$index" --trusted-host "$host" "$@"
+    else
+        "$pip" install "$@"
+    fi
+}
 
 [[ $EUID -eq 0 ]] || { err "Please run as root (sudo)."; exit 1; }
 [[ -f "$APP_DIR/server/app.py" ]] || {
@@ -69,14 +104,17 @@ if [[ -z "$REPO_DIR" ]]; then
     info "Fetching latest code ($BRANCH)..."
     fetched=0
     if command -v git >/dev/null 2>&1; then
-        if git clone --depth 1 --branch "$BRANCH" "$REPO_URL" "$TMP_DIR/src" 2>"$TMP_DIR/git.err"; then
+        if git clone --depth 1 --branch "$BRANCH" "$(gh_url "$REPO_URL")" "$TMP_DIR/src" 2>"$TMP_DIR/git.err"; then
             fetched=1
         else
             warn "git clone failed ($(tail -n1 "$TMP_DIR/git.err" 2>/dev/null)); falling back to tarball."
         fi
     fi
     if [[ "$fetched" -eq 0 ]]; then
-        curl -fsSL "$REPO_URL/archive/refs/heads/$BRANCH.tar.gz" -o "$TMP_DIR/src.tgz"
+        curl -fsSL "$(gh_url "$REPO_URL/archive/refs/heads/$BRANCH.tar.gz")" -o "$TMP_DIR/src.tgz" || {
+            err "Fetch failed. GitHub may be blocked — retry with --gh-mirror <proxy>, --repo-dir <local>, or the offline package."
+            exit 1
+        }
         mkdir -p "$TMP_DIR/src"
         tar xzf "$TMP_DIR/src.tgz" -C "$TMP_DIR/src" --strip-components=1
     fi
@@ -107,7 +145,7 @@ cp "$REPO_DIR/VERSION" "$APP_DIR/" 2>/dev/null || true
 # 4) Update Python deps (no --upgrade: installs anything newly required,
 #    leaves satisfied pins alone).
 info "Updating Python dependencies..."
-"$APP_DIR/venv/bin/pip" install -r "$APP_DIR/server/requirements.txt" --quiet \
+pip_install -r "$APP_DIR/server/requirements.txt" --quiet \
     || warn "pip step reported warnings."
 
 # 5) Restart the service — the whole point. Migrations run on startup.

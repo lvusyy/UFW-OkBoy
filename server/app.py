@@ -1086,11 +1086,23 @@ def cmd_upgrade(args):
     github_repo = "lvusyy/UFW-OkBoy"
     api_url = f"https://api.github.com/repos/{github_repo}/releases/latest"
 
+    # Optional GitHub proxy prefix for networks where GitHub is blocked (CN):
+    # env UFW_OKBOY_GH_MIRROR or config `github_mirror` (ghproxy form <mirror>/<url>).
+    gh_mirror = os.environ.get("UFW_OKBOY_GH_MIRROR", "")
+    if not gh_mirror:
+        try:
+            gh_mirror = (load_config(args.config) or {}).get("github_mirror", "") or ""
+        except Exception:
+            gh_mirror = ""
+
+    def _gh(url: str) -> str:
+        return f"{gh_mirror.rstrip('/')}/{url}" if gh_mirror else url
+
     # --- Step 1: version check (always, to decide if an upgrade is needed) ---
     def fetch_latest_version() -> str | None:
         """Query GitHub API for the latest release tag. None on error/no-network."""
         try:
-            req = urllib.request.Request(api_url, headers={
+            req = urllib.request.Request(_gh(api_url), headers={
                 "Accept": "application/vnd.github+json",
                 "User-Agent": f"ufw-okboy/{__version__}",
             })
@@ -1159,9 +1171,9 @@ def cmd_upgrade(args):
     else:
         # Tarball fallback: download + SHA256 verify.
         tarball_url = f"https://github.com/{github_repo}/archive/refs/tags/v{latest}.tar.gz"
-        print(f"Downloading release tarball ({tarball_url})...")
+        print(f"Downloading release tarball ({_gh(tarball_url)})...")
         try:
-            tmp_tar, _ = urllib.request.urlretrieve(tarball_url)
+            tmp_tar, _ = urllib.request.urlretrieve(_gh(tarball_url))
         except Exception as exc:
             print(f"Download failed: {exc}")
             sys.exit(1)
