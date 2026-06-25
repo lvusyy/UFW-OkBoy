@@ -150,9 +150,11 @@ bash install.sh --self-signed --port 8443 -y     # 自动用 vendor/ 离线装�
 
 ```bash
 # --gh-mirror 走 GitHub 代理；pip 在 pypi.org 不通时自动切清华源（也可 --mirror 指定）
-curl -fsSL https://ghproxy.com/https://raw.githubusercontent.com/lvusyy/UFW-OkBoy/master/deploy/quick-install.sh \
-  | bash -s -- --gh-mirror https://ghproxy.com --self-signed --port 8443 --ip <你的公网IP> -y
+curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/lvusyy/UFW-OkBoy/master/deploy/quick-install.sh \
+  | bash -s -- --gh-mirror https://ghfast.top --self-signed --port 8443 --ip <你的公网IP> -y
 ```
+
+> ⚠️ GitHub 代理会不定期失效。`https://ghfast.top` 为当前可用示例；若不通，到 **https://ghproxy.link/** 查最新可用地址，替换 `--gh-mirror` 与 `curl` 前缀（用同一个）。
 
 要点：
 - **无需域名**：缺省即自签证书 + IP 访问；证书 SAN 自动取**公网 IP**（NAT 云主机可用 `--ip` 显式指定），有效期 10 年。

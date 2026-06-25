@@ -12,7 +12,8 @@
 #   --interval <sec>   Knock interval (default: 30)
 #   --no-verify-ssl    Skip TLS verification (for self-signed certs — common in CN)
 #   --gh-mirror <url>  GitHub proxy prefix for downloads when GitHub is blocked
-#                      (e.g. https://ghproxy.com). Also via UFW_OKBOY_GH_MIRROR.
+#                      (e.g. https://ghfast.top; find a current one at
+#                      https://ghproxy.link/). Also via UFW_OKBOY_GH_MIRROR.
 #   --yes              Non-interactive
 
 set -euo pipefail

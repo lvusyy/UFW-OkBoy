@@ -68,7 +68,8 @@ totp_replay_protection: true
 # Optional GitHub proxy prefix for `python app.py upgrade` when GitHub is blocked
 # (common in mainland China). ghproxy form: the prefix is prepended to the GitHub
 # URL. Also settable via the UFW_OKBOY_GH_MIRROR env var. Empty = use GitHub directly.
-# github_mirror: "https://ghproxy.com"
+# Proxies expire often — find a currently-working one at https://ghproxy.link/
+# github_mirror: "https://ghfast.top"
 
 # ---------- Anomaly Detection ---------- #
 

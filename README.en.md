@@ -122,7 +122,8 @@ tar xzf ufw-okboy-*.tar.gz && cd ufw-okboy-*
 sudo bash install.sh --self-signed --port 8443 -y  # auto-detects vendor/ for offline pip
 
 # Online with mirrors:
-#   --gh-mirror <proxy>   GitHub proxy prefix (also UFW_OKBOY_GH_MIRROR)
+#   --gh-mirror <proxy>   GitHub proxy prefix, e.g. https://ghfast.top
+#                         (proxies expire often — find a current one at https://ghproxy.link/)
 #   --mirror <url>        PyPI index (else a CN mirror is used automatically when pypi.org is down)
 #   --ip <addr>           Public IP for the self-signed cert SAN (NAT'd cloud VPS)
 ```

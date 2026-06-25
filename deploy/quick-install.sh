@@ -5,8 +5,9 @@
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/lvusyy/UFW-OkBoy/master/deploy/quick-install.sh | bash
 #   curl -fsSL .../quick-install.sh | bash -s -- --self-signed -y
-#   # Behind the GFW (GitHub blocked), use a proxy prefix:
-#   curl -fsSL .../quick-install.sh | bash -s -- --gh-mirror https://ghproxy.com --self-signed -y
+#   # Behind the GFW (GitHub blocked), use a proxy prefix (find a current one
+#   # at https://ghproxy.link/ — proxies expire often):
+#   curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/lvusyy/UFW-OkBoy/master/deploy/quick-install.sh | bash -s -- --gh-mirror https://ghfast.top --self-signed -y
 #
 # --gh-mirror <url>   GitHub proxy prefix (ghproxy-style); also UFW_OKBOY_GH_MIRROR.
 #                     All other flags are forwarded to deploy.sh (--port, --ip,
@@ -63,7 +64,8 @@ if [[ -z "$REPO_DIR" || ! -d "$REPO_DIR" ]]; then
     echo "[ERROR] Download failed." >&2
     if [[ -z "$GH_MIRROR" ]]; then
         echo "        GitHub may be blocked on this network." >&2
-        echo "        Retry with a proxy:  ... | bash -s -- --gh-mirror https://ghproxy.com" >&2
+        echo "        Retry with a proxy (find a current one at https://ghproxy.link/):" >&2
+        echo "          ... | bash -s -- --gh-mirror https://ghfast.top" >&2
         echo "        Or use the OFFLINE release package (bundles all deps)." >&2
     fi
     exit 1

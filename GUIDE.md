@@ -151,11 +151,13 @@ sudo bash install.sh --self-signed --port 8443 -y
 ### 在线安装（GitHub/PyPI 慢时用镜像兜底）
 
 ```bash
-curl -fsSL https://ghproxy.com/https://raw.githubusercontent.com/lvusyy/UFW-OkBoy/master/deploy/quick-install.sh \
-  | bash -s -- --gh-mirror https://ghproxy.com --self-signed --port 8443 --ip <你的公网IP> -y
+curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/lvusyy/UFW-OkBoy/master/deploy/quick-install.sh \
+  | bash -s -- --gh-mirror https://ghfast.top --self-signed --port 8443 --ip <你的公网IP> -y
 ```
 
-- `--gh-mirror`：GitHub 代理前缀（拉代码走代理）。**ghproxy.com 仅为示例**，请换成当前可用的代理。
+> ⚠️ **GitHub 代理会不定期失效**。上面的 `https://ghfast.top` 为当前可用示例；若不通，到 **https://ghproxy.link/** 查最新可用地址，替换 `--gh-mirror` 与开头 `curl` 的前缀即可（二者用同一个）。
+
+- `--gh-mirror`：GitHub 代理前缀（拉代码走代理），同时也是开头 `curl` 的前缀。
 - pip 会自动判断：连不上 pypi.org 就自动切清华源；也可 `--mirror https://mirrors.aliyun.com/pypi/simple` 显式指定。
 
 ### 关键点速查（多数已自动处理，知道即可）
@@ -178,9 +180,9 @@ curl -fsSL https://ghproxy.com/https://raw.githubusercontent.com/lvusyy/UFW-OkBo
 - **一键装客户端**：加 `--no-verify-ssl`，脚本会把 `verify_ssl: false` 写进配置并接好定时器：
 
 ```bash
-curl -fsSL https://ghproxy.com/https://raw.githubusercontent.com/lvusyy/UFW-OkBoy/master/deploy/install-client.sh \
+curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/lvusyy/UFW-OkBoy/master/deploy/install-client.sh \
   | bash -s -- --server https://<公网IP>:8443 --user alice --secret 你的密钥 \
-               --no-verify-ssl --gh-mirror https://ghproxy.com
+               --no-verify-ssl --gh-mirror https://ghfast.top
 ```
 
 ### 升级（国内）
@@ -188,8 +190,8 @@ curl -fsSL https://ghproxy.com/https://raw.githubusercontent.com/lvusyy/UFW-OkBo
 ```bash
 # 离线升级：指向离线包目录
 sudo bash deploy/upgrade.sh --repo-dir /path/to/ufw-okboy-<VERSION>
-# 或走 GitHub 代理
-sudo bash deploy/upgrade.sh --gh-mirror https://ghproxy.com
+# 或走 GitHub 代理（当前可用地址见 https://ghproxy.link/）
+sudo bash deploy/upgrade.sh --gh-mirror https://ghfast.top
 ```
 
 服务端 `python app.py upgrade` 也支持在 `config.yaml` 设 `github_mirror`，或设环境变量 `UFW_OKBOY_GH_MIRROR`。
