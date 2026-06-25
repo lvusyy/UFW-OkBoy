@@ -415,6 +415,15 @@ def create_app(config_path: str = "config.yaml",
                 "error": "Forbidden: admin privileges or self-toggle required",
             }), 403
 
+        # An admin toggling ANOTHER user's membership opens/closes a firewall
+        # port for someone else — a sensitive admin write, so it requires TOTP
+        # step-up exactly like admin_add_membership / admin_remove_membership.
+        # Self-toggle stays step-up-free (self-service, re-validated below).
+        if not is_self:
+            se = _step_up_error(requester)
+            if se:
+                return se
+
         body = request.get_json(silent=True) or {}
         enabled = body.get("enabled")
         if not isinstance(enabled, bool):
@@ -537,6 +546,25 @@ def create_app(config_path: str = "config.yaml",
                 "totp_enroll_required": True,
             }), 403
         return None
+
+    def _consume_totp(user, code: str | None) -> bool:
+        """Counter-based TOTP verify with replay protection (RFC 6238 §5.2),
+        consuming the code on success.
+
+        Returns True for a fresh valid code (advancing ``totp_last_counter`` when
+        replay protection is on), False for an invalid OR replayed code. Used by
+        the TOTP disable / re-enroll paths so the most security-critical 2FA
+        operations honor the same replay protection as ``_step_up_error`` —
+        previously they used the bare ``verify_totp`` bool and a single captured
+        code stayed valid for its whole ±window.
+        """
+        matched = auth.verify_totp_counter(user["totp_secret"], code)
+        last = user["totp_last_counter"] if "totp_last_counter" in user.keys() else 0
+        if matched is None or (totp_replay_protection and matched <= last):
+            return False
+        if totp_replay_protection:
+            db.set_totp_last_counter(user["id"], matched)
+        return True
 
     @app.route("/api/admin/users", methods=["GET"])
     def admin_list_users():
@@ -713,11 +741,15 @@ def create_app(config_path: str = "config.yaml",
         group_id = data.get("group_id")
         if group_id is None:
             return jsonify({"ok": False, "error": "group_id is required"}), 400
-        group = db.get_group(int(group_id))
+        try:
+            group_id = int(group_id)
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "error": "group_id must be an integer"}), 400
+        group = db.get_group(group_id)
         if not group:
             return jsonify({"ok": False, "error": "Group not found"}), 404
         enabled = 1 if data.get("enabled", True) else 0
-        db.add_membership(user_id, int(group_id), enabled=enabled)
+        db.add_membership(user_id, group_id, enabled=enabled)
         # Immediate UFW sync: if the target user is online, open the port now.
         target_ip = target["current_ip"]
         if target_ip and enabled:
@@ -728,7 +760,7 @@ def create_app(config_path: str = "config.yaml",
         db.log_audit(user["username"], "user_join", target["username"], group["name"])
         return jsonify({
             "ok": True, "user_id": user_id,
-            "group_id": int(group_id), "enabled": enabled,
+            "group_id": group_id, "enabled": enabled,
         }), 201
 
     @app.route("/api/admin/memberships/remove", methods=["POST"])
@@ -848,7 +880,7 @@ def create_app(config_path: str = "config.yaml",
         if user["totp_enabled"]:
             recode = (request.headers.get("X-TOTP-Code")
                       or (request.get_json(silent=True) or {}).get("totp_code"))
-            if not auth.verify_totp(user["totp_secret"], recode):
+            if not _consume_totp(user, recode):
                 return jsonify({
                     "ok": False, "error": "Valid TOTP code required to re-enroll",
                     "totp_required": True,
@@ -889,7 +921,7 @@ def create_app(config_path: str = "config.yaml",
             return _admin_error_response(err)
         if user["totp_enabled"]:
             code = (request.get_json(silent=True) or {}).get("totp_code", "")
-            if not auth.verify_totp(user["totp_secret"], code):
+            if not _consume_totp(user, code):
                 return jsonify({"ok": False, "error": "Valid TOTP code required to disable"}), 403
         db.disable_totp(user["id"])
         db.log_audit(user["username"], "totp_disable", user["username"], None)

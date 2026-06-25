@@ -286,6 +286,61 @@ class TestTOTPStepUp(unittest.TestCase):
         self.assertEqual(second.status_code, 403)
         self.assertTrue(second.get_json()["totp_required"])
 
+    def test_admin_toggle_other_membership_requires_code(self) -> None:
+        """Admin toggling ANOTHER user's membership opens/closes a port for that
+        user — a sensitive write that must require step-up, on parity with
+        add/remove membership (this path previously skipped it)."""
+        secret = self._enroll_admin()
+        no_code = self.client.patch(
+            f"/api/membership/{self.alice_id}/{self.group_id}",
+            headers={"Authorization": self._admin_header()},
+            json={"enabled": False},
+        )
+        self.assertEqual(no_code.status_code, 403)
+        self.assertTrue(no_code.get_json()["totp_required"])
+        ok = self.client.patch(
+            f"/api/membership/{self.alice_id}/{self.group_id}",
+            headers={"Authorization": self._admin_header()},
+            json={"enabled": False, "totp_code": auth.totp_now(secret)},
+        )
+        self.assertEqual(ok.status_code, 200)
+
+    def test_disable_honors_replay_protection(self) -> None:
+        """A code consumed by a step-up op cannot be replayed to DISABLE 2FA —
+        the most security-critical op previously skipped replay protection."""
+        secret = self._enroll_admin()
+        code = auth.totp_now(secret)
+        first = self.client.post(  # consume the code on a step-up op
+            f"/api/admin/users/{self.alice_id}/revoke",
+            headers={"Authorization": self._admin_header(), "X-TOTP-Code": code},
+        )
+        self.assertEqual(first.status_code, 200)
+        replay = self.client.delete(  # replaying it to disable must fail
+            "/api/admin/totp", headers={"Authorization": self._admin_header()},
+            json={"totp_code": code},
+        )
+        self.assertEqual(replay.status_code, 403)
+        status = self.client.get(
+            "/api/status", headers={"Authorization": self._admin_header()},
+        ).get_json()
+        self.assertTrue(status["totp_enabled"])  # 2FA still on
+
+    def test_reenroll_honors_replay_protection(self) -> None:
+        """A consumed code cannot be replayed to re-enroll (overwrite) the secret."""
+        secret = self._enroll_admin()
+        code = auth.totp_now(secret)
+        first = self.client.post(
+            f"/api/admin/users/{self.alice_id}/revoke",
+            headers={"Authorization": self._admin_header(), "X-TOTP-Code": code},
+        )
+        self.assertEqual(first.status_code, 200)
+        replay = self.client.post(
+            "/api/admin/totp/enroll",
+            headers={"Authorization": self._admin_header()},
+            json={"totp_code": code},
+        )
+        self.assertEqual(replay.status_code, 403)
+
 
 class TestSchemaMigration(unittest.TestCase):
     """The additive column migration upgrades an old users table in place."""
