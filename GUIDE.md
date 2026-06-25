@@ -9,6 +9,7 @@
 - [这是什么](#这是什么)
 - [工作原理](#工作原理)
 - [一键部署](#一键部署)
+- [国内部署专题](#国内部署专题)
 - [快速开始](#快速开始)
 - [服务端部署](#服务端部署)
 - [用户组与端口管理](#用户组与端口管理)
@@ -75,6 +76,8 @@
 
 ## 一键部署
 
+> 🇨🇳 **国内服务器**（GitHub/PyPI 下载慢、没有备案域名、惯用高位端口 + 自签证书）请优先阅读 👉 **[国内部署专题](#国内部署专题)**，那里有最稳的离线安装与逐项排查，少走弯路。
+
 ### 服务端一键安装
 
 **自签证书模式（无需域名，IP 直接访问）：**
@@ -124,6 +127,72 @@ curl -fsSL https://raw.githubusercontent.com/lvusyy/UFW-OkBoy/master/deploy/inst
 - 创建配置文件（权限 600）
 - 测试首次敲门
 - 安装 Systemd 定时器（每 30 秒自动敲门）
+
+## 国内部署专题
+
+> 国内服务器装不上？强烈建议先读本节。常见失败几乎都来自这几个坑：GitHub/PyPI 下不动、域名要备案、习惯用高位端口 + 自签证书。这些我们都做了贴心处理，跟着走基本一次成功。
+
+### 最稳路径：离线安装包（推荐）
+
+离线包内置了全部 Python 依赖（wheels），安装时**只需下载一个 tar 包**，全程不碰 PyPI，最不容易卡。
+
+```bash
+# 第 1 步：在一台能联网的机器上构建离线包（产物在 dist/，含内置依赖 vendor/）
+bash deploy/build-release.sh
+
+# 第 2 步：把 dist/ufw-okboy-*.tar.gz 拷到目标服务器，然后：
+tar xzf ufw-okboy-*.tar.gz && cd ufw-okboy-*
+sudo bash install.sh --self-signed --port 8443 -y
+#                       │ 自签证书   │ 高位端口    └ 自动用内置 wheels 离线装依赖
+```
+
+> 构建机与目标服务器是常见的 x86_64 Linux 即可；离线包已含 CPython 3.8–3.12 的 Linux wheels。
+
+### 在线安装（GitHub/PyPI 慢时用镜像兜底）
+
+```bash
+curl -fsSL https://ghproxy.com/https://raw.githubusercontent.com/lvusyy/UFW-OkBoy/master/deploy/quick-install.sh \
+  | bash -s -- --gh-mirror https://ghproxy.com --self-signed --port 8443 --ip <你的公网IP> -y
+```
+
+- `--gh-mirror`：GitHub 代理前缀（拉代码走代理）。**ghproxy.com 仅为示例**，请换成当前可用的代理。
+- pip 会自动判断：连不上 pypi.org 就自动切清华源；也可 `--mirror https://mirrors.aliyun.com/pypi/simple` 显式指定。
+
+### 关键点速查（多数已自动处理，知道即可）
+
+| 关注点 | 我们的处理 | 你要做的 |
+|---|---|---|
+| 没有备案域名 | 缺省走**自签证书 + 公网 IP** 访问，无需域名 | 不用管 |
+| 公网 IP ≠ 内网 IP（云主机） | 证书 SAN 自动探测**公网 IP** | NAT 环境加 `--ip <公网IP>` 更稳妥 |
+| 高位端口 | `--port 8443` 任意端口；脚本自动 `ufw allow` | ⚠️ **在云控制台「安全组」也放行该端口**（UFW ≠ 安全组） |
+| 证书一年过期断连 | 自签证书有效期 **10 年** | 不用管 |
+| 客户端连自签报错 | 见下节 | 配 `verify_ssl: false` / `INSECURE=1` |
+
+### 客户端连自签证书
+
+服务端用自签证书时，客户端需跳过证书校验。HMAC 密钥永不上网，这只是关闭传输层验证，不影响鉴权安全：
+
+- **网页端**：浏览器弹一次安全警告，点"继续访问/接受风险"即可，之后正常使用。
+- **Python 客户端 `knock.py`**：在 `config.yaml` 加 `verify_ssl: false`（或命令行 `--no-verify-ssl`）。
+- **Shell 客户端 `knock.sh`**：在配置文件加 `INSECURE=1`（或运行时 `--insecure` / `-k`）。
+- **一键装客户端**：加 `--no-verify-ssl`，脚本会把 `verify_ssl: false` 写进配置并接好定时器：
+
+```bash
+curl -fsSL https://ghproxy.com/https://raw.githubusercontent.com/lvusyy/UFW-OkBoy/master/deploy/install-client.sh \
+  | bash -s -- --server https://<公网IP>:8443 --user alice --secret 你的密钥 \
+               --no-verify-ssl --gh-mirror https://ghproxy.com
+```
+
+### 升级（国内）
+
+```bash
+# 离线升级：指向离线包目录
+sudo bash deploy/upgrade.sh --repo-dir /path/to/ufw-okboy-<VERSION>
+# 或走 GitHub 代理
+sudo bash deploy/upgrade.sh --gh-mirror https://ghproxy.com
+```
+
+服务端 `python app.py upgrade` 也支持在 `config.yaml` 设 `github_mirror`，或设环境变量 `UFW_OKBOY_GH_MIRROR`。
 
 ## 快速开始
 
@@ -928,10 +997,32 @@ curl -X PATCH -H "Authorization: HMAC-SHA256 alice:..." \
 
 ### 自签证书如何使用？
 
-部署时加 `--self-signed` 参数。客户端需要：
-- Python：`--no-verify-ssl` 标志
-- Shell：`curl -k` 或配置 `VERIFY_SSL=false`
-- 浏览器：接受安全警告后继续
+部署时加 `--self-signed`（无域名时本就是默认）。客户端需跳过证书校验（HMAC 密钥永不上网，只关传输层验证，不影响鉴权安全）：
+- **Python（knock.py）**：在 `config.yaml` 加 `verify_ssl: false`，或命令行 `--no-verify-ssl`
+- **Shell（knock.sh）**：在配置加 `INSECURE=1`，或运行时 `--insecure` / `-k`
+- **浏览器**：接受一次安全警告后继续
+
+详细的国内自签 + IP + 高位端口一条龙，见 [国内部署专题](#国内部署专题)。
+
+### 安装时卡在下载 / 下载失败？（国内常见）
+
+- **拉代码卡住**（GitHub）：用 `--gh-mirror <可用代理>`，或直接用[离线安装包](#国内部署专题)（最稳）。
+- **装 Python 依赖卡住**（PyPI）：脚本会自动检测，连不上 pypi.org 时自动切清华源；也可 `--mirror <镜像>` 指定，或用离线包（内置 wheels，零联网）。
+- **装系统依赖卡住**（apt/yum）：请先把系统换成国内镜像源（阿里/清华），这一步由系统包管理器负责，脚本不代为修改 `sources.list`。
+
+### 网页能打开，但客户端 knock 失败？
+
+多半是**自签证书校验**没关：
+- `knock.py`：`config.yaml` 加 `verify_ssl: false`；`knock.sh`：配置加 `INSECURE=1`。
+- 手动验证：`python3 knock.py -c config.yaml status`（看返回的具体错误）。
+
+### 网页/客户端完全连不上服务器？
+
+按顺序排查：
+1. **云安全组**：在云控制台放行你的端口（如 8443/tcp）—— 这是最常见原因，UFW 放行 ≠ 安全组放行。
+2. **公网 IP**：确认访问的是公网 IP；NAT 云主机重装时加 `--ip <公网IP>` 让证书 SAN 与访问地址一致。
+3. **服务状态**：`systemctl status ufw-okboy` 与 `journalctl -u ufw-okboy -n 50`。
+4. **本机自检**：`curl -k https://127.0.0.1:<port>/health` 应返回 `{"ok": true, ...}`。
 
 ### 数据库丢失怎么办？
 

@@ -100,6 +100,27 @@ curl -fsSL https://raw.githubusercontent.com/lvusyy/UFW-OkBoy/master/deploy/upgr
 
 > Backs up the DB + snapshots old code first; restarts and health-checks after updating, with auto-rollback on failure. Preserves config / nginx / SSL / database. Hard-refresh the browser (Ctrl-Shift-R) to load the new UI.
 
+## Offline / Restricted Networks
+
+For servers where GitHub/PyPI are slow or blocked (e.g. mainland China — see the
+fuller 国内部署专题 in [GUIDE.md](GUIDE.md)):
+
+```bash
+# Most reliable: offline package — bundles Python wheels, only one tarball to fetch.
+bash deploy/build-release.sh                       # on an online machine → dist/*.tar.gz
+tar xzf ufw-okboy-*.tar.gz && cd ufw-okboy-*
+sudo bash install.sh --self-signed --port 8443 -y  # auto-detects vendor/ for offline pip
+
+# Online with mirrors:
+#   --gh-mirror <proxy>   GitHub proxy prefix (also UFW_OKBOY_GH_MIRROR)
+#   --mirror <url>        PyPI index (else a CN mirror is used automatically when pypi.org is down)
+#   --ip <addr>           Public IP for the self-signed cert SAN (NAT'd cloud VPS)
+```
+
+No domain needed: the default self-signed path uses your **public IP** (10-year cert).
+CLI clients trust it via `verify_ssl: false` (knock.py) or `INSECURE=1` (knock.sh).
+Open the port in your cloud **security group** too — UFW alone is not enough.
+
 ## Manual Install
 
 ```bash

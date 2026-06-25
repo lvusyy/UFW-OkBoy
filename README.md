@@ -120,6 +120,36 @@ curl -fsSL https://raw.githubusercontent.com/lvusyy/UFW-OkBoy/master/deploy/upgr
 
 > 升级前自动备份数据库 + 快照旧代码；更新后**重启服务**并健康检查，失败自动回滚。保留 config / nginx / SSL / 数据库。浏览器端硬刷新（Ctrl-Shift-R）加载新界面。
 
+## 国内安装（中国大陆）
+
+国内服务器常见障碍：GitHub/PyPI 下载慢或不通、域名需备案、惯用高位端口 + 自签证书。本项目对这些场景做了专门处理。
+
+> 💡 下面是速查版。**手把手步骤 + 逐项故障排查**请看 👉 **[完整指南 · 国内部署专题](GUIDE.md#国内部署专题)**——装不上时先翻它，基本都能对症解决。
+
+**最稳方式：离线安装包**（自带 Python 依赖 wheels，安装全程只需下载一个 tar 包）
+
+```bash
+# 在能联网的机器上构建离线包（产物含 vendor/ 内置 wheels）
+bash deploy/build-release.sh
+# 拷贝 dist/ufw-okboy-*.tar.gz 到目标服务器后：
+tar xzf ufw-okboy-*.tar.gz && cd ufw-okboy-*
+bash install.sh --self-signed --port 8443 -y     # 自动用 vendor/ 离线装依赖
+```
+
+**在线安装（GitHub/PyPI 受阻时用镜像兜底）**
+
+```bash
+# --gh-mirror 走 GitHub 代理；pip 在 pypi.org 不通时自动切清华源（也可 --mirror 指定）
+curl -fsSL https://ghproxy.com/https://raw.githubusercontent.com/lvusyy/UFW-OkBoy/master/deploy/quick-install.sh \
+  | bash -s -- --gh-mirror https://ghproxy.com --self-signed --port 8443 --ip <你的公网IP> -y
+```
+
+要点：
+- **无需域名**：缺省即自签证书 + IP 访问；证书 SAN 自动取**公网 IP**（NAT 云主机可用 `--ip` 显式指定），有效期 10 年。
+- **高位端口**：`--port 8443` 之类任意端口；脚本会 `ufw allow`，并提醒你在**云安全组**同步放行。
+- **客户端连自签**：`knock.py` 在 `config.yaml` 设 `verify_ssl: false`；`knock.sh` 在 config 设 `INSECURE=1`（或 `--insecure`）；HMAC 密钥永不上网，仅关闭传输层校验。
+- **离线升级**：`upgrade.sh --repo-dir <离线包目录>` 或 `--gh-mirror <代理>`；服务端 `app.py upgrade` 支持 `github_mirror` 配置 / `UFW_OKBOY_GH_MIRROR` 环境变量。
+
 ## 手动安装
 
 **服务端（管理员）：**
@@ -164,6 +194,7 @@ curl -X POST -H "Authorization: ..." -d '{"username":"bob","secret":"..."}' http
 
 详见 **[GUIDE.md](GUIDE.md)**（中文），包含：
 
+- 🇨🇳 **[国内部署专题](GUIDE.md#国内部署专题)**：离线包 / 镜像兜底 / 自签 + 公网 IP + 高位端口 / 故障排查
 - 服务端部署（UFW 前置配置、Nginx、Systemd）
 - 密钥生成与安全分发流程（含发给用户的模板消息）
 - 客户端使用说明（Web / Python / Shell）
