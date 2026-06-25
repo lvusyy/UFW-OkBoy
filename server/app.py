@@ -12,6 +12,7 @@ import argparse
 import hashlib
 import json
 import logging
+import re
 import secrets
 import shutil
 import sqlite3
@@ -96,6 +97,29 @@ def open_database(cfg: dict) -> Database:
 # ====================================================================== #
 #  Flask Application Factory
 # ====================================================================== #
+
+# Usernames and group names flow into the colon-delimited HMAC payload
+# (``<user>:<ts>:<sig>``) and the UFW rule comment (``<prefix>:<user>:<group>``).
+# A ':' or whitespace in either would corrupt that parsing, so creation paths
+# reject anything outside this charset. Existing rows are untouched (validation
+# is at the creation entry points only — backward compatible).
+_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+
+
+def _name_error(value, kind: str) -> str | None:
+    """Return an error string if *value* is not a valid user/group name, else None."""
+    if not isinstance(value, str) or not _NAME_RE.match(value):
+        return (f"Invalid {kind}: use 1-64 characters from [A-Za-z0-9_.-] "
+                "(no spaces or ':')")
+    return None
+
+
+def _port_error(port) -> str | None:
+    """Return an error string if *port* is not a valid TCP/UDP port, else None."""
+    if isinstance(port, bool) or not isinstance(port, int) or not (1 <= port <= 65535):
+        return "Invalid port: must be an integer in 1-65535"
+    return None
+
 
 def create_app(config_path: str = "config.yaml",
                db_override: Database | None = None,
@@ -597,6 +621,9 @@ def create_app(config_path: str = "config.yaml",
         username = data.get("username")
         if not username:
             return jsonify({"ok": False, "error": "username is required"}), 400
+        name_err = _name_error(username, "username")
+        if name_err:
+            return jsonify({"ok": False, "error": name_err}), 400
         secret = data.get("secret") or secrets.token_hex(32)
         is_admin = bool(data.get("is_admin", False))
         try:
@@ -657,6 +684,9 @@ def create_app(config_path: str = "config.yaml",
         port = data.get("port")
         if not name or port is None:
             return jsonify({"ok": False, "error": "name and port are required"}), 400
+        name_err = _name_error(name, "group name")
+        if name_err:
+            return jsonify({"ok": False, "error": name_err}), 400
         proto = data.get("proto", "tcp")
 
         # Port whitelist (VULN-B): when an admin explicitly configures
@@ -667,6 +697,9 @@ def create_app(config_path: str = "config.yaml",
             port_int = int(port)
         except (TypeError, ValueError):
             return jsonify({"ok": False, "error": "port must be an integer"}), 400
+        port_err = _port_error(port_int)
+        if port_err:
+            return jsonify({"ok": False, "error": port_err}), 400
         allowed_ports = cfg.get("allowed_ports")
         if allowed_ports and port_int not in allowed_ports:
             db.log_audit(
@@ -1287,6 +1320,10 @@ def cmd_sync(args):
 
 def cmd_user_add(args):
     """Create a new user with a random secret."""
+    name_err = _name_error(args.username, "username")
+    if name_err:
+        print(name_err)
+        return
     cfg = load_config(args.config)
     db = open_database(cfg)
     secret = secrets.token_hex(32)
@@ -1331,6 +1368,14 @@ def cmd_user_list(args):
 
 def cmd_group_add(args):
     """Create a new port group."""
+    name_err = _name_error(args.name, "group name")
+    if name_err:
+        print(name_err)
+        return
+    port_err = _port_error(args.port)
+    if port_err:
+        print(port_err)
+        return
     cfg = load_config(args.config)
     db = open_database(cfg)
     dup = db.get_group_by_port_proto(args.port, args.proto)

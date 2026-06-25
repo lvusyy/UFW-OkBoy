@@ -410,6 +410,51 @@ class TestAdminAPI(unittest.TestCase):
         self.assertEqual(resp.mimetype, "application/json")
         self.assertFalse(resp.get_json()["ok"])
 
+    # -- input validation (names break the ':'-delimited UFW comment scheme) -- #
+
+    def test_create_user_rejects_invalid_name(self) -> None:
+        for bad in ["bad:name", "has space", "a" * 65, "x/y"]:
+            resp = self.client.post(
+                "/api/admin/users",
+                headers={"Authorization": self._admin_header()},
+                json={"username": bad},
+            )
+            self.assertEqual(resp.status_code, 400, f"name={bad!r}")
+            self.assertFalse(resp.get_json()["ok"])
+
+    def test_create_group_rejects_invalid_name(self) -> None:
+        resp = self.client.post(
+            "/api/admin/groups",
+            headers={"Authorization": self._admin_header()},
+            json={"name": "web:prod", "port": 9000},
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertFalse(resp.get_json()["ok"])
+
+    def test_create_group_rejects_out_of_range_port(self) -> None:
+        for bad in [0, -1, 70000]:
+            resp = self.client.post(
+                "/api/admin/groups",
+                headers={"Authorization": self._admin_header()},
+                json={"name": "svc", "port": bad},
+            )
+            self.assertEqual(resp.status_code, 400, f"port={bad}")
+
+    def test_add_membership_non_int_group_id_returns_400(self) -> None:
+        create = self.client.post(
+            "/api/admin/users",
+            headers={"Authorization": self._admin_header()},
+            json={"username": "bob"},
+        )
+        bob_id = create.get_json()["id"]
+        resp = self.client.post(
+            f"/api/admin/users/{bob_id}/groups",
+            headers={"Authorization": self._admin_header()},
+            json={"group_id": "not-an-int"},
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertFalse(resp.get_json()["ok"])
+
 
 if __name__ == "__main__":
     unittest.main()
