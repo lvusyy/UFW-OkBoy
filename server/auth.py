@@ -66,8 +66,17 @@ def verify_hmac(db: Database, auth_header: str | None, ttl: int = 300,
 
     row = db.get_user_by_username(username)
     if row is None:
+        # Defeat user enumeration: an unknown user must cost the same time and
+        # return the same generic message as a bad signature. Compute a dummy
+        # HMAC so the timing matches the verified path. The specific reason is
+        # still recorded server-side for audit.
+        hmac.compare_digest(
+            hmac.new(b"\x00" * 32, f"{username}:{ts_str}".encode("utf-8"),
+                     hashlib.sha256).hexdigest(),
+            signature,
+        )
         db.record_failed_attempt(username, client_ip, "Unknown user")
-        return None, "Unknown user"
+        return None, "Invalid credentials"
 
     expected = hmac.new(
         row["secret"].encode("utf-8"),
@@ -77,7 +86,7 @@ def verify_hmac(db: Database, auth_header: str | None, ttl: int = 300,
 
     if not hmac.compare_digest(signature, expected):
         db.record_failed_attempt(username, client_ip, "Invalid signature")
-        return None, "Invalid signature"
+        return None, "Invalid credentials"
 
     return username, None
 

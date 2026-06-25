@@ -63,7 +63,9 @@ class TestAuth(unittest.TestCase):
         header = header[:-1] + ("0" if header[-1] != "0" else "1")
         username, err = auth.verify_hmac(self.db, header)
         self.assertIsNone(username)
-        self.assertEqual(err, "Invalid signature")
+        # Client sees a generic message (no user enumeration); the DB audit row
+        # still records the specific reason.
+        self.assertEqual(err, "Invalid credentials")
         rows = self.db.conn.execute(
             "SELECT * FROM failed_attempts WHERE reason='Invalid signature'",
         ).fetchall()
@@ -80,7 +82,13 @@ class TestAuth(unittest.TestCase):
         header = build_auth_header("mallory", "no-such-secret")
         username, err = auth.verify_hmac(self.db, header)
         self.assertIsNone(username)
-        self.assertEqual(err, "Unknown user")
+        # Generic message to the client (same as a bad signature → no
+        # enumeration); the specific reason is kept in the audit row.
+        self.assertEqual(err, "Invalid credentials")
+        rows = self.db.conn.execute(
+            "SELECT * FROM failed_attempts WHERE reason='Unknown user'",
+        ).fetchall()
+        self.assertEqual(len(rows), 1)
 
     def test_verify_hmac_missing_header(self) -> None:
         username, err = auth.verify_hmac(self.db, None)

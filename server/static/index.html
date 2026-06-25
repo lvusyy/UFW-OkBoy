@@ -1226,13 +1226,15 @@ async function doKnock() {
         addLog(result.warning, "warn");
       }
     } else {
-      // Auth error → disconnect
+      // Auth error → the saved credentials are wrong/stale. Clear them so they
+      // are not replayed on the next reload, then disconnect. Rate-limit / 5xx
+      // are NOT auth errors and fall through to the warn branch (creds kept).
       if (result.error && (
-        result.error.includes("Unknown user") ||
-        result.error.includes("Invalid signature") ||
+        result.error.includes("Invalid credentials") ||
         result.error.includes("expired")
       )) {
         addLog(t("log_auth_failed", result.error), "err");
+        forgetCredentials();
         disconnect(result.error);
         return;
       }
@@ -1287,19 +1289,9 @@ function updateCountdownDisplay() {
 
 async function connect(username, secret, remember) {
   credentials = { username, secret };
-
-  // Persist credentials encrypted when "Remember" is on. A PIN is required
-  // to encrypt — if the user did not set one, we fall back to the legacy
-  // plaintext store so existing one-click reconnect still works. The admin
-  // console ALWAYS requires PIN unlock regardless.
-  if (remember) {
-    const pin = pendingPin;
-    if (pin) {
-      await encryptVault(pin, { username, secret });
-    } else {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify({ username, secret }));
-    }
-  }
+  // Capture and clear the pending PIN up front so it never lingers across
+  // attempts, regardless of how this connect resolves.
+  const pin = pendingPin;
   pendingPin = null;
 
   // Switch views
@@ -1311,13 +1303,24 @@ async function connect(username, secret, remember) {
   clearLog();
   addLog(t("log_connecting"), "warn");
 
-  // First knock
+  // First knock VALIDATES the credentials before we persist anything. On an
+  // auth failure doKnock clears `credentials` (and any stale saved copy), so we
+  // must not have written them to disk yet — otherwise a typo'd / revoked secret
+  // gets stranded in localStorage or the vault and replays on every reload.
   await doKnock();
+  if (!credentials) return;
 
-  // If still connected after first knock, start periodic knocking
-  if (credentials) {
-    startTimers();
+  // Credentials proven good → persist if "Remember" is on, then start the loop.
+  // A PIN encrypts into the vault; without one we fall back to the legacy
+  // plaintext store. The admin console ALWAYS requires PIN unlock regardless.
+  if (remember) {
+    if (pin) {
+      await encryptVault(pin, { username, secret });
+    } else {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({ username, secret }));
+    }
   }
+  startTimers();
 }
 
 function disconnect(reason) {
