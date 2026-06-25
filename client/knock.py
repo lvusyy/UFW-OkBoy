@@ -163,7 +163,14 @@ def main():
     server_url = cfg["server_url"]
     username = cfg["username"]
     secret = cfg["secret"]
-    verify_ssl = not args.no_verify_ssl
+    # TLS verification: config `verify_ssl: false` suits self-signed servers
+    # (common for IP-based / high-port CN deployments); the --no-verify-ssl flag,
+    # when passed, always forces verification off. The HMAC secret is never sent
+    # over the wire, so this drops only transport verification, not auth secrecy.
+    cfg_verify = cfg.get("verify_ssl", True)
+    if isinstance(cfg_verify, str):
+        cfg_verify = cfg_verify.strip().lower() not in ("false", "0", "no", "off")
+    verify_ssl = bool(cfg_verify) and not args.no_verify_ssl
 
     action_fn = knock if args.action == "knock" else status
 

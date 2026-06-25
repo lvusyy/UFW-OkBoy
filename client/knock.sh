@@ -10,6 +10,13 @@
 #   SERVER_URL=https://your-server.com
 #   USERNAME=alice
 #   SECRET=your-secret-here
+#   INSECURE=1            # optional: skip TLS verify for self-signed certs
+#
+# Self-signed certificates are the norm for IP-based / high-port deployments
+# (common in mainland China where filed domains + Let's Encrypt are impractical).
+# Set INSECURE=1 in the config, export INSECURE=1, or pass --insecure to skip
+# TLS verification. The HMAC secret is never transmitted, so this drops only
+# transport verification, not authentication secrecy.
 
 set -euo pipefail
 
@@ -59,7 +66,8 @@ do_knock() {
         -H "Authorization: ${auth}" \
         -H "Content-Type: application/json" \
         --connect-timeout 10 \
-        --max-time 30
+        --max-time 30 \
+        ${CURL_TLS[@]+"${CURL_TLS[@]}"}
     echo ""
 }
 
@@ -70,13 +78,29 @@ do_status() {
         "${SERVER_URL}/api/status" \
         -H "Authorization: ${auth}" \
         --connect-timeout 10 \
-        --max-time 30
+        --max-time 30 \
+        ${CURL_TLS[@]+"${CURL_TLS[@]}"}
     echo ""
 }
 
 # ---- Main ---- #
 
-ACTION="${1:-knock}"
+# Parse the action and an optional --insecure / -k flag (in any order).
+ACTION="knock"
+for arg in "$@"; do
+    case "$arg" in
+        -k|--insecure) INSECURE=1 ;;
+        knock|status)  ACTION="$arg" ;;
+        *) echo "Usage: $0 [knock|status] [--insecure]"; exit 1 ;;
+    esac
+done
+
+# Resolve TLS verification: --insecure flag > INSECURE from config/env.
+INSECURE="${INSECURE:-0}"
+CURL_TLS=()
+if [[ "$INSECURE" == "1" || "$INSECURE" == "true" ]]; then
+    CURL_TLS=(-k)
+fi
 
 case "$ACTION" in
     knock)
@@ -84,9 +108,5 @@ case "$ACTION" in
         ;;
     status)
         do_status
-        ;;
-    *)
-        echo "Usage: $0 [knock|status]"
-        exit 1
         ;;
 esac
