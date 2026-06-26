@@ -18,7 +18,7 @@
 #   --offline           Install Python deps from the bundled vendor/ wheels (no network)
 #   --no-nginx          Skip nginx setup (use gunicorn directly with self-signed)
 #   --self-signed       Force self-signed cert even if domain provided
-#   --admin-user <name> First admin to auto-create (default: admin; use 'skip' to skip)
+#   --admin-user <name> Admin user to create after install (default: admin)
 #   --app-dir <path>    Install directory (default: /opt/ufw-okboy)
 #   -y, --yes           Non-interactive mode (skip all prompts)
 
@@ -490,50 +490,26 @@ info "Services installed and started."
 ufw allow $HTTPS_PORT/tcp comment "UFW OkBoy HTTPS" 2>/dev/null || true
 warn "Cloud VPS: also open port $HTTPS_PORT/tcp in your provider's security group (安全组) — UFW alone is not enough."
 
-# ── Bootstrap first admin (BOTH interactive and -y) ── #
-# An admin is REQUIRED to do anything, so create one by default — including in
-# non-interactive (-y) mode, where the old script skipped this and left the
-# operator with NO admin and NO credentials.
+# ── Bootstrap admin (always, both modes) ── #
+# Create one admin and print its token — that's it. Change the token later from
+# the web console ("更换密钥" on your own row). Default user "admin" (override
+# with --admin-user). Re-runs are harmless: a duplicate just prints no token.
 PY="$APP_DIR/venv/bin/python"
 APP="$APP_DIR/server/app.py"
 CONF="$APP_DIR/server/config.yaml"
+ADMIN_USER="${ADMIN_USER:-admin}"
 
-if [[ -z "$ADMIN_USER" ]]; then
-    if [[ "$NON_INTERACTIVE" == true ]]; then
-        ADMIN_USER="admin"
-    else
-        echo ""
-        read -rp "Create your first admin user? Enter username [admin] (or 'skip'): " ADMIN_USER
-        ADMIN_USER="${ADMIN_USER:-admin}"
-    fi
-fi
-
-ADMIN_SECRET=""
-if [[ "$ADMIN_USER" != "skip" && "$ADMIN_USER" != "none" ]]; then
-    info "Creating admin user: $ADMIN_USER"
-    # Detect success by capturing the 64-hex secret it prints. A duplicate (on a
-    # re-run) prints no secret, so we fall through to the manual hint instead of
-    # aborting under `set -e`.
-    ADMIN_OUT="$("$PY" "$APP" -c "$CONF" user-add "$ADMIN_USER" --admin 2>&1)" || true
-    ADMIN_SECRET="$(printf '%s' "$ADMIN_OUT" | grep -oE '[0-9a-f]{64}' | head -n1)"
-    if [[ -n "$ADMIN_SECRET" ]]; then
-        echo ""
-        step "管理员已创建 / Admin created — 请妥善保存（仅此一次显示）"
-        echo "  用户名 / USERNAME: $ADMIN_USER"
-        echo "  密钥   / SECRET:   $ADMIN_SECRET"
-        echo ""
-        echo "  客户端配置 (~/.config/ufw-okboy/config, knock.sh):"
-        echo "    SERVER_URL=https://${DOMAIN:-$SERVER_IP}:$HTTPS_PORT"
-        echo "    USERNAME=$ADMIN_USER"
-        echo "    SECRET=$ADMIN_SECRET"
-        if [[ -z "$DOMAIN" || "$FORCE_SELF_SIGNED" == true ]]; then
-            echo "    INSECURE=1   # self-signed cert: skip TLS verification"
-        fi
-    else
-        warn "Admin '$ADMIN_USER' was not created (it may already exist)."
-        warn "Create one manually:  $PY $APP -c $CONF user-add <name> --admin"
-        warn "Rotate an existing user's secret:  $PY $APP -c $CONF revoke <name>"
-    fi
+info "Creating admin user: $ADMIN_USER"
+ADMIN_OUT="$("$PY" "$APP" -c "$CONF" user-add "$ADMIN_USER" --admin 2>&1)" || true
+ADMIN_SECRET="$(printf '%s' "$ADMIN_OUT" | grep -oE '[0-9a-f]{64}' | head -n1)"
+echo ""
+if [[ -n "$ADMIN_SECRET" ]]; then
+    step "管理员账号 / Admin — 请保存（仅此一次显示）"
+    echo "  用户名 USERNAME: $ADMIN_USER"
+    echo "  密钥   SECRET:   $ADMIN_SECRET"
+    echo "  登录网页后可在管理台「更换密钥」随时轮换。"
+else
+    info "管理员 '$ADMIN_USER' 已存在；如需更换密钥，登录网页管理台点「更换密钥」。"
 fi
 
 # ── Summary ── #
