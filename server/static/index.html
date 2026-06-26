@@ -729,6 +729,9 @@ const I18N = {
     // ---- Admin view (dynamic JS-built) ----
     admin_tag_admin: "[admin]",
     admin_revoke: "Revoke",
+    admin_rotate_self: "Rotate secret",
+    confirm_rotate_self: "Rotate your own secret?\n\nThe old secret stops working immediately. Update your other clients (knock.py / knock.sh) with the NEW secret shown next. This web session keeps working automatically.",
+    log_secret_rotated: "Your secret was rotated — copy the new one below.",
     admin_delete: "Delete",
     admin_make_admin: "Make admin",
     admin_remove_admin: "Remove admin",
@@ -865,6 +868,9 @@ const I18N = {
     // ---- Admin view (dynamic JS-built) ----
     admin_tag_admin: "[管理员]",
     admin_revoke: "吊销",
+    admin_rotate_self: "更换密钥",
+    confirm_rotate_self: "更换你自己的密钥？\n\n旧密钥立即失效。请用随后显示的新密钥更新你的其它客户端（knock.py / knock.sh）。当前网页会话会自动沿用新密钥。",
+    log_secret_rotated: "你的密钥已更换 — 请复制下方新密钥。",
     admin_delete: "删除",
     admin_make_admin: "设为管理员",
     admin_remove_admin: "取消管理员",
@@ -1697,8 +1703,11 @@ function renderUsers(users) {
       `<button class="btn-secondary btn-small" data-setadmin="${esc(u.id)}" data-name="${esc(u.username)}" data-isadmin="${u.is_admin ? "1" : "0"}">${esc(adminLbl)}</button>`;
     const delBtn = isSelf ? "" :
       `<button class="btn-link-danger" data-deluser="${esc(u.id)}" data-name="${esc(u.username)}">${esc(t("admin_delete"))}</button>`;
-    const revokeBtn = isSelf ? "" :
-      `<button class="btn-link-danger" data-revoke="${esc(u.id)}" data-name="${esc(u.username)}">${esc(t("admin_revoke"))}</button>`;
+    // Self-row: the destructive Revoke is hidden (avoid accidental self-revoke),
+    // but the admin still needs to change their OWN token — offer "Rotate secret".
+    const revokeBtn = isSelf
+      ? `<button class="btn-secondary btn-small" data-rotate-self="${esc(u.id)}">${esc(t("admin_rotate_self"))}</button>`
+      : `<button class="btn-link-danger" data-revoke="${esc(u.id)}" data-name="${esc(u.username)}">${esc(t("admin_revoke"))}</button>`;
     return `<div style="padding:.35rem 0;border-bottom:1px solid var(--border)">
       <div>${esc(u.id)}: ${esc(u.username)}${admin} <span style="color:var(--text2)">ip=${ip}</span></div>
       <div class="user-actions">
@@ -1908,6 +1917,36 @@ adminUsersEl.addEventListener("click", async (e) => {
     }
     await loadAdminConsole();
     if (newSecret) showSecret(newSecret); // persistent reveal, survives re-render
+  } else {
+    adminError.textContent = r.error || t("err_revoke_failed");
+    adminError.style.display = "block";
+  }
+});
+
+// Rotate the logged-in admin's OWN secret (self-service "change my token").
+// Reuses the revoke endpoint (rotates + returns the new secret). Since it is our
+// OWN credential, update the in-memory session to the new secret so we stay
+// logged in, and refresh a saved plaintext copy. (A PIN-encrypted vault keeps the
+// old secret until the next login — the new secret is shown so you can re-save.)
+adminUsersEl.addEventListener("click", async (e) => {
+  const btn = e.target.closest("[data-rotate-self]");
+  if (!btn) return;
+  const id = btn.dataset.rotateSelf;
+  if (!confirm(t("confirm_rotate_self"))) return;
+  let r = await apiAdmin("POST", `/api/admin/users/${id}/revoke`, { rotate_secret: true });
+  if (!r.ok && r.totp_required) {
+    const code = prompt(t("prompt_totp_revoke", credentials.username));
+    if (!code) return;
+    r = await apiAdmin("POST", `/api/admin/users/${id}/revoke`, { rotate_secret: true, totp_code: code });
+  }
+  if (r.ok && r.secret) {
+    credentials.secret = r.secret; // keep this session alive on the new secret
+    if (localStorage.getItem(STORAGE_KEY)) {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({ username: credentials.username, secret: r.secret }));
+    }
+    addLog(t("log_secret_rotated"), "ok");
+    await loadAdminConsole();
+    showSecret(r.secret);
   } else {
     adminError.textContent = r.error || t("err_revoke_failed");
     adminError.style.display = "block";
