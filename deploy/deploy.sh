@@ -69,10 +69,12 @@ detect_public_ip() {
     if [[ -n "$PUBLIC_IP" ]]; then echo "$PUBLIC_IP"; return; fi
     local ip svc
     for svc in "https://4.ipw.cn" "https://api.ipify.org" "https://ifconfig.me/ip"; do
-        ip="$(curl -fsS --max-time 4 "$svc" 2>/dev/null | tr -d '[:space:]')"
+        # `|| true`: a failed/blocked echo service must not abort under set -e —
+        # just try the next one, then fall back to the local NIC IP.
+        ip="$(curl -fsS --max-time 4 "$svc" 2>/dev/null | tr -d '[:space:]' || true)"
         if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then echo "$ip"; return; fi
     done
-    ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+    ip="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
     [[ -n "$ip" ]] && warn "Public IP auto-detect failed; using local IP $ip (pass --ip on a NAT'd VPS)." >&2
     echo "${ip:-127.0.0.1}"
 }
@@ -503,7 +505,11 @@ ADMIN_USER="${ADMIN_USER:-admin}"
 
 info "Creating admin user: $ADMIN_USER"
 ADMIN_OUT="$("$PY" "$APP" -c "$CONF" user-add "$ADMIN_USER" --admin 2>&1)" || true
-ADMIN_SECRET="$(printf '%s' "$ADMIN_OUT" | grep -oE '[0-9a-f]{64}' | head -n1)"
+# `|| true`: on a re-run the user already exists, grep finds no token and exits
+# non-zero — without this, `set -e`+pipefail would abort the whole script right
+# here (before the summary), leaving the operator confused even though the server
+# is fully installed.
+ADMIN_SECRET="$(printf '%s' "$ADMIN_OUT" | grep -oE '[0-9a-f]{64}' | head -n1 || true)"
 
 # ── Summary ── #
 echo ""
