@@ -1008,6 +1008,73 @@ def create_app(config_path: str = "config.yaml",
         db.log_audit(user["username"], "set_admin", target["username"], f"is_admin={is_admin}")
         return jsonify({"ok": True, "user_id": user_id, "is_admin": is_admin})
 
+    # ---- System firewall rules (ADVANCED / HIGH-RISK) ---- #
+    # Let an admin inspect and delete *any* UFW rule, including pre-existing
+    # system rules (SSH, manual rules). Deletion is gated by TOTP step-up AND a
+    # dedicated SSH lock-out guard, and every deletion is audited.
+
+    @app.route("/api/admin/ufw/rules", methods=["GET"])
+    def admin_ufw_rules():
+        """List ALL UFW rules (admin only, read-only)."""
+        user, err = auth.require_admin(
+            db, request.headers.get("Authorization"), ttl, _client_ip(),
+        )
+        if err:
+            return _admin_error_response(err)
+        return jsonify({"ok": True, "rules": ufw.list_all_rules()})
+
+    @app.route("/api/admin/ufw/delete", methods=["POST"])
+    def admin_ufw_delete():
+        """Delete a UFW rule by its current number (admin only, HIGH-RISK).
+
+        Guards, in order (so a TOTP code is consumed only once):
+          1. SSH lock-out guard — deleting a rule that looks like SSH (port 22 /
+             "ssh") requires an explicit ``confirm_ssh: true``.
+          2. TOTP step-up (when enrolled).
+        Returns the refreshed rule list (numbers shift after a deletion).
+        """
+        user, err = auth.require_admin(
+            db, request.headers.get("Authorization"), ttl, _client_ip(),
+        )
+        if err:
+            return _admin_error_response(err)
+        data = request.get_json(force=True, silent=True) or {}
+        number = data.get("number")
+        try:
+            number = int(number)
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "error": "number must be an integer"}), 400
+
+        # Identify the rule from the CURRENT listing (numbers can shift).
+        target = next((r for r in ufw.list_all_rules() if r["number"] == number), None)
+        if not target:
+            return jsonify({
+                "ok": False,
+                "error": "Rule not found — the list may have changed; refresh and retry.",
+            }), 404
+
+        # SSH guard FIRST (cheap, before consuming a step-up code).
+        if target["looks_like_ssh"] and not data.get("confirm_ssh"):
+            return jsonify({
+                "ok": False,
+                "error": "This looks like an SSH rule — deleting it may lock you out.",
+                "ssh_warning": True, "rule": target,
+            }), 409
+
+        se = _step_up_error(user)  # deleting a firewall rule is sensitive
+        if se:
+            return se
+
+        try:
+            ufw.delete_rule(number)
+        except Exception as exc:  # ufw failure → report, don't 500-HTML
+            return jsonify({"ok": False, "error": f"delete failed: {exc}"}), 500
+        db.log_audit(
+            user["username"], "ufw_rule_delete", str(number),
+            f"{target['to']} {target['action']} {target['from']} #{target['comment']}",
+        )
+        return jsonify({"ok": True, "deleted": number, "rules": ufw.list_all_rules()})
+
     # ---- JSON error contract ---- #
     # The SPA parses every response body as JSON. Without these handlers an
     # aborted request (unknown route → 404, wrong verb → 405, oversized body →

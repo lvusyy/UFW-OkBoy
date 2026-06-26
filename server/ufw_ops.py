@@ -110,6 +110,66 @@ class UFWManager:
             })
         return rules
 
+    def list_all_rules(self) -> list[dict]:
+        """Return ALL UFW rules from ``ufw status numbered`` (not just managed ones).
+
+        Lets the admin inspect / clean up pre-existing system rules. Each item::
+
+            {number, to, action, from, comment, is_okboy, looks_like_ssh}
+
+        UFW's columns are whitespace-aligned and vary (ports, app profiles like
+        "OpenSSH", IPv6 "(v6)", "Anywhere"), so this splits on the action keyword
+        rather than a rigid column regex. Returns [] when the numbered view is
+        unavailable (e.g. UFW inactive). ``looks_like_ssh`` flags rules that touch
+        port 22 / SSH so the caller can guard against an accidental lock-out.
+        """
+        try:
+            output = subprocess.run(
+                ["ufw", "status", "numbered"], capture_output=True,
+                text=True, timeout=15, check=False,
+            ).stdout
+        except Exception:
+            return []
+
+        num_re = re.compile(r"^\s*\[\s*(\d+)\s*\]\s+(.*\S)\s*$")
+        act_re = re.compile(r"\b(ALLOW|DENY|REJECT|LIMIT)\b")
+        rules: list[dict] = []
+        for line in output.splitlines():
+            m = num_re.match(line)
+            if not m:
+                continue
+            number = int(m.group(1))
+            body = m.group(2)
+            comment = ""
+            if "#" in body:
+                body, comment = body.split("#", 1)
+                comment, body = comment.strip(), body.rstrip()
+            am = act_re.search(body)
+            if am:
+                to = body[:am.start()].strip()
+                rest = body[am.start():].split(None, 2)
+                action = " ".join(rest[:2]) if len(rest) >= 2 else rest[0]
+                frm = rest[2].strip() if len(rest) >= 3 else ""
+            else:
+                to, action, frm = body.strip(), "", ""
+            blob = f"{to} {comment}".lower()
+            looks_like_ssh = ("ssh" in blob) or ("22" in re.findall(r"\d+", to))
+            rules.append({
+                "number": number, "to": to, "action": action, "from": frm,
+                "comment": comment,
+                "is_okboy": comment.startswith(self.rule_prefix),
+                "looks_like_ssh": looks_like_ssh,
+            })
+        return rules
+
+    def delete_rule(self, number: int) -> None:
+        """Delete a UFW rule by its CURRENT number (``ufw --force delete N``).
+
+        Rule numbers shift after each deletion, so callers must re-list between
+        deletes. Raises RuntimeError on failure (propagated to the caller).
+        """
+        self._run_ufw("--force", "delete", str(int(number)))
+
     def remove_rule(self, ip: str, port: int, username: str, proto: str = "tcp",
                     group: str | None = None) -> None:
         """Remove a specific UFW rule. Logs warning if rule doesn't exist.

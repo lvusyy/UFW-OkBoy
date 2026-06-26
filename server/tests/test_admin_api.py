@@ -12,7 +12,7 @@ import sys
 import tempfile
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import yaml
 
@@ -454,6 +454,133 @@ class TestAdminAPI(unittest.TestCase):
         )
         self.assertEqual(resp.status_code, 400)
         self.assertFalse(resp.get_json()["ok"])
+
+    # -- system firewall rules (advanced / high-risk) ----------------- #
+
+    _SAMPLE_UFW = (
+        "Status: active\n"
+        "\n"
+        "     To                         Action      From\n"
+        "     --                         ------      ----\n"
+        "[ 1] 22/tcp                     ALLOW IN    Anywhere\n"
+        "[ 2] 8080/tcp                   ALLOW IN    203.0.113.5"
+        "                # ufw-okboy:alice:default-8080\n"
+        "[ 3] 443                        ALLOW IN    Anywhere\n"
+        "[ 4] OpenSSH                    ALLOW IN    Anywhere\n"
+    )
+
+    def test_ufw_list_all_rules_parses_numbered_output(self) -> None:
+        """list_all_rules() parses `ufw status numbered`, flagging SSH + okboy rules.
+
+        Splitting on the action keyword (not rigid columns) must handle bare
+        ports, app profiles (OpenSSH), comments, and the okboy prefix.
+        """
+        db = self._open_db()
+        try:
+            ufw = UFWManager("ufw-okboy", db=db)
+            with patch("ufw_ops.subprocess.run", return_value=Mock(stdout=self._SAMPLE_UFW)):
+                rules = ufw.list_all_rules()
+        finally:
+            db.close()
+        self.assertEqual([r["number"] for r in rules], [1, 2, 3, 4])
+        by_num = {r["number"]: r for r in rules}
+        self.assertTrue(by_num[1]["looks_like_ssh"])        # 22/tcp
+        self.assertTrue(by_num[2]["is_okboy"])              # ufw-okboy comment
+        self.assertFalse(by_num[2]["looks_like_ssh"])       # 8080 is not SSH
+        self.assertFalse(by_num[3]["looks_like_ssh"])       # 443
+        self.assertTrue(by_num[4]["looks_like_ssh"])        # OpenSSH profile
+        self.assertEqual(by_num[2]["action"], "ALLOW IN")
+        self.assertEqual(by_num[2]["from"], "203.0.113.5")
+        self.assertEqual(by_num[2]["comment"], "ufw-okboy:alice:default-8080")
+
+    _SSH_RULE = {
+        "number": 1, "to": "22/tcp", "action": "ALLOW IN", "from": "Anywhere",
+        "comment": "", "is_okboy": False, "looks_like_ssh": True,
+    }
+    _WEB_RULE = {
+        "number": 2, "to": "8080/tcp", "action": "ALLOW IN", "from": "Anywhere",
+        "comment": "", "is_okboy": False, "looks_like_ssh": False,
+    }
+
+    def test_api_ufw_rules_requires_admin(self) -> None:
+        resp = self.client.get(
+            "/api/admin/ufw/rules",
+            headers={"Authorization": self._alice_header()},
+        )
+        self.assertEqual(resp.status_code, 403)
+
+    def test_api_ufw_rules_admin_lists(self) -> None:
+        with patch.object(UFWManager, "list_all_rules", return_value=[self._SSH_RULE]):
+            resp = self.client.get(
+                "/api/admin/ufw/rules",
+                headers={"Authorization": self._admin_header()},
+            )
+        self.assertEqual(resp.status_code, 200)
+        data = resp.get_json()
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["rules"], [self._SSH_RULE])
+
+    def test_api_ufw_delete_ssh_requires_confirm(self) -> None:
+        """Deleting an SSH-looking rule without confirm_ssh → 409, no actual delete."""
+        with patch.object(UFWManager, "list_all_rules", return_value=[self._SSH_RULE]), \
+                patch.object(UFWManager, "delete_rule") as mdel:
+            resp = self.client.post(
+                "/api/admin/ufw/delete",
+                headers={"Authorization": self._admin_header()},
+                json={"number": 1},
+            )
+        self.assertEqual(resp.status_code, 409)
+        self.assertTrue(resp.get_json()["ssh_warning"])
+        mdel.assert_not_called()
+
+    def test_api_ufw_delete_ssh_confirmed_deletes_and_audits(self) -> None:
+        with patch.object(UFWManager, "list_all_rules", return_value=[self._SSH_RULE]), \
+                patch.object(UFWManager, "delete_rule") as mdel:
+            resp = self.client.post(
+                "/api/admin/ufw/delete",
+                headers={"Authorization": self._admin_header()},
+                json={"number": 1, "confirm_ssh": True},
+            )
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(resp.get_json()["ok"])
+        mdel.assert_called_once_with(1)
+        self.assertGreaterEqual(self._count_audit("ufw_rule_delete"), 1)
+
+    def test_api_ufw_delete_non_ssh_deletes_without_confirm(self) -> None:
+        with patch.object(UFWManager, "list_all_rules", return_value=[self._WEB_RULE]), \
+                patch.object(UFWManager, "delete_rule") as mdel:
+            resp = self.client.post(
+                "/api/admin/ufw/delete",
+                headers={"Authorization": self._admin_header()},
+                json={"number": 2},
+            )
+        self.assertEqual(resp.status_code, 200)
+        mdel.assert_called_once_with(2)
+
+    def test_api_ufw_delete_not_found_returns_404(self) -> None:
+        with patch.object(UFWManager, "list_all_rules", return_value=[]):
+            resp = self.client.post(
+                "/api/admin/ufw/delete",
+                headers={"Authorization": self._admin_header()},
+                json={"number": 99},
+            )
+        self.assertEqual(resp.status_code, 404)
+
+    def test_api_ufw_delete_non_int_returns_400(self) -> None:
+        resp = self.client.post(
+            "/api/admin/ufw/delete",
+            headers={"Authorization": self._admin_header()},
+            json={"number": "abc"},
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_api_ufw_delete_requires_admin(self) -> None:
+        resp = self.client.post(
+            "/api/admin/ufw/delete",
+            headers={"Authorization": self._alice_header()},
+            json={"number": 1},
+        )
+        self.assertEqual(resp.status_code, 403)
 
 
 if __name__ == "__main__":
