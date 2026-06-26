@@ -49,9 +49,11 @@ if [[ -t 1 ]]; then
     YELLOW='\033[1;33m'
     RED='\033[0;31m'
     CYAN='\033[0;36m'
+    BOLD='\033[1m'
+    HILITE='\033[1;30;103m'   # bold black on bright-yellow — a highlighter for the secret
     NC='\033[0m'
 else
-    GREEN=''; YELLOW=''; RED=''; CYAN=''; NC=''
+    GREEN=''; YELLOW=''; RED=''; CYAN=''; BOLD=''; HILITE=''; NC=''
 fi
 
 info()  { echo -e "${GREEN}[INFO]${NC} $*"; }
@@ -491,9 +493,9 @@ ufw allow $HTTPS_PORT/tcp comment "UFW OkBoy HTTPS" 2>/dev/null || true
 warn "Cloud VPS: also open port $HTTPS_PORT/tcp in your provider's security group (安全组) — UFW alone is not enough."
 
 # ── Bootstrap admin (always, both modes) ── #
-# Create one admin and print its token — that's it. Change the token later from
-# the web console ("更换密钥" on your own row). Default user "admin" (override
-# with --admin-user). Re-runs are harmless: a duplicate just prints no token.
+# Create one admin here; its credentials are printed at the VERY END (last on
+# screen, highlighted) so the token can't scroll out of view. Default user
+# "admin" (override with --admin-user). Re-runs are harmless (duplicate → no token).
 PY="$APP_DIR/venv/bin/python"
 APP="$APP_DIR/server/app.py"
 CONF="$APP_DIR/server/config.yaml"
@@ -502,15 +504,6 @@ ADMIN_USER="${ADMIN_USER:-admin}"
 info "Creating admin user: $ADMIN_USER"
 ADMIN_OUT="$("$PY" "$APP" -c "$CONF" user-add "$ADMIN_USER" --admin 2>&1)" || true
 ADMIN_SECRET="$(printf '%s' "$ADMIN_OUT" | grep -oE '[0-9a-f]{64}' | head -n1)"
-echo ""
-if [[ -n "$ADMIN_SECRET" ]]; then
-    step "管理员账号 / Admin — 请保存（仅此一次显示）"
-    echo "  用户名 USERNAME: $ADMIN_USER"
-    echo "  密钥   SECRET:   $ADMIN_SECRET"
-    echo "  登录网页后可在管理台「更换密钥」随时轮换。"
-else
-    info "管理员 '$ADMIN_USER' 已存在；如需更换密钥，登录网页管理台点「更换密钥」。"
-fi
 
 # ── Summary ── #
 echo ""
@@ -544,6 +537,22 @@ echo "  View logs:       journalctl -u ufw-okboy -f"
 echo ""
 echo "  Next steps:"
 echo "    1. Open the Access URL in your browser"
-echo "    2. Login with your admin credentials"
+echo "    2. Login with your admin credentials (shown below)"
 echo "    3. Create user groups and add users"
+echo ""
+
+# ── Admin credentials — printed LAST and HIGHLIGHTED so the token can't be missed ── #
+echo ""
+if [[ -n "$ADMIN_SECRET" ]]; then
+    echo -e "${CYAN}══════════════════════════════════════════════════════════════${NC}"
+    echo -e "  ${BOLD}管理员凭据 / ADMIN LOGIN — 请立即复制保存（仅此一次显示）${NC}"
+    echo ""
+    echo -e "    用户名 USERNAME:  ${BOLD}$ADMIN_USER${NC}"
+    echo -e "    密钥   SECRET:    ${HILITE} $ADMIN_SECRET ${NC}"
+    echo ""
+    echo -e "  登录网页后，可在管理台自己那一行点「更换密钥」随时轮换。"
+    echo -e "${CYAN}══════════════════════════════════════════════════════════════${NC}"
+else
+    warn "管理员 '$ADMIN_USER' 已存在；如需更换密钥，登录网页管理台点「更换密钥」。"
+fi
 echo ""
