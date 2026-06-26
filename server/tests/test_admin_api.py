@@ -492,6 +492,29 @@ class TestAdminAPI(unittest.TestCase):
         self.assertEqual(by_num[2]["action"], "ALLOW IN")
         self.assertEqual(by_num[2]["from"], "203.0.113.5")
         self.assertEqual(by_num[2]["comment"], "ufw-okboy:alice:default-8080")
+        self.assertTrue(by_num[1]["is_open"])               # 22 from Anywhere
+        self.assertFalse(by_num[2]["is_open"])              # restricted source IP
+
+    def test_ufw_list_all_rules_honors_custom_ssh_port(self) -> None:
+        """sshd on a custom port → that port is flagged SSH; bare 22 is not."""
+        sample = (
+            "Status: active\n\n"
+            "[ 1] 2222/tcp   ALLOW IN   Anywhere\n"
+            "[ 2] 22/tcp     ALLOW IN   203.0.113.9\n"
+        )
+        db = self._open_db()
+        try:
+            ufw = UFWManager("ufw-okboy", db=db)
+            with patch.object(UFWManager, "_detect_ssh_ports", return_value={"2222"}), \
+                    patch("ufw_ops.subprocess.run", return_value=Mock(stdout=sample)):
+                rules = ufw.list_all_rules()
+        finally:
+            db.close()
+        by_num = {r["number"]: r for r in rules}
+        self.assertTrue(by_num[1]["looks_like_ssh"])        # 2222 = real SSH port
+        self.assertTrue(by_num[1]["is_open"])               # ALLOW from Anywhere
+        self.assertFalse(by_num[2]["looks_like_ssh"])       # bare 22 isn't sshd here
+        self.assertFalse(by_num[2]["is_open"])              # restricted source IP
 
     _SSH_RULE = {
         "number": 1, "to": "22/tcp", "action": "ALLOW IN", "from": "Anywhere",
@@ -581,6 +604,37 @@ class TestAdminAPI(unittest.TestCase):
             json={"number": 1},
         )
         self.assertEqual(resp.status_code, 403)
+
+
+class TestSSHPortDetection(unittest.TestCase):
+    """UFWManager._detect_ssh_ports parses sshd_config + drop-ins; safe defaults."""
+
+    def _write(self, dirpath: str, name: str, content: str) -> str:
+        path = os.path.join(dirpath, name)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+        return path
+
+    def test_reads_port_from_main_and_dropins(self) -> None:
+        d = tempfile.mkdtemp(prefix="ufw-okboy-sshd-")
+        main = self._write(d, "sshd_config", "#Port 22\nPort 2222\nPermitRootLogin no\n")
+        drop = self._write(d, "10-custom.conf", "Port 2022\n")
+        self.assertEqual(UFWManager._detect_ssh_ports([main, drop]), {"2222", "2022"})
+
+    def test_defaults_to_22_when_unset(self) -> None:
+        d = tempfile.mkdtemp(prefix="ufw-okboy-sshd-")
+        main = self._write(d, "sshd_config", "# no port here\nPermitRootLogin no\n")
+        self.assertEqual(UFWManager._detect_ssh_ports([main]), {"22"})
+
+    def test_defaults_to_22_when_file_missing(self) -> None:
+        self.assertEqual(
+            UFWManager._detect_ssh_ports(["/no/such/sshd_config"]), {"22"},
+        )
+
+    def test_ignores_lookalike_directives(self) -> None:
+        d = tempfile.mkdtemp(prefix="ufw-okboy-sshd-")
+        main = self._write(d, "sshd_config", "Ports 9\nPortForwarding yes\nPort 22\n")
+        self.assertEqual(UFWManager._detect_ssh_ports([main]), {"22"})
 
 
 if __name__ == "__main__":

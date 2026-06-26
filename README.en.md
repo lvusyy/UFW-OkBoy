@@ -10,6 +10,18 @@ English | [中文](README.md)
 
 ---
 
+## What's New in v2.2.1
+
+> ⚠️ **Use v2.2.1, not v2.2.0**: v2.2.0 could lock you out — it enabled UFW before allowing SSH. v2.2.1 fixes this.
+
+| Item | Description |
+|------|-------------|
+| **SSH lock-out fix (critical)** | Install now **allows SSH before enabling UFW**, and auto-detects the real SSH port from `sshd_config` (including `sshd_config.d/*.conf` and custom ports) so the operator can't be locked out |
+| **Admin manages system UFW rules (high-risk)** | New "Advanced (high-risk)" console panel lists/deletes **all** UFW rules (including ones not created by this tool); deletion is gated generic-confirm → SSH double-confirm → TOTP, audit-logged, and returns the refreshed list (numbers shift after a delete) |
+| **Exposure reminder** | Rules that look like SSH and are open to `Anywhere` are flagged, nudging you to restrict the source to a group instead of the whole internet |
+| **Simpler bootstrap** | Install creates `admin` directly and **prints the token highlighted** at the very end; the console supports **self-service secret rotation** — no reinstall needed |
+| **Re-install no longer aborts** | Fixed the installer aborting under `set -e` on re-run (command substitutions now tolerate empty matches) |
+
 ## What's New in v2.2
 
 | Feature | Description |
@@ -180,7 +192,7 @@ server/
   static/index.html   Web client + admin console + PIN vault (single-file SPA)
   config.example.yaml Server config template
   requirements.txt    Dependencies
-  tests/              Unit tests (120 tests)
+  tests/              Unit tests (145 tests)
 client/
   knock.py            Python client (stdlib only)
   knock.sh            Shell client (curl + openssl)

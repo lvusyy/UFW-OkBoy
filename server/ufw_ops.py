@@ -6,6 +6,7 @@ Responsibilities:
 - Cleanup stale rules that exceed a configurable max age
 """
 
+import glob
 import logging
 import re
 import subprocess
@@ -110,12 +111,44 @@ class UFWManager:
             })
         return rules
 
+    @staticmethod
+    def _detect_ssh_ports(paths: list[str] | None = None) -> set[str]:
+        """Best-effort set of ports sshd actually listens on (from sshd_config).
+
+        Reads ``/etc/ssh/sshd_config`` plus any ``sshd_config.d/*.conf`` drop-ins
+        (the layout modern Debian/Ubuntu use). Multiple ``Port`` lines are allowed.
+        Falls back to ``{"22"}`` — sshd's compiled-in default — when nothing is
+        readable or declared, so the lock-out guard never silently goes blind.
+        The ``paths`` arg exists for testing.
+        """
+        if paths is None:
+            paths = ["/etc/ssh/sshd_config"]
+            try:
+                paths += sorted(glob.glob("/etc/ssh/sshd_config.d/*.conf"))
+            except Exception:
+                pass
+        ports: set[str] = set()
+        for path in paths:
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        s = line.strip()
+                        if not s or s.startswith("#"):
+                            continue
+                        parts = s.split()
+                        # "Port 2222" — ignore "Ports", "PortForwarding", etc.
+                        if len(parts) >= 2 and parts[0].lower() == "port" and parts[1].isdigit():
+                            ports.add(parts[1])
+            except OSError:
+                continue
+        return ports or {"22"}
+
     def list_all_rules(self) -> list[dict]:
         """Return ALL UFW rules from ``ufw status numbered`` (not just managed ones).
 
         Lets the admin inspect / clean up pre-existing system rules. Each item::
 
-            {number, to, action, from, comment, is_okboy, looks_like_ssh}
+            {number, to, action, from, comment, is_okboy, looks_like_ssh, is_open}
 
         UFW's columns are whitespace-aligned and vary (ports, app profiles like
         "OpenSSH", IPv6 "(v6)", "Anywhere"), so this splits on the action keyword
@@ -131,6 +164,7 @@ class UFWManager:
         except Exception:
             return []
 
+        ssh_ports = self._detect_ssh_ports()
         num_re = re.compile(r"^\s*\[\s*(\d+)\s*\]\s+(.*\S)\s*$")
         act_re = re.compile(r"\b(ALLOW|DENY|REJECT|LIMIT)\b")
         rules: list[dict] = []
@@ -153,12 +187,18 @@ class UFWManager:
             else:
                 to, action, frm = body.strip(), "", ""
             blob = f"{to} {comment}".lower()
-            looks_like_ssh = ("ssh" in blob) or ("22" in re.findall(r"\d+", to))
+            to_ports = set(re.findall(r"\d+", to))
+            looks_like_ssh = ("ssh" in blob) or bool(to_ports & ssh_ports)
+            # "Open" = an ALLOW reachable from any source (no IP restriction).
+            # Used to nudge the admin to lock down management ports (SSH) via a
+            # group instead of leaving them world-open.
+            is_open = ("ALLOW" in action.upper()) and ("anywhere" in frm.lower())
             rules.append({
                 "number": number, "to": to, "action": action, "from": frm,
                 "comment": comment,
                 "is_okboy": comment.startswith(self.rule_prefix),
                 "looks_like_ssh": looks_like_ssh,
+                "is_open": is_open,
             })
         return rules
 

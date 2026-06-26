@@ -758,6 +758,8 @@ const I18N = {
     admin_fw_title: "System Firewall Rules",
     admin_fw_warn: "⚠️ High-risk: deleting a rule can lock you out (e.g. SSH / port 22). This lists ALL UFW rules, including ones not created by ufw-okboy. Only proceed if you know what you're doing.",
     admin_fw_load: "Show firewall rules",
+    admin_fw_protect_note: "Tip: restrict management ports (SSH) to allowed source IPs via a group — don't leave them open to everyone.",
+    admin_fw_open_hint: "open to all — consider restricting",
     admin_fw_none: "(no firewall rules)",
     confirm_fw_delete: "Delete this firewall rule?\n\n{0}\n\nThis cannot be undone.",
     confirm_fw_delete_ssh: "⚠️ This rule looks like SSH ({0}).\n\nDeleting it may LOCK YOU OUT of the server. Make sure another way in exists (cloud console / VNC) before continuing.\n\nDelete anyway?",
@@ -907,6 +909,8 @@ const I18N = {
     admin_fw_title: "系统防火墙规则",
     admin_fw_warn: "⚠️ 高风险：删除规则可能把你锁在门外（例如 SSH / 22 端口）。这里列出的是全部 UFW 规则，包含并非 ufw-okboy 创建的规则。请在确知后果的前提下再操作。",
     admin_fw_load: "显示防火墙规则",
+    admin_fw_protect_note: "提示：SSH 等管理端口建议用分组限制来源 IP，不要对所有人开放。",
+    admin_fw_open_hint: "对所有人开放，建议收紧",
     admin_fw_none: "（暂无防火墙规则）",
     confirm_fw_delete: "删除这条防火墙规则？\n\n{0}\n\n此操作无法撤销。",
     confirm_fw_delete_ssh: "⚠️ 这条规则疑似 SSH（{0}）。\n\n删除它可能会把你锁在服务器门外。请先确保有其它登录方式（云控制台 / VNC）再继续。\n\n仍要删除？",
@@ -2120,13 +2124,17 @@ function renderFwRules(rules) {
     adminFwEl.innerHTML = `<span style="color:var(--text2);font-size:.75rem">${esc(t("admin_fw_none"))}</span>`;
     return;
   }
-  adminFwEl.innerHTML = rules.map(r => {
+  // Persistent nudge: lock management ports down to a group, not the world.
+  const note = `<div style="color:var(--amber);font-size:.72rem;margin-bottom:.45rem">${esc(t("admin_fw_protect_note"))}</div>`;
+  adminFwEl.innerHTML = note + rules.map(r => {
     const ssh = r.looks_like_ssh ? ` <span style="color:var(--red)">⚠️SSH</span>` : "";
     const okboy = r.is_okboy ? ` <span style="color:var(--text2)">[okboy]</span>` : "";
+    // Flag SSH-looking rules that are reachable from anywhere (lock-out vector + exposure).
+    const open = (r.looks_like_ssh && r.is_open) ? ` <span style="color:var(--amber)">⚠️ ${esc(t("admin_fw_open_hint"))}</span>` : "";
     const cmt = r.comment ? ` <span style="color:var(--text2)"># ${esc(r.comment)}</span>` : "";
     const desc = `[${r.number}] ${r.to} ${r.action} ${r.from}`;
     return `<div style="padding:.25rem 0;border-bottom:1px solid var(--border);font-size:.75rem">
-      <span style="color:var(--text2)">[${esc(r.number)}]</span> ${esc(r.to)} <b>${esc(r.action)}</b> ${esc(r.from)}${cmt}${ssh}${okboy}
+      <span style="color:var(--text2)">[${esc(r.number)}]</span> ${esc(r.to)} <b>${esc(r.action)}</b> ${esc(r.from)}${cmt}${ssh}${okboy}${open}
       <button class="btn-link-danger" data-fwdel="${esc(r.number)}" data-desc="${esc(desc)}" style="margin-left:.4rem">${esc(t("admin_delete"))}</button>
     </div>`;
   }).join("");
