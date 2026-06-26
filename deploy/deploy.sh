@@ -203,9 +203,27 @@ if [[ "$FORCE_SELF_SIGNED" == false && -n "$DOMAIN" ]]; then
     $PKG_INSTALL $CERTBOT_PKG
 fi
 
+# CRITICAL: allow SSH BEFORE (re-)enabling UFW. `ufw enable` sets the default
+# incoming policy to DENY; without an SSH allow rule first, enabling UFW locks the
+# operator out of their own server over port 22. Allow the sshd port(s) from
+# sshd_config (default 22), the CURRENT SSH session's port (covers non-standard
+# ports), and the OpenSSH app profile — belt and suspenders. Run ALWAYS (even if
+# UFW is already active) so a re-run can never strand you either.
+SSH_PORTS="$(awk '/^[[:space:]]*[Pp]ort[[:space:]]+[0-9]+/{print $2}' /etc/ssh/sshd_config 2>/dev/null)"
+[[ -z "$SSH_PORTS" ]] && SSH_PORTS="22"
+if [[ -n "${SSH_CONNECTION:-}" ]]; then
+    CUR_SSH_PORT="$(awk '{print $4}' <<<"$SSH_CONNECTION")"
+    [[ -n "$CUR_SSH_PORT" ]] && SSH_PORTS="$SSH_PORTS $CUR_SSH_PORT"
+fi
+for _p in $SSH_PORTS; do
+    ufw allow "$_p/tcp" comment "SSH (auto-allowed by ufw-okboy installer)" 2>/dev/null || true
+done
+ufw allow OpenSSH 2>/dev/null || true
+info "Allowed SSH (ports: $SSH_PORTS) before touching UFW — avoids lockout."
+
 # Ensure ufw is enabled
 if ! ufw status | grep -q "Status: active"; then
-    warn "UFW is not active. Enabling UFW..."
+    warn "UFW is not active. Enabling UFW (SSH already allowed above)..."
     ufw --force enable
 fi
 
@@ -534,6 +552,9 @@ else
     warn "  Self-signed cert: the browser shows a one-time warning — click through / add an exception."
     warn "  CLI clients: set verify_ssl: false (knock.py) or INSECURE=1 (knock.sh) for self-signed."
 fi
+echo ""
+echo "  Firewall:        UFW active; SSH ($SSH_PORTS) + $HTTPS_PORT/tcp allowed."
+warn "  Keep the SSH rule — removing it (or letting the tool manage port 22) can lock you out."
 echo ""
 echo "  Management commands (run from any directory):"
 echo "    $PY $APP -c $CONF user-add <name> --admin     # 创建另一个管理员"
