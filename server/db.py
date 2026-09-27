@@ -9,12 +9,26 @@ CRUD, logging helpers, state queries, and one-time JSON state migration.
 import hashlib
 import json
 import logging
+import secrets
 import sqlite3
 import threading
 import time
 from pathlib import Path
 
 logger = logging.getLogger("ufw-okboy.db")
+
+# Secrets in the public sample config start with this prefix (e.g.
+# "CHANGE_ME_run_python_app_py_gen_secret_alice"). Anyone can read them in
+# the repo, so they must never become a working credential.
+PLACEHOLDER_SECRET_PREFIX = "CHANGE_ME"
+
+
+def is_placeholder_secret(secret) -> bool:
+    """Return True for an empty secret or a public CHANGE_ME* sample value.
+
+    Accepts non-strings too: an unquoted all-digit secret in YAML is an int.
+    """
+    return not secret or str(secret).startswith(PLACEHOLDER_SECRET_PREFIX)
 
 
 SCHEMA: dict[str, str] = {
@@ -100,6 +114,7 @@ MIGRATIONS: list[tuple[int, str]] = [
     (2, "add TOTP step-up columns (totp_secret, totp_enabled) to users"),
     (3, "add totp_last_counter to users (TOTP replay protection)"),
     (4, "add UNIQUE(port, proto) index on groups when data permits"),
+    (5, "rotate public CHANGE_ME* sample secrets seeded from the example config"),
 ]
 
 CURRENT_SCHEMA_VERSION: int = MIGRATIONS[-1][0]
@@ -241,6 +256,8 @@ class Database:
                 self._migration_003_totp_counter()
             elif version == 4:
                 self._migration_004_groups_port_proto_unique()
+            elif version == 5:
+                self._migration_005_rotate_placeholder_secrets()
             self._record_migration(version)
             applied.append(version)
         if applied:
@@ -304,6 +321,33 @@ class Database:
             "ON groups(port, proto)"
         )
         self.conn.commit()
+
+    def _migration_005_rotate_placeholder_secrets(self) -> None:
+        """v5: replace public CHANGE_ME* sample secrets with random ones.
+
+        Up to v2.2.1 the installers copied config.example.yaml verbatim, and
+        the first run seeded its sample user "alice" (secret published in the
+        repo, enrolled in default-8080), so anyone could knock as that user.
+        Rotating kills the credential but keeps the row, its memberships and
+        its current IP, so `revoke` / `user-del` can still close its rules.
+        """
+        cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(users)")}
+        if not {"username", "secret"} <= cols:
+            logger.info("users table predates secrets; nothing to rotate")
+            return
+        rotated: list[str] = []
+        for row in self.conn.execute("SELECT id, username, secret FROM users").fetchall():
+            if is_placeholder_secret(row["secret"]):
+                self.rotate_secret(row["id"], secrets.token_hex(32))
+                self.log_audit("migration", "rotate_placeholder_secret", row["username"],
+                               "v5: public sample secret replaced with a random one")
+                rotated.append(row["username"])
+        if rotated:
+            logger.warning(
+                "Rotated the public sample secret of user(s) %s. If unused, delete "
+                "them (`app.py user-del <name>`); to keep one, `app.py revoke <name>` "
+                "closes its ports and prints a new secret.", ", ".join(rotated),
+            )
 
     def close(self) -> None:
         """Close the calling thread's connection (if one was opened)."""
@@ -722,11 +766,22 @@ class Database:
         Seeds users from *config_users* (skipping any that already exist),
         copies current_ip/last_knock from *state_json_path* when present,
         and creates a ``default-<port>`` group per protected port with every
-        seeded user enrolled.
+        seeded user enrolled. A user whose secret is empty or a public
+        CHANGE_ME* sample value is still created (so any IP it already holds
+        stays tracked and its rules can be closed), but with a random secret.
         """
         for username, info in config_users.items():
-            if not self.get_user_by_username(username):
-                self.create_user(username, info.get("secret", ""))
+            if self.get_user_by_username(username):
+                continue
+            secret = info.get("secret", "")
+            if is_placeholder_secret(secret):
+                logger.warning(
+                    "User %r in config has an empty or public CHANGE_ME secret; seeding it "
+                    "with a random one. Delete it (`app.py user-del`) if unused, or get a "
+                    "usable secret with `app.py revoke`.", username,
+                )
+                secret = secrets.token_hex(32)
+            self.create_user(username, secret)
 
         state_path = Path(state_json_path)
         if state_path.exists():

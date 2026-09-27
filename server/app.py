@@ -29,7 +29,7 @@ from flask import Flask, request, jsonify, send_from_directory
 from werkzeug.exceptions import HTTPException
 
 import auth
-from db import Database
+from db import Database, is_placeholder_secret
 from ufw_ops import UFWManager
 
 logger = logging.getLogger("ufw-okboy")
@@ -63,13 +63,13 @@ def load_config(path: str) -> dict:
     if not p.exists():
         sys.exit(f"Config file not found: {path}")
     with open(p, encoding="utf-8") as f:
-        cfg = yaml.safe_load(f)
+        cfg = yaml.safe_load(f) or {}
 
-    # Validate required fields
-    if not cfg.get("protected_ports"):
-        sys.exit("Config error: 'protected_ports' must be a non-empty list")
-    if not cfg.get("users"):
-        sys.exit("Config error: 'users' must contain at least one user")
+    # Users, groups and ports live in the DB (v2). `users` / `protected_ports`
+    # are optional legacy first-run seeds (Database.migrate_from_json), so a
+    # config without them is valid: users are created with `user-add`.
+    cfg["users"] = cfg.get("users") or {}
+    cfg["protected_ports"] = cfg.get("protected_ports") or []
     for name, info in cfg["users"].items():
         if not info.get("secret"):
             sys.exit(f"Config error: user '{name}' is missing 'secret'")
@@ -625,6 +625,9 @@ def create_app(config_path: str = "config.yaml",
         if name_err:
             return jsonify({"ok": False, "error": name_err}), 400
         secret = data.get("secret") or secrets.token_hex(32)
+        if not isinstance(secret, str) or is_placeholder_secret(secret):
+            return jsonify({"ok": False, "error": "secret must be a string and not a public "
+                                                  "CHANGE_ME sample value; omit it to get a random one"}), 400
         is_admin = bool(data.get("is_admin", False))
         try:
             user_id = db.create_user(username, secret, is_admin=is_admin)
@@ -1336,7 +1339,7 @@ def cmd_list(args):
     db_users = {row["username"] for row in db.list_users()}
     orphaned = db_users - set(cfg["users"].keys())
     if orphaned:
-        print("\n=== Orphaned DB Users (not in config) ===")
+        print("\n=== DB Users (not in config) ===")
         for name in orphaned:
             state = ufw.get_user_state(name)
             print(f"  {name:20s}  IP: {state.get('ip') or 'N/A'}")

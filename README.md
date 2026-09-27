@@ -82,6 +82,9 @@ curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/lvusyy/UFW-OkBoy
 **装完 SSH / 远程连不上了？**
 请确认用的是 **v2.2.1 及以上**（旧版有此隐患，已修复）；新版安装会先放行 SSH 再启用防火墙。万一被锁在外面：用云厂商**控制台 / VNC** 登录，执行 `sudo ufw allow 22/tcp && sudo ufw reload`。
 
+**用 v2.2.1 及更早版本装过，要处理什么？**
+旧安装脚本会把示例用户 `alice` 写进数据库，它的密钥是公开的。按下面「怎么升级」升到 **v2.2.2 及以上**，这个密钥就会失效；再到服务器上看看 `alice` 还在不在，不用就删掉。步骤见 [CHANGELOG · v2.2.2](CHANGELOG.md#v222-2026-09-27)。
+
 **网页能打开，但端口连不上？**
 九成是**云安全组**没放行该端口。UFW 和云厂商安全组是两层，**两层都要放行**。
 

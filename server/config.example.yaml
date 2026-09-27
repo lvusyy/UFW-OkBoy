@@ -3,12 +3,14 @@
 
 # ---------- Network ---------- #
 
-# Ports protected by the firewall allowlist.
-# Authenticated clients will be granted access to ALL listed ports.
-protected_ports:
-  - 8080
-  # - 3306
-  # - 6379
+# Ports are managed as groups in the database: create them in the admin
+# console or with `python app.py group-add <name> <port>`.
+#
+# Legacy first-run seed (optional, read only while the database has no users):
+# each port listed here becomes a "default-<port>" group, with the seed users
+# from the Users section enrolled.
+# protected_ports:
+#   - 8080
 
 # Port whitelist for NEW groups (optional, opt-in).
 # When set, admin_create_group rejects groups whose port is NOT in this list,
@@ -101,11 +103,13 @@ backup_dir: "/var/lib/ufw-okboy/backups"
 backup_keep: 7
 
 # ---------- Users ---------- #
-# Each user needs a unique secret for HMAC authentication.
-# Generate secrets with: python app.py gen-secret <username>
-
-users:
-  alice:
-    secret: "CHANGE_ME_run_python_app_py_gen_secret_alice"
-  # bob:
-  #   secret: "CHANGE_ME_run_python_app_py_gen_secret_bob"
+# Users live in the database. Create them in the admin console or with
+#   python app.py -c config.yaml user-add <name> [--admin]
+# which generates a random secret (the installer already created an admin).
+#
+# Legacy first-run seed (optional, read only while the database has no users).
+# Put a secret from `python app.py gen-secret <name>` here. CHANGE_ME* sample
+# values are public, so such a user gets a random secret instead.
+# users:
+#   alice:
+#     secret: "CHANGE_ME_run_python_app_py_gen_secret_alice"
