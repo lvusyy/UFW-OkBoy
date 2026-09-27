@@ -82,6 +82,9 @@ curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/lvusyy/UFW-OkBoy
 **Locked out of SSH after install?**
 Make sure you're on **v2.2.1+** (older versions had this issue, now fixed); the new installer allows SSH before enabling the firewall. If locked out: log in via your cloud provider's **console / VNC** and run `sudo ufw allow 22/tcp && sudo ufw reload`.
 
+**Installed v2.2.1 or earlier — anything to do?**
+Older installers seeded a sample user `alice` whose secret is public. Upgrading to **v2.2.2 or later** (see "How do I upgrade?") invalidates it. Then run `python app.py user-list` on the server. If `alice` is there and unused, first delete the sample `users:` / `protected_ports:` block from `config.yaml` (otherwise it is re-seeded once no users are left), then `python app.py user-del alice` removes it along with its UFW rules (and `python app.py group-del default-8080` if you don't use port 8080).
+
 **Web page opens but the port won't connect?**
 99% of the time your **cloud security group** hasn't opened that port. UFW and the cloud security group are two layers — open **both**.
 
