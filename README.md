@@ -26,7 +26,7 @@
 | 🖥️ **网页管理台** | 用户 / 分组 / 规则、审计日志、TOTP、系统防火墙规则，全在网页搞定，无需 SSH |
 | 🔐 **认证安全** | HMAC-SHA256 + 时间戳（密钥不上网）、TOTP 二次验证、失败限流、操作审计 |
 | 🇨🇳 **国内友好** | 离线安装包 + 镜像兜底 + 自签证书 + 公网 IP + 高位端口，**无需备案域名** |
-| 🧰 **三种客户端** | 网页 / Python（`knock.py`）/ Shell（`knock.sh`，零依赖） |
+| 🧰 **四种客户端** | 网页 / Python（`knock.py`）/ Shell（`knock.sh`，零依赖）/ Windows（`knock.ps1`，系统自带 PowerShell） |
 
 ## 快速开始
 
@@ -56,6 +56,17 @@ curl -fsSL https://raw.githubusercontent.com/lvusyy/UFW-OkBoy/master/deploy/quic
 curl -fsSL https://raw.githubusercontent.com/lvusyy/UFW-OkBoy/master/deploy/install-client.sh \
   | bash -s -- --server https://你的服务器:端口 --user alice --secret 用户的token
 ```
+
+### Windows 电脑一键装客户端
+
+以管理员身份打开 PowerShell，粘贴下面两行。token 会提示输入，输入时不回显；服务器用自签证书的，末尾加 `-NoVerifySsl`：
+
+```powershell
+[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 3072
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/lvusyy/UFW-OkBoy/master/deploy/install-client.ps1))) -Server https://你的服务器:端口 -User alice
+```
+
+装好后由计划任务以 SYSTEM 身份每分钟敲一次门，开机即生效，不用登录。要敲多台服务器，换个 `-Server` 再跑一遍；卸载加 `-Uninstall`。Windows PowerShell 5.1 和 PowerShell 7 都能用，不需要装 Python。
 
 ## 国内安装（中国大陆）
 
@@ -89,7 +100,7 @@ curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/lvusyy/UFW-OkBoy
 九成是**云安全组**没放行该端口。UFW 和云厂商安全组是两层，**两层都要放行**。
 
 **用自签证书，客户端报 TLS 错误？**
-`knock.py` 在 `config.yaml` 设 `verify_ssl: false`；`knock.sh` 设 `INSECURE=1`（或加 `--insecure`）。HMAC 密钥永不上网，只是关掉传输层证书校验。
+`knock.py` 在 `config.yaml` 设 `verify_ssl: false`；`knock.sh` 设 `INSECURE=1`（或加 `--insecure`）；Windows 一键安装时加 `-NoVerifySsl`。HMAC 密钥永不上网，只是关掉传输层证书校验。
 
 **忘了 / 泄露了密钥？**
 管理台里对该用户点「更换密钥」（自己则点自助更换）；或在服务器执行 `python app.py revoke <用户>`——关端口 + 轮换密钥，旧凭据即时失效。

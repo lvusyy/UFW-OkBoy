@@ -128,6 +128,8 @@ curl -fsSL https://raw.githubusercontent.com/lvusyy/UFW-OkBoy/master/deploy/inst
 - 测试首次敲门
 - 安装 Systemd 定时器（每 30 秒自动敲门）
 
+Windows 电脑用 PowerShell 一键安装，见 [方式四：Windows 客户端](#方式四windows-客户端)。
+
 ## 国内部署专题
 
 > 国内服务器装不上？强烈建议先读本节。常见失败几乎都来自这几个坑：GitHub/PyPI 下不动、域名要备案、习惯用高位端口 + 自签证书。这些我们都做了贴心处理，跟着走基本一次成功。
@@ -184,6 +186,15 @@ curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/lvusyy/UFW-OkBoy
   | bash -s -- --server https://<公网IP>:8443 --user alice --secret 你的密钥 \
                --no-verify-ssl --gh-mirror https://ghfast.top
 ```
+
+- **Windows 一键装客户端**：同样加 `-NoVerifySsl`；GitHub 不通时，脚本地址和 `-GhMirror` 都走镜像：
+
+```powershell
+[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 3072
+& ([scriptblock]::Create((irm https://ghfast.top/https://raw.githubusercontent.com/lvusyy/UFW-OkBoy/master/deploy/install-client.ps1))) -Server https://<公网IP>:8443 -User alice -NoVerifySsl -GhMirror https://ghfast.top
+```
+
+  镜像会原样转发脚本，而 `knock.ps1` 之后以 SYSTEM 身份运行，所以只用你信任的镜像。更稳的是离线包：解压后运行其中的 `deploy\install-client.ps1`，它直接用包里的 `client\knock.ps1`，不再联网下载（见 [方式四](#方式四windows-客户端)）。
 
 ### 升级（国内）
 
@@ -601,13 +612,14 @@ GET /health
 
 ## 客户端使用
 
-提供三种客户端方式，适应不同使用场景：
+提供四种客户端方式，适应不同使用场景：
 
 | 方式 | 适用场景 | 技术要求 |
 |------|----------|----------|
 | 网页客户端 | 日常使用，手机/电脑均可 | 只需浏览器 |
 | Python 客户端 | 无界面的服务器 | 需要 Python 3 |
 | Shell 客户端 | 极简环境 | 只需 curl + openssl |
+| Windows 客户端 | Windows 电脑常驻自动敲门 | 系统自带 PowerShell |
 
 ### 方式一：网页客户端（推荐）
 
@@ -673,12 +685,49 @@ crontab -e
 # */2 * * * * /usr/local/bin/ufw-okboy-knock.sh >/dev/null 2>&1
 ```
 
+### 方式四：Windows 客户端
+
+用系统自带的 PowerShell（Windows PowerShell 5.1 或 PowerShell 7），不需要 Python。以**管理员身份**打开 PowerShell：
+
+```powershell
+# 一键安装（推荐）：token 会提示输入（不回显）；自签证书的服务器加 -NoVerifySsl
+[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 3072
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/lvusyy/UFW-OkBoy/master/deploy/install-client.ps1))) -Server https://your-server.com -User alice
+
+# 再加一台服务器：换个 -Server 再跑一遍（每台一个配置文件，由同一个计划任务依次敲门）
+# 卸载（删除计划任务和全部文件）：把第二行 -Server 之后的参数换成 -Uninstall
+
+# 离线包：解压后在包目录里运行（直接用包里的 client\knock.ps1，不联网下载）
+powershell -ExecutionPolicy Bypass -File .\deploy\install-client.ps1 -Server https://your-server.com -User alice
+```
+
+装好后：
+
+| 项 | 位置 / 说明 |
+|------|------|
+| 客户端脚本 | `C:\Program Files\UFW-OkBoy\knock.ps1` |
+| 配置 | `C:\Program Files\UFW-OkBoy\servers\<主机>[_<端口>].yaml`，格式与 `knock.py` 的 `config.yaml` 相同 |
+| 计划任务 | `UFW-OkBoy Knock`，以 SYSTEM 身份每分钟运行一次（安装时用 `-IntervalMinutes` 调整），开机即生效，不用登录 |
+| 最近一次结果 | `C:\Program Files\UFW-OkBoy\last-run.log` |
+
+整个 `C:\Program Files\UFW-OkBoy` 只有 SYSTEM 和管理员能访问（里面有密钥，脚本又以 SYSTEM 身份运行），所以下面的命令和查看日志都要在管理员 PowerShell 里执行。
+
+```powershell
+# 手动敲门 / 查看状态（管理员 PowerShell）
+powershell -ExecutionPolicy Bypass -File 'C:\Program Files\UFW-OkBoy\knock.ps1'
+powershell -ExecutionPolicy Bypass -File 'C:\Program Files\UFW-OkBoy\knock.ps1' status
+
+# 不装计划任务，只用脚本（任意 knock.py 格式的配置文件）
+powershell -ExecutionPolicy Bypass -File .\client\knock.ps1 -Config .\config.yaml
+```
+
 ### 自签证书注意事项
 
 使用自签证书部署时，客户端需要跳过 SSL 验证：
 
 - **Python 客户端**：`python3 knock.py --no-verify-ssl`
 - **Shell 客户端**：在 config 中添加 `VERIFY_SSL=false` 或使用 `curl -k`
+- **Windows 客户端**：一键安装时加 `-NoVerifySsl`（写入 `verify_ssl: false`），或运行 `knock.ps1` 时加 `-Insecure`
 - **Web 客户端**：浏览器会显示安全警告，点击「高级」→「继续前往」即可
 
 ---

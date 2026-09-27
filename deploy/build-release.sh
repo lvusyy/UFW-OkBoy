@@ -52,6 +52,7 @@ echo "[2/4] Copying client files..."
 mkdir -p "$PKG_DIR/client"
 cp "$REPO_DIR/client/knock.py" "$PKG_DIR/client/"
 cp "$REPO_DIR/client/knock.sh" "$PKG_DIR/client/"
+cp "$REPO_DIR/client/knock.ps1" "$PKG_DIR/client/"
 cp "$REPO_DIR/client/config.example.yaml" "$PKG_DIR/client/"
 
 # Copy deploy files
@@ -60,6 +61,7 @@ mkdir -p "$PKG_DIR/deploy" "$PKG_DIR/nginx"
 cp "$REPO_DIR/deploy/deploy.sh" "$PKG_DIR/deploy/"
 cp "$REPO_DIR/deploy/quick-install.sh" "$PKG_DIR/deploy/"
 cp "$REPO_DIR/deploy/install-client.sh" "$PKG_DIR/deploy/"
+cp "$REPO_DIR/deploy/install-client.ps1" "$PKG_DIR/deploy/"
 cp "$REPO_DIR/deploy/ufw-okboy.service" "$PKG_DIR/deploy/" 2>/dev/null || true
 cp "$REPO_DIR/deploy/ufw-okboy-cleanup.service" "$PKG_DIR/deploy/" 2>/dev/null || true
 cp "$REPO_DIR/deploy/ufw-okboy-cleanup.timer" "$PKG_DIR/deploy/" 2>/dev/null || true

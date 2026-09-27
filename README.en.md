@@ -26,7 +26,7 @@ Your server's sensitive ports (admin panels, databases, SSH, APIs) sit behind UF
 | 🖥️ **Web admin console** | Users / groups / rules, audit log, TOTP, system firewall rules — all in the browser, no SSH needed |
 | 🔐 **Secure auth** | HMAC-SHA256 + timestamp (secret never sent), TOTP step-up, failure throttle, audit log |
 | 🌏 **Restricted-network friendly** | Offline package + mirror fallback + self-signed cert + public IP + high ports — no filed domain needed |
-| 🧰 **Three clients** | Web / Python (`knock.py`) / Shell (`knock.sh`, zero deps) |
+| 🧰 **Four clients** | Web / Python (`knock.py`) / Shell (`knock.sh`, zero deps) / Windows (`knock.ps1`, built-in PowerShell) |
 
 ## Quick start
 
@@ -56,6 +56,17 @@ Then send "server address + username + token" to your teammate — they open the
 curl -fsSL https://raw.githubusercontent.com/lvusyy/UFW-OkBoy/master/deploy/install-client.sh \
   | bash -s -- --server https://your-server:port --user alice --secret USER_TOKEN
 ```
+
+### One-click client for Windows
+
+Open PowerShell as Administrator and paste the two lines below. The token is prompted for without echo; add `-NoVerifySsl` for a self-signed server:
+
+```powershell
+[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 3072
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/lvusyy/UFW-OkBoy/master/deploy/install-client.ps1))) -Server https://your-server:port -User alice
+```
+
+A scheduled task then knocks every minute as SYSTEM, from boot and with nobody logged in. For more servers, run it again with another `-Server`; `-Uninstall` removes it. Works with Windows PowerShell 5.1 and PowerShell 7, no Python needed.
 
 ## Offline / restricted networks
 
@@ -89,7 +100,7 @@ Older installers seeded a sample user `alice` whose secret is public. Upgrading 
 99% of the time your **cloud security group** hasn't opened that port. UFW and the cloud security group are two layers — open **both**.
 
 **Self-signed cert → client TLS error?**
-Set `verify_ssl: false` in `knock.py`'s `config.yaml`; set `INSECURE=1` (or pass `--insecure`) for `knock.sh`. The HMAC secret never goes over the wire — this only disables transport-layer cert verification.
+Set `verify_ssl: false` in `knock.py`'s `config.yaml`; set `INSECURE=1` (or pass `--insecure`) for `knock.sh`; add `-NoVerifySsl` to the Windows installer. The HMAC secret never goes over the wire — this only disables transport-layer cert verification.
 
 **Lost or leaked a secret?**
 In the console, click "Rotate secret" for that user (or self-rotate your own); or run `python app.py revoke <user>` on the server — closes ports + rotates the secret, old credentials die instantly.

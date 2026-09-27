@@ -34,6 +34,8 @@ State Store (/var/lib/ufw-okboy/state.json)
    automatic reconnection on page reopen. Works on mobile.
 2. **Python client**: `knock.py` with `--watch 30` for headless servers.
 3. **Shell client**: `knock.sh` (curl + openssl only, zero dependencies).
+4. **Windows client**: `knock.ps1` (built-in PowerShell 5.1+/7, same config format as
+   knock.py); `deploy/install-client.ps1` installs it as a SYSTEM scheduled task.
 
 ## Authentication Protocol
 
@@ -77,6 +79,7 @@ VERSION               - Single source of truth for version (read by app/build)
 client/
   knock.py            - Python client (requires: pyyaml)
   knock.sh            - Shell client (zero dependencies, uses curl + openssl)
+  knock.ps1           - Windows PowerShell client (zero dependencies, multi-server)
   config.example.yaml - Client configuration template
 nginx/
   ufw-okboy.conf      - Nginx reverse proxy configuration example
@@ -85,6 +88,7 @@ deploy/
   install-server.sh   - Lightweight standalone install entry
   build-release.sh    - Release package builder (reads VERSION)
   quick-install.sh    - curl|bash one-liner
+  install-client.ps1  - Windows client one-click install (SYSTEM scheduled task)
   ufw-okboy.service   - Systemd service for server
   ufw-okboy-cleanup.service - Systemd service for stale rule cleanup
   ufw-okboy-cleanup.timer   - Systemd timer for daily cleanup
