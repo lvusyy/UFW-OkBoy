@@ -61,10 +61,10 @@ jobs:
           cp server/tests/__init__.py "$PKG_NAME/server/tests/" 2>/dev/null || true
 
           # Client
-          cp client/knock.py client/knock.sh client/config.example.yaml "$PKG_NAME/client/" 2>/dev/null || true
+          cp client/knock.py client/knock.sh client/knock.ps1 client/config.example.yaml "$PKG_NAME/client/" 2>/dev/null || true
 
           # Deploy
-          cp deploy/deploy.sh deploy/quick-install.sh deploy/install-client.sh \
+          cp deploy/deploy.sh deploy/quick-install.sh deploy/install-client.sh deploy/install-client.ps1 \
              deploy/install-server.sh deploy/ufw-okboy.service \
              deploy/ufw-okboy-cleanup.service deploy/ufw-okboy-cleanup.timer \
              deploy/knock.service deploy/knock.timer "$PKG_NAME/deploy/" 2>/dev/null || true
