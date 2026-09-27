@@ -75,6 +75,9 @@ jobs:
           # Docs
           cp README.md README.en.md GUIDE.md "$PKG_NAME/" 2>/dev/null || true
 
+          # VERSION: the installers copy it next to the app so --version / upgrade checks work
+          cp VERSION "$PKG_NAME/"
+
           # Install wrapper
           cat > "$PKG_NAME/install.sh" << 'EOF'
           #!/usr/bin/env bash
