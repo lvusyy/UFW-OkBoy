@@ -40,10 +40,18 @@ class DatabaseInUse(RuntimeError):
 
 
 class _Claim:
-    """A shared lock on db.lock, released when the last holder is gone: the
-    Database, or any connection it opened (see _Connection)."""
+    """A shared lock on db.lock, and the connections opened under it. The lock
+    goes only after each of them is closed — by release(), or by this object's
+    finalizer for a Database dropped without close(): a connection closing
+    after it could checkpoint its -wal into a database a restore has just
+    replaced. (The connections' own finalization order, in a reference cycle
+    as they are, is not to be relied on.)"""
+
+    _fd = None
 
     def __init__(self, path: str) -> None:
+        self._mu = threading.Lock()
+        self._conns: list[tuple[threading.Thread, sqlite3.Connection]] = []
         fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
         try:
             fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
@@ -52,17 +60,29 @@ class _Claim:
             raise
         self._fd = fd
 
-    def __del__(self) -> None:
-        fd = getattr(self, "_fd", None)
-        if fd is not None:
-            os.close(fd)
+    def track(self, conn: sqlite3.Connection) -> None:
+        """Hold *conn*, the calling thread's, until release(); close those of
+        threads that have ended (a threaded server starts one per request)."""
+        with self._mu:
+            live = []
+            for thread, c in self._conns:
+                if thread.is_alive():
+                    live.append((thread, c))
+                else:
+                    c.close()
+            live.append((threading.current_thread(), conn))
+            self._conns = live
 
+    def release(self) -> None:
+        with self._mu:
+            for _, conn in self._conns:
+                conn.close()
+            self._conns = []
+            if self._fd is not None:
+                os.close(self._fd)
+                self._fd = None
 
-class _Connection(sqlite3.Connection):
-    """A connection keeping the claim alive for as long as it exists: closed
-    after the claim is released, it could checkpoint its -wal into a database
-    a restore has just replaced."""
-    claim = None
+    __del__ = release
 
 
 @contextlib.contextmanager
@@ -201,8 +221,8 @@ class Database:
         self._restrict_files()
 
     def _claim_shared(self):
-        """A shared lock on ``db.lock`` beside the database, held until neither
-        this object nor any connection it opened is left: a restore takes it
+        """A shared lock on ``db.lock`` beside the database, held until this
+        object's connections are closed (see _Claim): a restore takes it
         exclusively, so it never replaces the database under a process that
         has it open — whether or not close() was called. While a restore runs,
         opening fails at once."""
@@ -239,8 +259,9 @@ class Database:
 
     def _connect(self) -> sqlite3.Connection:
         """Open and configure a SQLite connection for the calling thread."""
-        conn = sqlite3.connect(self.db_path, check_same_thread=False, factory=_Connection)
-        conn.claim = self._claim
+        conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        if self._claim is not None:
+            self._claim.track(conn)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
         conn.execute("PRAGMA journal_mode = WAL")
@@ -462,13 +483,16 @@ class Database:
             self.conn.commit()
 
     def close(self) -> None:
-        """Close the calling thread's connection (if one was opened), and let
-        go of the claim on the database (see _claim_shared)."""
+        """Close this object's connections — every thread's — and let go of its
+        claim on the database (see _claim_shared); without one (not POSIX),
+        the calling thread's connection."""
+        if self._claim is not None:
+            self._claim.release()
+            self._claim = None
         conn = getattr(self._local, "conn", None)
         if conn is not None:
             conn.close()
             self._local.conn = None
-        self._claim = None
 
     # ------------------------------------------------------------------ #
     #  User CRUD

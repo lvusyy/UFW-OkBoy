@@ -16,6 +16,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import patch
@@ -504,21 +505,40 @@ class TestFilesAndSeeding(unittest.TestCase):
                 Database(self.db_path)
 
     @unittest.skipIf(fcntl is None, "POSIX flock")
-    def test_the_claim_outlives_every_connection(self) -> None:
+    def test_no_connection_outlives_the_claim(self) -> None:
         # Dropped without close(), a Database gave up its claim while its
-        # connection could live on — whose last close checkpoints its -wal
-        # into whatever file is there by then, a restored one included.
-        db = Database(self.db_path)
-        conn = db.conn
-        del db
-        gc.collect()
-        with self.assertRaises(DatabaseInUse):
+        # connection could live on — its last close then checkpoints the -wal
+        # into whatever file is there by then, a restored one included. Freed
+        # by reference count or by the cycle collector: the connections are
+        # closed before the claim goes.
+        for cyclic in (False, True):
+            db = Database(self.db_path)
+            conn = db.conn
+            conn.execute("SELECT 1")
+            if cyclic:
+                db.itself = db
+            del db
+            gc.collect()
             with exclusive_claim(self.db_path):
-                pass
-        conn.close()
-        del conn
-        with exclusive_claim(self.db_path):
-            pass
+                with self.assertRaises(sqlite3.ProgrammingError, msg=f"cyclic={cyclic}"):
+                    conn.execute("SELECT 1")
+
+    @unittest.skipIf(fcntl is None, "POSIX flock")
+    def test_connections_of_ended_threads_are_closed(self) -> None:
+        # Held until release, a threaded server's per-request connections
+        # would pile up: those of threads that ended close as others open.
+        db = Database(self.db_path)
+        conns = []
+        for _ in range(2):
+            t = threading.Thread(target=lambda: conns.append(db.conn))
+            t.start()
+            t.join()
+        with self.assertRaises(sqlite3.ProgrammingError):
+            conns[0].execute("SELECT 1")
+        conns[1].execute("SELECT 1")  # the latest is left alone until release
+        db.close()
+        with self.assertRaises(sqlite3.ProgrammingError):
+            conns[1].execute("SELECT 1")
 
     @unittest.skipIf(os.name != "posix", "POSIX file modes")
     def test_snapshot_copies_are_owner_only(self) -> None:
