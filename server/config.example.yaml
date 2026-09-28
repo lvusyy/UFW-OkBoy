@@ -1,115 +1,141 @@
 # UFW OkBoy - Server Configuration
-# Copy this file to config.yaml and modify as needed.
+# Copy this file to config.yaml and modify as needed; the defaults work as they are.
+# The service reads config.yaml at startup (restart it after editing:
+# `systemctl restart ufw-okboy`); CLI commands read it on every run.
+# Users, groups and memberships live in the database, not in this file.
 
 # ---------- Network ---------- #
 
 # Ports are managed as groups in the database: create them in the admin
-# console or with `python app.py group-add <name> <port>`.
+# console or with `app.py group-add <name> <port> [--proto udp]`.
 #
-# Legacy first-run seed (optional, read only while the database has no users):
+# Legacy first-run seed (optional, read only when a NEW database is created):
 # each port listed here becomes a "default-<port>" group, with the seed users
 # from the Users section enrolled.
 # protected_ports:
 #   - 8080
 
 # Port whitelist for NEW groups (optional, opt-in).
-# When set, admin_create_group rejects groups whose port is NOT in this list,
-# preventing an admin from accidentally opening sensitive ports (22/3306/...).
+# When set, groups created through the admin API / web console must use a port
+# in this list, preventing an admin from accidentally opening sensitive ports
+# (22/3306/...). The CLI `group-add` is not restricted.
 # When commented out or empty, no restriction is applied (backward compatible).
 # To enforce, uncomment and list the allowed ports:
 # allowed_ports:
 #   - 8080
 #   - 8443
 
-# Protocol for firewall rules (tcp / udp)
+# Legacy first-run seed: protocol (tcp / udp) of the "default-<port>" groups
+# created from protected_ports on a new database. Every firewall rule uses the
+# protocol of its own group.
 proto: "tcp"
 
-# Flask listen address (should be localhost when behind Nginx)
+# Listen address and port of `app.py serve` (the Flask development server)
+# only. The systemd service runs gunicorn with its own --bind (127.0.0.1:5000
+# behind Nginx, 0.0.0.0:<port> with TLS for --no-nginx installs); changing
+# these two does not move it.
 listen_host: "127.0.0.1"
 listen_port: 5000
 
 # ---------- Security ---------- #
 
 # HMAC signature validity window in seconds.
-# Client timestamps outside this window will be rejected.
-# Increase if clients have significant clock drift.
+# Client timestamps further than this from the server clock (either direction)
+# are rejected. Increase if clients have significant clock drift.
 signature_ttl: 300
 
 # Prefix for UFW rule comments. Used to identify rules managed by this tool.
-# When you run `ufw status`, managed rules will show as:
-#   ALLOW  1.2.3.4  # ufw-okboy:alice
+# Managed rules show in `ufw status` as, for example:
+#   8080/tcp   ALLOW   198.51.100.3   # ufw-okboy:alice:web
+# (comment format: <rule_prefix>:<user>:<group>). Do not change it while
+# managed rules exist: rules with the old prefix are no longer recognized.
 rule_prefix: "ufw-okboy"
 
-# Trusted reverse-proxy addresses. X-Real-IP / X-Forwarded-For headers are
-# honored ONLY when the direct peer is in this list, so a client reaching Flask
-# directly cannot spoof these headers to register an arbitrary IP (fixes H-9).
-# Default: localhost. Add your nginx/proxy IP here if it is on another host.
+# Trusted reverse-proxy addresses. X-Real-IP / X-Forwarded-For (its rightmost
+# entry) are honored ONLY when the direct peer is in this list, so a client
+# reaching the backend directly cannot spoof these headers to register an
+# arbitrary IP. Default: localhost. Add your proxy's IP here if it runs on
+# another host.
 trusted_proxies:
   - "127.0.0.1"
   - "::1"
 
-# Per-IP abuse throttle on /api/ endpoints: after `throttle_max_failures` failed
-# auth attempts from one IP within `throttle_window` seconds, further requests
-# from that IP get HTTP 429 until the failures age out. Keyed on IP (not
-# username) to avoid locking out a legitimate user. 0 disables the throttle.
+# Per-IP abuse throttle on /api/ endpoints: once one IP reaches
+# `throttle_max_failures` failures within `throttle_window` seconds (missing,
+# malformed, expired or wrong signatures; non-admin calls to admin endpoints;
+# wrong TOTP codes), its requests get HTTP 429 until the failures age out.
+# Keyed on IP (not username) to avoid locking out a legitimate user. The same
+# number also caps wrong TOTP codes per admin account, across IPs.
+# 0 disables both.
 throttle_max_failures: 10
 throttle_window: 300
 
 # Require a 6-digit TOTP code for sensitive admin actions (create/delete user,
-# create/delete group, membership changes, revoke, promote) once an admin enrolls
-# 2FA in the admin console. Set to true to also BLOCK un-enrolled admins from
-# those actions (forces enrollment).
+# create/delete group, membership changes, revoke, promote/demote, deleting
+# system UFW rules) once an admin enrolls 2FA in the admin console. Set to true
+# to also BLOCK un-enrolled admins from those actions (forces enrollment).
 require_admin_totp: false
 
 # Reject replay of an already-consumed TOTP step-up code (RFC 6238 §5.2): each
-# sensitive action needs a fresh code. Set false to restore the prior stateless
-# behavior (a code stays valid for its full ±step window) if you do many
-# back-to-back admin actions and prefer reusing one code per 30s window.
+# sensitive action needs a fresh code (the code used to activate TOTP counts as
+# used). Set false to restore the prior stateless behavior (a code stays valid
+# for its full ±step window) if you do many back-to-back admin actions and
+# prefer reusing one code per 30s window.
 totp_replay_protection: true
 
-# Optional GitHub proxy prefix for `python app.py upgrade` when GitHub is blocked
-# (common in mainland China). ghproxy form: the prefix is prepended to the GitHub
-# URL. Also settable via the UFW_OKBOY_GH_MIRROR env var. Empty = use GitHub directly.
+# Optional GitHub proxy prefix for the release query of `app.py upgrade`
+# (--check, and the version check before --force) when GitHub is blocked
+# (common in mainland China). ghproxy form: the prefix is prepended to the
+# GitHub URL. The UFW_OKBOY_GH_MIRROR env var takes precedence. The code itself
+# is updated with `git pull` from the checkout's own remote, not through this
+# proxy. Empty = use GitHub directly.
 # Proxies expire often — find a currently-working one at https://ghproxy.link/
 # github_mirror: "https://ghfast.top"
 
 # ---------- Anomaly Detection ---------- #
 
 # Detect possible credential sharing by monitoring IP change frequency.
-# If a user's IP changes more than `anomaly_max_changes` times within
-# `anomaly_window` seconds, a warning is logged and returned to the client.
+# When the number of a user's IP changes within `anomaly_window` seconds
+# reaches `anomaly_max_changes` (the first registration counts as one), a
+# warning is logged (journalctl -u ufw-okboy | grep ANOMALY) and returned to
+# the client; the knock itself still succeeds.
 # Normal users rarely change IP more than once or twice per day.
 
 # Time window for counting IP changes (seconds). Default: 3600 (1 hour)
 anomaly_window: 3600
 
-# Max IP changes allowed within the window before triggering a warning.
+# Number of IP changes within the window that triggers the warning.
 # Default: 5
 anomaly_max_changes: 5
 
 # ---------- Storage ---------- #
 
-# Path to the SQLite database file (tracks users, groups, state, logs).
-# The first run auto-migrates legacy state.json into the DB.
+# Path to the SQLite database file (users, groups, memberships, state, logs).
+# The lock files (ufw.lock, totp.lock, db.lock) live in the same directory.
+# A newly created database imports the legacy seeds (Users section,
+# protected_ports, state_file) once.
 db_path: "/var/lib/ufw-okboy/ufw-okboy.db"
 
-# Path to the legacy JSON state file (used only for one-time migration).
+# Path to the legacy (v1) JSON state file: read only when a new database is
+# created, to import each seeded user's last IP and knock time.
 state_file: "/var/lib/ufw-okboy/state.json"
 
-# Directory for `python app.py backup` snapshots (SQLite online backup API, not
+# Directory for `app.py backup` snapshots (SQLite online backup API, not
 # a raw file copy — safe under WAL). Each backup gets a .sha256 sidecar; the
 # newest `backup_keep` are retained (0 = keep all).
 backup_dir: "/var/lib/ufw-okboy/backups"
 backup_keep: 7
 
 # ---------- Users ---------- #
-# Users live in the database. Create them in the admin console or with
-#   python app.py -c config.yaml user-add <name> [--admin]
+# Users live in the database. Create them in the admin console or, as root in
+# the server directory, with
+#   ../venv/bin/python app.py -c config.yaml user-add <name> [--admin]
 # which generates a random secret (the installer already created an admin).
 #
-# Legacy first-run seed (optional, read only while the database has no users).
-# Put a secret from `python app.py gen-secret <name>` here. CHANGE_ME* sample
-# values are public, so such a user gets a random secret instead.
+# Legacy first-run seed (optional, read only when a NEW database is created).
+# Put a secret from `app.py gen-secret <name>` here. CHANGE_ME* sample
+# values are public, so such a user gets a random secret instead. A config
+# file that lists users is made owner-only (0600) when it is loaded.
 # users:
 #   alice:
 #     secret: "CHANGE_ME_run_python_app_py_gen_secret_alice"
