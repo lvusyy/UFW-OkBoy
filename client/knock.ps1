@@ -5,7 +5,7 @@
 .DESCRIPTION
     Registers this machine's public IP with UFW OkBoy servers: the Windows
     counterpart of knock.py / knock.sh. Reads the same config format as
-    knock.py (server_url / username / secret / verify_ssl, see
+    knock.py (server_url / username / secret / pin_sha256 / verify_ssl, see
     config.example.yaml).
 
     -Config is a config file or a directory. For a directory, every *.yaml in
@@ -25,8 +25,9 @@ param(
 
     [string]$Config,
 
-    # Skip TLS verification (self-signed server), like knock.py --no-verify-ssl.
-    # The HMAC secret is never sent, so this drops only transport verification.
+    # Skip TLS verification, like knock.py --no-verify-ssl. For a self-signed
+    # server prefer pin_sha256 in its config (it then decides and this switch
+    # is not used): without verification a man in the middle can replay a knock.
     [switch]$Insecure
 )
 
@@ -87,12 +88,125 @@ public static class OkBoyAcceptAnyCert {
     [OkBoyAcceptAnyCert]::Callback
 }
 
+function Initialize-OkBoyPin {
+    # pin_sha256 = base64(SHA-256(SubjectPublicKeyInfo)), checked in a compiled
+    # validation callback (it runs on another thread, see above). Each request
+    # gets its own OkBoyPinCheck, so nothing is shared between requests.
+    if ('OkBoyPinCheck' -as [type]) { return }
+    $source = @'
+using System;
+using System.Net.Security;
+using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
+
+public sealed class OkBoyPinCheck {
+    readonly string expected;
+    // The key the server presented, for the error message.
+    public string Seen;
+
+    public OkBoyPinCheck(string expected) { this.expected = expected; }
+
+    public RemoteCertificateValidationCallback Callback { get { return Validate; } }
+
+    bool Validate(object sender, X509Certificate cert, X509Chain chain, SslPolicyErrors errors) {
+        return Matches(cert);
+    }
+
+    public bool Matches(X509Certificate cert) {
+        Seen = cert == null ? null : SpkiSha256(cert.GetRawCertData());
+        return Seen != null && Seen == expected;
+    }
+
+    public static string SpkiSha256(byte[] der) {
+        int pos = Value(der, 0);                            // Certificate -> tbsCertificate
+        pos = Value(der, pos);                              // first field of tbsCertificate
+        if (der[pos] == 0xA0) pos = Next(der, pos);         // [0] version (absent in v1)
+        for (int i = 0; i < 5; i++) pos = Next(der, pos);   // serial, signature, issuer, validity, subject
+        int end = Next(der, pos);                           // subjectPublicKeyInfo
+        using (SHA256 sha = SHA256.Create()) {
+            return Convert.ToBase64String(sha.ComputeHash(der, pos, end - pos));
+        }
+    }
+
+    static int Value(byte[] der, int pos) { int len; return Header(der, pos, out len); }
+    static int Next(byte[] der, int pos) { int len; int start = Header(der, pos, out len); return start + len; }
+    static int Header(byte[] der, int pos, out int len) {
+        len = der[pos + 1];
+        pos += 2;
+        if ((len & 0x80) != 0) {
+            int size = len & 0x7F;
+            len = 0;
+            for (int i = 0; i < size; i++) len = (len << 8) | der[pos++];
+        }
+        if (len < 0 || pos + len > der.Length) throw new FormatException("truncated certificate");
+        return pos;
+    }
+}
+'@
+    if ($PSVersionTable.PSEdition -eq 'Core') {
+        $source += @'
+
+public static class OkBoyPinHttp {
+    public static Func<System.Net.Http.HttpRequestMessage, X509Certificate2, X509Chain, SslPolicyErrors, bool> Callback(OkBoyPinCheck check) {
+        return (request, cert, chain, errors) => check.Matches(cert);
+    }
+}
+'@
+    } else {
+        Add-Type -AssemblyName System.Net.Http, System.Net.Http.WebRequest
+    }
+    Add-Type -TypeDefinition $source
+}
+
+function Invoke-OkBoyPinned([hashtable]$Cfg, [string]$Action, [string]$Pin) {
+    # The server key is checked on the connection that then carries the request,
+    # before anything is sent. HttpClient gives each handler its own connections
+    # and callback: WebRequestHandler under Windows PowerShell, HttpClientHandler
+    # under PowerShell 7 (whose Invoke-RestMethod cannot check a key).
+    $uri = [Uri]($Cfg.server_url.TrimEnd('/') + "/api/$Action")
+    if ($uri.Scheme -ne 'https') { throw 'pin_sha256 needs an https:// server_url' }
+    Initialize-OkBoyPin
+    $check = [OkBoyPinCheck]::new($Pin)
+    if ($PSVersionTable.PSEdition -eq 'Core') {
+        $handler = [Net.Http.HttpClientHandler]::new()
+        $handler.ServerCertificateCustomValidationCallback = [OkBoyPinHttp]::Callback($check)
+    } else {
+        $handler = [Net.Http.WebRequestHandler]::new()
+        $handler.ServerCertificateValidationCallback = $check.Callback
+    }
+    $handler.AllowAutoRedirect = $false
+    $client = [Net.Http.HttpClient]::new($handler)
+    $client.Timeout = [TimeSpan]::FromSeconds(15)
+    try {
+        $method = if ($Action -eq 'knock') { [Net.Http.HttpMethod]::Post } else { [Net.Http.HttpMethod]::Get }
+        $request = [Net.Http.HttpRequestMessage]::new($method, $uri)
+        [void]$request.Headers.TryAddWithoutValidation('Authorization', (Get-AuthHeader $Cfg.username $Cfg.secret))
+        $response = $client.SendAsync($request).GetAwaiter().GetResult()
+        $body = ConvertFrom-JsonOrNull $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+        if ($response.IsSuccessStatusCode -and $body) { return $body }
+        $message = if ($body -and $body.error) { $body.error } else { 'Unexpected non-JSON response (wrong server URL?)' }
+        [pscustomobject]@{ ok = $false; error = "HTTP $([int]$response.StatusCode): $message" }
+    } catch {
+        if ($check.Seen -and $check.Seen -ne $Pin) {
+            $message = "Server public key does not match pin_sha256 (the server presented $($check.Seen)); nothing was sent"
+        } else {
+            $e = $_.Exception
+            while ($e.InnerException) { $e = $e.InnerException }
+            $message = $e.Message
+        }
+        [pscustomobject]@{ ok = $false; error = $message }
+    } finally {
+        $client.Dispose()
+    }
+}
+
 function ConvertFrom-JsonOrNull([string]$Text) {
     if (-not $Text) { return $null }
     try { $Text | ConvertFrom-Json } catch { $null }  # not JSON, e.g. an HTML error page from a proxy
 }
 
-function Invoke-OkBoy([hashtable]$Cfg, [string]$Action, [bool]$Verify) {
+function Invoke-OkBoy([hashtable]$Cfg, [string]$Action, [bool]$Verify, [string]$Pin) {
+    if ($Pin) { return Invoke-OkBoyPinned $Cfg $Action $Pin }
     $request = @{
         Uri              = $Cfg.server_url.TrimEnd('/') + "/api/$Action"
         Method           = $(if ($Action -eq 'knock') { 'Post' } else { 'Get' })
@@ -140,8 +254,12 @@ foreach ($file in $files) {
     try {
         $cfg = Read-KnockConfig $file
         $server = $cfg.server_url
+        $pin = "$($cfg.pin_sha256)".Trim()
+        if ($pin -and $pin -cnotmatch '^[A-Za-z0-9+/]{43}=$') {
+            throw "'pin_sha256' must be the base64 SHA-256 of the server's public key (44 characters ending in '=')"
+        }
         $verify = -not $Insecure -and $cfg.verify_ssl -notin 'false', '0', 'no', 'off'
-        $result = Invoke-OkBoy $cfg $Action $verify
+        $result = Invoke-OkBoy $cfg $Action $verify $pin
     } catch {
         $result = [pscustomobject]@{ ok = $false; error = $_.Exception.Message }
     }

@@ -4,7 +4,7 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/lvusyy/UFW-OkBoy/master/deploy/upgrade.sh | bash
 #   curl -fsSL .../upgrade.sh | bash -s -- --app-dir /opt/ufw-okboy -y
-#   curl -fsSL .../upgrade.sh | bash -s -- --branch v2.4.1    # pin a release tag
+#   curl -fsSL .../upgrade.sh | bash -s -- --branch v2.4.2    # pin a release tag
 #   sudo bash deploy/upgrade.sh --repo-dir . -y               # from an unpacked release package
 #
 # Updates the code of an EXISTING install, restarts the service (DB schema
@@ -125,7 +125,7 @@ if [[ -z "$REPO_DIR" ]]; then
         fi
     fi
     if [[ "$fetched" -eq 0 ]]; then
-        # archive/<ref> takes a branch or a tag alike (--branch v2.4.1 pins a release).
+        # archive/<ref> takes a branch or a tag alike (--branch v2.4.2 pins a release).
         curl -fsSL "$(gh_url "$REPO_URL/archive/$BRANCH.tar.gz")" -o "$TMP_DIR/src.tgz" || {
             err "Fetch failed. GitHub may be blocked — retry with --gh-mirror <proxy>, --repo-dir <local>, or the offline package."
             exit 1

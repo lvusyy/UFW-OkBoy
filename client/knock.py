@@ -9,13 +9,17 @@ Usage:
 """
 
 import argparse
+import base64
 import hashlib
 import hmac
+import http.client
 import json
+import re
 import ssl
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -30,6 +34,10 @@ except ImportError:
 # ====================================================================== #
 #  Configuration
 # ====================================================================== #
+
+# pin_sha256: base64 of a SHA-256 digest, 43 characters and one '=' of padding.
+PIN_RE = re.compile(r"[A-Za-z0-9+/]{43}=")
+
 
 def _parse_simple_yaml(text: str) -> dict:
     """Minimal single-level YAML parser (fallback when pyyaml is not installed).
@@ -63,6 +71,11 @@ def load_config(path: str) -> dict:
     for field in ("server_url", "username", "secret"):
         if not cfg.get(field):
             sys.exit(f"Config error: '{field}' is required")
+    pin = str(cfg.get("pin_sha256") or "").strip()
+    if pin and not PIN_RE.fullmatch(pin):
+        sys.exit("Config error: 'pin_sha256' must be the base64 SHA-256 of the "
+                 "server's public key (44 characters ending in '=')")
+    cfg["pin_sha256"] = pin
     return cfg
 
 
@@ -83,12 +96,82 @@ def build_auth_header(username: str, secret: str) -> str:
 
 
 # ====================================================================== #
+#  Public-key pinning
+# ====================================================================== #
+
+def _der_value(der: bytes, pos: int):
+    """Return (start, end) of the value of the DER element at pos."""
+    length = der[pos + 1]
+    pos += 2
+    if length & 0x80:
+        size = length & 0x7F
+        length = int.from_bytes(der[pos:pos + size], "big")
+        pos += size
+    if pos + length > len(der):
+        raise ValueError("truncated certificate")
+    return pos, pos + length
+
+
+def spki_sha256(cert_der: bytes) -> str:
+    """base64(SHA-256(SubjectPublicKeyInfo)) of a DER certificate: the pin
+    format of pin_sha256 (and of curl --pinnedpubkey sha256//...)."""
+    tbs, _ = _der_value(cert_der, 0)             # Certificate -> tbsCertificate
+    pos, _ = _der_value(cert_der, tbs)           # first field of tbsCertificate
+    if cert_der[pos] == 0xA0:                    # [0] version (absent in v1)
+        pos = _der_value(cert_der, pos)[1]
+    for _ in range(5):                           # serial, signature, issuer, validity, subject
+        pos = _der_value(cert_der, pos)[1]
+    end = _der_value(cert_der, pos)[1]           # subjectPublicKeyInfo
+    return base64.b64encode(hashlib.sha256(cert_der[pos:end]).digest()).decode()
+
+
+def _pinned_request(method: str, url: str, headers: dict, pin: str,
+                    timeout: int = 15) -> dict:
+    """Send a request over a connection whose server key matches pin.
+
+    The certificate is not checked against a CA or the host name (a
+    self-signed server is the point); the pin is checked right after the
+    handshake, before anything is sent.
+    """
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme != "https" or not parts.hostname:
+        return {"ok": False, "error": "pin_sha256 needs an https:// server_url"}
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    conn = None
+    try:
+        conn = http.client.HTTPSConnection(parts.hostname, parts.port or 443,
+                                           timeout=timeout, context=ctx)
+        conn.connect()
+        seen = spki_sha256(conn.sock.getpeercert(binary_form=True))
+        if seen != pin:
+            return {"ok": False, "error": "Server public key does not match "
+                    f"pin_sha256 (the server presented {seen}); nothing was sent"}
+        path = parts.path + (f"?{parts.query}" if parts.query else "")
+        conn.request(method, path, headers=headers)
+        resp = conn.getresponse()
+        body = resp.read().decode("utf-8", errors="replace")
+    except (OSError, http.client.HTTPException, ValueError, IndexError) as e:
+        return {"ok": False, "error": f"Connection failed: {e}"}
+    finally:
+        if conn is not None:
+            conn.close()
+    try:
+        return json.loads(body)
+    except json.JSONDecodeError:
+        return {"ok": False, "error": f"HTTP {resp.status}: {body[:200]}"}
+
+
+# ====================================================================== #
 #  HTTP Client (stdlib only, zero external dependencies)
 # ====================================================================== #
 
 def _request(method: str, url: str, headers: dict,
-             verify_ssl: bool = True, timeout: int = 15) -> dict:
+             verify_ssl: bool = True, timeout: int = 15, pin: str = "") -> dict:
     """Send an HTTP request and return the parsed JSON response."""
+    if pin:
+        return _pinned_request(method, url, headers, pin, timeout)
     req = urllib.request.Request(url, method=method, headers=headers)
 
     ctx = None
@@ -114,19 +197,19 @@ def _request(method: str, url: str, headers: dict,
 
 
 def knock(server_url: str, username: str, secret: str,
-          verify_ssl: bool = True) -> dict:
+          verify_ssl: bool = True, pin: str = "") -> dict:
     """Send a knock request to register the current IP."""
     auth = build_auth_header(username, secret)
     url = f"{server_url.rstrip('/')}/api/knock"
-    return _request("POST", url, {"Authorization": auth}, verify_ssl)
+    return _request("POST", url, {"Authorization": auth}, verify_ssl, pin=pin)
 
 
 def status(server_url: str, username: str, secret: str,
-           verify_ssl: bool = True) -> dict:
+           verify_ssl: bool = True, pin: str = "") -> dict:
     """Query current registration status."""
     auth = build_auth_header(username, secret)
     url = f"{server_url.rstrip('/')}/api/status"
-    return _request("GET", url, {"Authorization": auth}, verify_ssl)
+    return _request("GET", url, {"Authorization": auth}, verify_ssl, pin=pin)
 
 
 # ====================================================================== #
@@ -155,7 +238,8 @@ def main():
     )
     parser.add_argument(
         "--no-verify-ssl", action="store_true",
-        help="Skip SSL certificate verification (not recommended)",
+        help="Skip SSL certificate verification (not recommended; "
+             "not used when pin_sha256 is set)",
     )
     args = parser.parse_args()
 
@@ -163,10 +247,12 @@ def main():
     server_url = cfg["server_url"]
     username = cfg["username"]
     secret = cfg["secret"]
-    # TLS verification: config `verify_ssl: false` suits self-signed servers
-    # (common for IP-based / high-port CN deployments); the --no-verify-ssl flag,
-    # when passed, always forces verification off. The HMAC secret is never sent
-    # over the wire, so this drops only transport verification, not auth secrecy.
+    # TLS verification: `pin_sha256` accepts exactly the server key it names
+    # (the way to trust a self-signed server) and then decides alone. Without
+    # it, config `verify_ssl: false` or the --no-verify-ssl flag turns
+    # verification off: the HMAC secret is never sent over the wire, but a man
+    # in the middle can then capture a request and replay it while it is valid.
+    pin = cfg["pin_sha256"]
     cfg_verify = cfg.get("verify_ssl", True)
     if isinstance(cfg_verify, str):
         cfg_verify = cfg_verify.strip().lower() not in ("false", "0", "no", "off")
@@ -178,7 +264,7 @@ def main():
         print(f"[{_now()}] Watch mode: {args.action} every {args.watch}s")
         while True:
             try:
-                result = action_fn(server_url, username, secret, verify_ssl)
+                result = action_fn(server_url, username, secret, verify_ssl, pin)
                 ok = result.get("ok", False)
                 msg = result.get("message") or result.get("error", "")
                 ip = result.get("ip", "")
@@ -195,7 +281,7 @@ def main():
                 print(f"\n[{_now()}] Stopped.")
                 break
     else:
-        result = action_fn(server_url, username, secret, verify_ssl)
+        result = action_fn(server_url, username, secret, verify_ssl, pin)
         print(json.dumps(result, indent=2, ensure_ascii=False))
         sys.exit(0 if result.get("ok") else 1)
 

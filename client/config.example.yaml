@@ -18,10 +18,17 @@ username: "alice"
 # Get it from the server admin.
 secret: "CHANGE_ME_get_this_from_server_admin"
 
-# TLS certificate verification. Set to false when the server uses a self-signed
-# certificate (the norm for IP-based / high-port deployments, e.g. most mainland
-# China setups without a filed domain + Let's Encrypt). The HMAC secret itself
-# is never sent, but without verification a man in the middle can capture a
-# request and replay it while its signature is valid (signature_ttl, 300 s by
-# default). Leave true whenever the server has a real CA-issued certificate.
+# Server key pin, for a server with a self-signed certificate (the norm for
+# IP-based / high-port deployments, e.g. most mainland China setups without a
+# filed domain + Let's Encrypt): the base64 SHA-256 of the server's public key,
+# printed at the end of the server install (see GUIDE.md to print it again).
+# With it the client accepts exactly that key and verify_ssl is not used;
+# server_url must be https://. knock.py then connects directly, without
+# HTTPS_PROXY.
+# pin_sha256: "PASTE_THE_PIN_HERE"
+
+# TLS certificate verification against the system's CAs: leave true for a
+# server with a CA-issued certificate. false turns verification off: the HMAC
+# secret itself is never sent, but a man in the middle can capture a request
+# and replay it while its signature is valid (signature_ttl, 300 s by default).
 verify_ssl: true

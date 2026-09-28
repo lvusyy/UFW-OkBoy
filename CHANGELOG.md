@@ -4,6 +4,22 @@
 
 ---
 
+## v2.4.2 (2026-09-29)
+
+命令行客户端可以按公钥固定（pin）服务器，服务器用自签证书时不必再关闭证书校验。服务端的运行行为没有变化。
+
+| 新增 / 修复 | 说明 |
+|------|------|
+| **客户端公钥固定** | `knock.py`、`knock.ps1` 的配置新增 `pin_sha256`，`knock.sh` 的配置新增 `PIN_SHA256`：服务器公钥（SubjectPublicKeyInfo）SHA-256 的 base64，与 curl `--pinnedpubkey sha256//…` 同一格式。配上之后客户端只接受这把公钥，不做 CA 与主机名校验，所以自签证书也能用；公钥不符时在发出请求之前停下（`knock.py`、`knock.ps1` 的错误信息里带上对方出示的 pin）；pin 只能配给 `https://` 的服务器地址。`knock.py` 在同一条连接上先核对再发送（这时直接连接，不经 `HTTPS_PROXY`）；`knock.sh` 用 `curl -q -k --pinnedpubkey --proto =https`（需要 curl 7.49 及以上，更早的版本在部分 TLS 后端上会忽略 pin，因此拒绝使用；`-q` 不读 `~/.curlrc`）；`knock.ps1` 每次请求用各自的 HttpClient 处理器与连接核对（Windows PowerShell 5.1 为 `WebRequestHandler`，PowerShell 7 为 `HttpClientHandler`），不改动进程级的 `ServicePointManager` 设置。配了 pin，`verify_ssl`、`INSECURE` 以及 `--no-verify-ssl`、`--insecure`、`-Insecure` 都不再起作用。一键安装脚本新增 `--pin-sha256`（Linux）与 `-PinSha256`（Windows），为同一台服务器重新运行时保留已有的 pin（传空值去掉），旧配置里的 pin 无法沿用时中止并提示，不会悄悄丢掉 |
+| **安装结束时打印 pin** | 自签模式下 `deploy.sh` 在结尾打印 `Client key pin` 和各客户端的填法；GUIDE 给出在服务器上重新计算它的命令 |
+| **重新运行 `deploy.sh` 不再换私钥** | 自签模式每次运行都用新私钥重新生成证书，所有客户端都得重新信任。现在沿用已有的私钥，只续签证书，pin 不变；删掉 `/etc/ssl/ufw-okboy/selfsigned.key` 再运行才换新密钥 |
+| 其他 | `knock.sh` 改用 `curl -sS`，连接失败（包括 pin 不符）时打印 curl 的错误；`install-client.sh --help` 不再多打印脚本内容，示例地址改为文档保留地址；CI 增加客户端测试：在本地的自签 HTTPS 服务（RSA 与 EC 证书）上跑 `knock.py`、`knock.sh` 和 `knock.ps1`（PowerShell 7 与 Windows PowerShell 5.1），pin 对时请求送达，不对时服务端收不到任何请求；pin 配给 `http://` 地址时三个客户端都拒绝 |
+
+**升级须知**：
+
+- 服务端升级后行为不变。要用 pin，先在服务器上算出它（见 GUIDE 的「客户端连自签证书」），再给客户端补上：`knock.py`、`knock.ps1` 的配置加 `pin_sha256: "<pin>"`，`knock.sh` 的配置加 `PIN_SHA256=<pin>`。客户端脚本要换成本版本；带 `--pin-sha256` / `-PinSha256` 重新运行一键安装脚本，脚本和配置会一起更新。
+- 用 `-NoVerifySsl` 装过的 Windows 客户端，以同一个 `-Server` 带 `-PinSha256` 重新运行一次安装脚本，就会覆盖这台服务器的配置。
+
 ## v2.4.1 (2026-09-29)
 
 安装、升级与发布流程的修复，外加文档按当前代码全面校订。应用本身只有命令行的行为有变化：`user-add`、`group-add` 出错时（包括重名、端口已被占用）一律以非零状态退出；`upgrade` 不再把同一版本当作新版本。

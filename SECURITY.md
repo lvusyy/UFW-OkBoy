@@ -30,7 +30,7 @@
 
 - 签名只覆盖「用户名 + 时间戳」：截获的请求头在 `signature_ttl`（默认 300 秒）内可以重放，传输层依赖 HTTPS 保护。要消除这一点需要改客户端协议。
 - 同一分组的两个用户在同一个出口地址后面时共用一条 ufw 规则：删除、吊销或禁用其中一人，会连带关掉另一人的访问，直到对方下一次敲门。只影响可用性，不会多放行。
-- 客户端关闭证书校验（使用自签证书时常见）后，网络路径上的中间人可以截获请求，并在 `signature_ttl` 内重放。
+- 客户端关闭证书校验后，网络路径上的中间人可以截获请求，并在 `signature_ttl` 内重放。服务器用自签证书时，请给客户端配上服务器的公钥 pin（`pin_sha256` / `PIN_SHA256`），而不是关闭校验。
 - 经 GitHub 镜像执行一键安装脚本，等于信任该镜像。
 - `knock.sh` 用 `openssl -hmac` 计算签名时，密钥会出现在本机的进程参数里；多用户机器上请改用 `knock.py`。
 
@@ -60,6 +60,6 @@ These are documented design trade-offs, not treated as vulnerabilities:
 
 - The signature covers only the username and the timestamp: captured request headers can be replayed within `signature_ttl` (300 seconds by default); the transport relies on HTTPS. Removing this needs a client protocol change.
 - Two users of the same group behind the same egress address share one ufw rule: deleting, revoking or disabling one of them also closes access for the other until their next knock. This affects availability only; it never allows more.
-- With certificate verification turned off in a client (common with self-signed certificates), a man in the middle can capture requests and replay them within `signature_ttl`.
+- With certificate verification turned off in a client, a man in the middle can capture requests and replay them within `signature_ttl`. For a server with a self-signed certificate, give the clients its key pin (`pin_sha256` / `PIN_SHA256`) instead of turning verification off.
 - Running the one-line installer through a GitHub mirror means trusting that mirror.
 - `knock.sh` computes the signature with `openssl -hmac`, which puts the secret in the local process arguments; on multi-user machines use `knock.py` instead.

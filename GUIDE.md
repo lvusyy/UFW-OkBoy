@@ -1,6 +1,6 @@
 # UFW OkBoy 使用指南
 
-> 动态防火墙白名单管理工具 v2.4.1：让授权用户的 IP 变更不再需要手动处理。
+> 动态防火墙白名单管理工具 v2.4.2：让授权用户的 IP 变更不再需要手动处理。
 
 本指南覆盖部署、配置、网页管理台、命令行、REST API、客户端与日常运维。项目概览见 [README](README.md)，版本变化见 [CHANGELOG](CHANGELOG.md)，漏洞报告方式与已知限制见 [SECURITY](SECURITY.md)。
 
@@ -106,7 +106,7 @@ curl -fsSL https://raw.githubusercontent.com/lvusyy/UFW-OkBoy/master/deploy/quic
 v2.4.1 起，GitHub Release 上的发布包自带 Python 依赖（CPython 3.10–3.14，x86_64 与 aarch64 的 wheels），安装时不访问 PyPI：
 
 ```bash
-V=v2.4.1
+V=v2.4.2
 curl -fsSLO https://github.com/lvusyy/UFW-OkBoy/releases/download/$V/ufw-okboy-$V.tar.gz
 curl -fsSLO https://github.com/lvusyy/UFW-OkBoy/releases/download/$V/ufw-okboy-$V.tar.gz.sha256
 sha256sum -c ufw-okboy-$V.tar.gz.sha256
@@ -161,7 +161,7 @@ curl -fsSL https://raw.githubusercontent.com/lvusyy/UFW-OkBoy/master/deploy/inst
 发布包自带全部 Python 依赖（CPython 3.10–3.14，x86_64 与 aarch64），装依赖时不访问 PyPI，只需下载一个压缩包。系统软件包仍由 apt/dnf 安装，下载慢时先把系统软件源换成国内镜像。
 
 ```bash
-V=v2.4.1
+V=v2.4.2
 # 第 1 步：下载发布包与校验和。GitHub 不通时在地址前加代理前缀（如下），
 #         或在能访问 GitHub 的机器上下载后拷到服务器
 curl -fsSLO https://ghfast.top/https://github.com/lvusyy/UFW-OkBoy/releases/download/$V/ufw-okboy-$V.tar.gz
@@ -200,42 +200,54 @@ curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/lvusyy/UFW-OkBoy
 | 公网 IP 与网卡 IP 不同（云主机） | 自动探测公网 IP，写进自签证书的 CN/SAN | NAT 环境加 `--ip <公网 IP>` 更稳妥 |
 | 高位端口 | `--port 8443` 可用任意端口，脚本自动 `ufw allow` | 在云控制台的安全组里也放行该端口（UFW ≠ 安全组） |
 | 证书过期 | 自签证书有效期 10 年 | 无 |
-| 客户端连自签证书报错 | 见下节 | `verify_ssl: false`（knock.py）/ `INSECURE=1`（knock.sh） |
+| 客户端连自签证书报错 | 见下节 | 给客户端配上服务器的公钥 pin：`pin_sha256`（knock.py、knock.ps1）/ `PIN_SHA256`（knock.sh） |
 
 ### 客户端连自签证书
 
-服务端用自签证书时，命令行客户端需要跳过证书校验。敲门请求只带签名、不带密钥，所以密钥本身不会因此发出；但关闭校验后无法识别中间人，截获的签名头在有效期内可被重放（见 [SECURITY.md](SECURITY.md) 的已知限制）。有域名时优先用 Let's Encrypt 证书。
+自签证书没法靠 CA 验证，命令行客户端改为认服务器的**公钥 pin**：服务器公钥（SubjectPublicKeyInfo）的 SHA-256，用 base64 表示，与 curl `--pinnedpubkey sha256//…` 同一格式。配上之后，客户端只接受这把公钥，连到别的服务器（包括中间人）时在发出请求之前就会停下。
 
-- **网页端**：浏览器首次访问会提示安全警告。先核对证书指纹与服务器上的一致（在服务器上执行 `openssl x509 -in /etc/ssl/ufw-okboy/selfsigned.crt -noout -fingerprint -sha256`），再确认继续。之后若再次出现警告，说明证书变了，不要继续：在中间人伪造的页面里输入的密钥会被窃取。
-- **Python 客户端 `knock.py`**：在 `config.yaml` 里设 `verify_ssl: false`，或运行时加 `--no-verify-ssl`。
-- **Shell 客户端 `knock.sh`**：在配置文件里加 `INSECURE=1`，或运行时加 `--insecure` / `-k`。
-- **Linux 一键装客户端**：加 `--no-verify-ssl`，脚本会把 `verify_ssl: false` 写进配置：
+服务端安装结束时会打印 pin（`Client key pin`），之后也可以随时在服务器上重新算出：
+
+```bash
+openssl x509 -in /etc/ssl/ufw-okboy/selfsigned.crt -pubkey -noout \
+  | openssl pkey -pubin -outform der | openssl dgst -sha256 -binary | base64
+```
+
+pin 要经可信的渠道拿到（服务器上的这条命令、管理员本人），不要现连服务器去取。重新运行安装脚本会续签证书但沿用原来的私钥，pin 不变；删掉 `/etc/ssl/ufw-okboy/selfsigned.key` 再运行才会换新密钥，这时要把新 pin 发给所有客户端。
+
+- **网页端**：浏览器首次访问会提示安全警告。先核对证书指纹与服务器上的一致（在服务器上执行 `openssl x509 -in /etc/ssl/ufw-okboy/selfsigned.crt -noout -fingerprint -sha256`），再确认继续。之后若再次出现警告，说明证书变了，不要继续：在中间人伪造的页面里输入的密钥会被窃取。重新运行安装脚本续签后指纹也会变，核对新指纹即可。
+- **Python 客户端 `knock.py`**：在 `config.yaml` 里加 `pin_sha256: "<pin>"`。这时 `knock.py` 直接连接服务器，不经 `HTTPS_PROXY`。
+- **Shell 客户端 `knock.sh`**：在配置文件里加 `PIN_SHA256=<pin>`（需要 curl 7.49 及以上：更早的版本在部分 TLS 后端上会忽略 pin，`knock.sh` 会拒绝使用；TLS 后端不支持 sha256 pin 时 curl 报错退出，不会发出请求，见 curl 文档中的 CURLOPT_PINNEDPUBLICKEY）。
+- **Windows 客户端 `knock.ps1`**：在服务器的配置文件里加 `pin_sha256: "<pin>"`。
+- **Linux 一键装客户端**：加 `--pin-sha256 <pin>`，脚本会把它写进配置：
 
 ```bash
 curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/lvusyy/UFW-OkBoy/master/deploy/install-client.sh \
   | sudo bash -s -- --server https://203.0.113.10:8443 --user alice --secret YOUR_SECRET \
-               --no-verify-ssl --gh-mirror https://ghfast.top
+               --pin-sha256 <pin> --gh-mirror https://ghfast.top
 ```
 
-- **Windows 一键装客户端**：同样加 `-NoVerifySsl`；GitHub 不通时，脚本地址和 `-GhMirror` 都走代理：
+- **Windows 一键装客户端**：同样加 `-PinSha256 <pin>`；GitHub 不通时，脚本地址和 `-GhMirror` 都走代理：
 
 ```powershell
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 3072
-& ([scriptblock]::Create((irm https://ghfast.top/https://raw.githubusercontent.com/lvusyy/UFW-OkBoy/master/deploy/install-client.ps1))) -Server https://203.0.113.10:8443 -User alice -NoVerifySsl -GhMirror https://ghfast.top
+& ([scriptblock]::Create((irm https://ghfast.top/https://raw.githubusercontent.com/lvusyy/UFW-OkBoy/master/deploy/install-client.ps1))) -Server https://203.0.113.10:8443 -User alice -PinSha256 <pin> -GhMirror https://ghfast.top
 ```
 
   代理会原样转发脚本，而 `knock.ps1` 之后以 SYSTEM 身份运行，所以只用你信任的代理。更稳的是发布包：解压后运行其中的 `deploy\install-client.ps1`，它直接用包里的 `client\knock.ps1`，不再联网下载（见 [方式四](#方式四windows-客户端)）。
+
+配了 pin，`verify_ssl`、`INSECURE` 以及 `--no-verify-ssl`、`--insecure`、`-Insecure` 就不再起作用。也可以不配 pin 而直接关闭证书校验（`verify_ssl: false`、`INSECURE=1`，一键安装时 `--no-verify-ssl`、`-NoVerifySsl`），这样能连上，但无法识别中间人：敲门请求只带签名、不带密钥，密钥本身不会泄露，截获的签名头却能在有效期内被重放（见 [SECURITY.md](SECURITY.md) 的已知限制）。已经这样装好的客户端，按上面的方法补上 pin 即可。有域名时优先用 Let's Encrypt 证书，它不需要 pin。
 
 ### 升级（国内）
 
 ```bash
 # 离线升级：在解压好的新版本发布包目录里执行
-cd ufw-okboy-v2.4.1
+cd ufw-okboy-v2.4.2
 sudo bash deploy/upgrade.sh --repo-dir . -y
 
 # 在线升级：升级脚本和代码都经 GitHub 代理下载（当前可用地址见 https://ghproxy.link/）
 curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/lvusyy/UFW-OkBoy/master/deploy/upgrade.sh \
-  | sudo bash -s -- --gh-mirror https://ghfast.top --branch v2.4.1
+  | sudo bash -s -- --gh-mirror https://ghfast.top --branch v2.4.2
 ```
 
 `app.py upgrade` 只用于 git 检出的安装：查询最新版本时可以经 `config.yaml` 的 `github_mirror` 或环境变量 `UFW_OKBOY_GH_MIRROR` 走代理；更新代码用的是检出自己的 git 远端（`git pull --ff-only`），不经过这个代理。详见 [升级与版本管理](#升级与版本管理)。
@@ -933,7 +945,8 @@ curl -fsSL https://raw.githubusercontent.com/lvusyy/UFW-OkBoy/master/deploy/inst
 | `--user <用户名>` | 用户名 |
 | `--secret <密钥>` | 密钥 |
 | `--interval <秒>` | 敲门间隔，默认 30 |
-| `--no-verify-ssl` | 不校验证书（服务器用自签证书时），写入 `verify_ssl: false` |
+| `--pin-sha256 <pin>` | 服务器的公钥 pin（服务器用自签证书时），写入 `pin_sha256`，见 [客户端连自签证书](#客户端连自签证书)。为同一台服务器重新运行时保留已有的 pin，传 `''` 去掉；旧配置里的 pin 无法沿用（读不出或属于另一台服务器）时中止 |
+| `--no-verify-ssl` | 不校验证书，写入 `verify_ssl: false`（不推荐：无法识别中间人） |
 | `--gh-mirror <前缀>` | 从 GitHub 下载 `knock.py` 时使用的代理前缀（也可用环境变量 `UFW_OKBOY_GH_MIRROR`） |
 | `--yes` | 非交互：缺少必填参数时直接报错，不提示输入 |
 
@@ -950,14 +963,14 @@ scp client/knock.py client/config.example.yaml user@client-machine:~/ufw-okboy/
 cd ~/ufw-okboy
 cp config.example.yaml config.yaml
 chmod 600 config.yaml
-# 编辑 config.yaml：server_url、username、secret；服务器用自签证书时设 verify_ssl: false
+# 编辑 config.yaml：server_url、username、secret；服务器用自签证书时填 pin_sha256
 pip install pyyaml    # 可选：没有 PyYAML 时使用内置的简易解析器
 
 python3 knock.py                          # 敲门一次（默认读取当前目录的 config.yaml）
 python3 knock.py status                   # 查看登记状态
 python3 knock.py -c /path/to/config.yaml  # 指定配置文件
 python3 knock.py --watch 30               # 每 30 秒敲门一次，Ctrl-C 停止
-python3 knock.py --no-verify-ssl          # 不校验证书（自签证书）
+python3 knock.py --no-verify-ssl          # 不校验证书（不推荐；配了 pin_sha256 时不起作用）
 ```
 
 单次运行时打印服务器返回的 JSON，成功时退出码为 0，失败为 1；`--watch` 模式每次输出一行结果。
@@ -975,21 +988,21 @@ cat > ~/.config/ufw-okboy/config << 'EOF'
 SERVER_URL=https://your-server:8443
 USERNAME=alice
 SECRET=你的密钥
-# INSECURE=1
+# PIN_SHA256=服务器的公钥 pin
 EOF
 chmod 600 ~/.config/ufw-okboy/config
 
 # 使用
 ufw-okboy-knock.sh                 # 敲门
 ufw-okboy-knock.sh status          # 查看状态
-ufw-okboy-knock.sh --insecure      # 或 -k：本次不校验证书
+ufw-okboy-knock.sh --insecure      # 或 -k：本次不校验证书（配了 PIN_SHA256 时不起作用）
 
 # cron 定时（每 2 分钟）
 crontab -e
 # */2 * * * * /usr/local/bin/ufw-okboy-knock.sh >/dev/null 2>&1
 ```
 
-- 配置文件会被当作 shell 脚本 `source`，只写上面这几行。服务器用自签证书时取消 `INSECURE=1` 的注释（`INSECURE=true` 也可以）。
+- 配置文件会被当作 shell 脚本 `source`，只写上面这几行。服务器用自签证书时取消 `PIN_SHA256` 的注释并填上 pin（curl 的要求见 [客户端连自签证书](#客户端连自签证书)）；另有 `INSECURE=1`（或 `INSECURE=true`）表示不校验证书，不推荐。
 - 脚本打印服务器返回的 JSON。连不上服务器时退出码非 0；服务器返回错误时退出码仍为 0，以 JSON 中的 `ok` 为准。
 - `deploy/knock.service` 与 `deploy/knock.timer` 是对应的 systemd 示例：以 root 每 2 分钟运行一次 `/usr/local/bin/ufw-okboy-knock.sh`。
 - `knock.sh` 用 `openssl -hmac` 计算签名，密钥会出现在本机的进程参数里；多用户机器上请改用 `knock.py`。
@@ -999,7 +1012,7 @@ crontab -e
 用系统自带的 PowerShell（Windows PowerShell 5.1 或 PowerShell 7），不需要 Python。以**管理员身份**打开 PowerShell：
 
 ```powershell
-# 一键安装（推荐）：密钥会提示输入（不回显）；自签证书的服务器加 -NoVerifySsl
+# 一键安装（推荐）：密钥会提示输入（不回显）；自签证书的服务器加 -PinSha256 <服务器公钥 pin>
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 3072
 & ([scriptblock]::Create((irm https://raw.githubusercontent.com/lvusyy/UFW-OkBoy/master/deploy/install-client.ps1))) -Server https://your-server:8443 -User alice
 
@@ -1018,7 +1031,8 @@ powershell -ExecutionPolicy Bypass -File .\deploy\install-client.ps1 -Server htt
 | `-User <用户名>` | 用户名 |
 | `-Secret <密钥>` | 密钥；省略时提示输入，不回显，也不会留在 PowerShell 历史里 |
 | `-IntervalMinutes <分钟>` | 敲门间隔，1–1440，默认 1。计划任务只有一个，每次运行安装脚本都按本次的值重新注册 |
-| `-NoVerifySsl` | 不校验证书（服务器用自签证书时），写入 `verify_ssl: false` |
+| `-PinSha256 <pin>` | 服务器的公钥 pin（服务器用自签证书时），写入 `pin_sha256`，见 [客户端连自签证书](#客户端连自签证书)。为同一台服务器重新运行时保留已有的 pin，传 `''` 去掉；旧配置里的 pin 读不出时中止 |
+| `-NoVerifySsl` | 不校验证书，写入 `verify_ssl: false`（不推荐：无法识别中间人） |
 | `-GhMirror <前缀>` | 从 GitHub 下载 `knock.ps1` 时使用的代理前缀（也可用环境变量 `UFW_OKBOY_GH_MIRROR`） |
 | `-Uninstall` | 删除计划任务和整个安装目录 |
 
@@ -1044,15 +1058,15 @@ powershell -ExecutionPolicy Bypass -File 'C:\Program Files\UFW-OkBoy\knock.ps1' 
 powershell -ExecutionPolicy Bypass -File .\client\knock.ps1 -Config .\config.yaml
 ```
 
-`knock.ps1` 的第一个位置参数为 `knock`（默认）或 `status`；`-Config` 指定配置文件或目录（目录时使用其中全部 `*.yaml`，默认是脚本旁边的 `servers` 目录）；`-Insecure` 不校验证书。任一服务器失败时退出码为 1。
+`knock.ps1` 的第一个位置参数为 `knock`（默认）或 `status`；`-Config` 指定配置文件或目录（目录时使用其中全部 `*.yaml`，默认是脚本旁边的 `servers` 目录）；`-Insecure` 不校验证书（配置里有 `pin_sha256` 时不起作用）。任一服务器失败时退出码为 1。
 
 ### 自签证书注意事项
 
-使用自签证书部署时，客户端需要跳过证书校验（影响见 [客户端连自签证书](#客户端连自签证书)）：
+使用自签证书部署时，客户端用服务器的公钥 pin 认服务器（pin 从哪里来、为什么不直接关闭校验，见 [客户端连自签证书](#客户端连自签证书)）：
 
-- **Python 客户端**：`config.yaml` 中设 `verify_ssl: false`，或运行时加 `--no-verify-ssl`
-- **Shell 客户端**：配置文件中加 `INSECURE=1`，或运行时加 `--insecure` / `-k`
-- **Windows 客户端**：一键安装时加 `-NoVerifySsl`（写入 `verify_ssl: false`），或运行 `knock.ps1` 时加 `-Insecure`
+- **Python 客户端**：`config.yaml` 中加 `pin_sha256: "<pin>"`
+- **Shell 客户端**：配置文件中加 `PIN_SHA256=<pin>`
+- **Windows 客户端**：一键安装时加 `-PinSha256 <pin>`（写入 `pin_sha256`）
 - **网页客户端**：浏览器显示安全警告；核对证书指纹与服务器上的一致后再继续（见[客户端连自签证书](#客户端连自签证书)），证书变了就不要继续
 
 ---
@@ -1353,10 +1367,10 @@ curl -fsSL https://raw.githubusercontent.com/lvusyy/UFW-OkBoy/master/deploy/upgr
 
 # 升级到指定版本（分支或发布标签）
 curl -fsSL https://raw.githubusercontent.com/lvusyy/UFW-OkBoy/master/deploy/upgrade.sh \
-  | sudo bash -s -- --branch v2.4.1
+  | sudo bash -s -- --branch v2.4.2
 
 # 用解压好的发布包离线升级
-cd ufw-okboy-v2.4.1
+cd ufw-okboy-v2.4.2
 sudo bash deploy/upgrade.sh --repo-dir . -y
 ```
 
@@ -1389,7 +1403,7 @@ sudo bash deploy/upgrade.sh --repo-dir . -y
 
 ```bash
 cd /opt/ufw-okboy/server
-sudo ../venv/bin/python app.py -c config.yaml --version    # 输出如：UFW OkBoy 2.4.1
+sudo ../venv/bin/python app.py -c config.yaml --version    # 输出如：UFW OkBoy 2.4.2
 cat /opt/ufw-okboy/VERSION
 ```
 
@@ -1435,7 +1449,7 @@ cd /opt/ufw-okboy/server
 sudo ../venv/bin/python app.py -c config.yaml backup
 cd /opt/ufw-okboy
 sudo git fetch --tags
-sudo git checkout v2.4.1                              # 或在分支上执行 sudo git pull --ff-only
+sudo git checkout v2.4.2                              # 或在分支上执行 sudo git pull --ff-only
 sudo venv/bin/pip install -r server/requirements.txt
 sudo systemctl restart ufw-okboy                      # 数据库迁移在启动时执行
 ```
@@ -1471,7 +1485,7 @@ v1.x 用 `config.yaml` 里的 `users:` 和 `state.json` 保存用户与状态。
 
 ```bash
 bash deploy/build-release.sh                 # 版本号取自 VERSION，输出到 dist/
-bash deploy/build-release.sh v2.4.1 out      # 指定版本号和输出目录
+bash deploy/build-release.sh v2.4.2 out      # 指定版本号和输出目录
 ```
 
 产物为 `ufw-okboy-v<版本>.tar.gz`（解压为同名目录）和 `.sha256` 校验和文件。包内有服务端、客户端、部署脚本（含 `install.sh`）、Nginx 示例和文档，以及 CPython 3.10–3.14（x86_64、aarch64）的依赖 wheels（`vendor/`，下载 wheels 需要 pip 和网络）。某个组合的 wheels 下载失败时只警告，设置 `REQUIRE_WHEELS=1` 则构建失败。GitHub Release 由发布流程用同一个脚本构建，通常不需要自己打包。
@@ -1512,7 +1526,7 @@ curl -X PATCH -H "Authorization: $AUTH" -H "Content-Type: application/json" \
 
 ### 自签证书如何使用？
 
-部署时加 `--self-signed`（不带 `--domain` 时本就是自签）。客户端需要跳过证书校验，做法见 [自签证书注意事项](#自签证书注意事项)。国内自签 + IP + 高位端口的完整做法见 [国内部署专题](#国内部署专题)。
+部署时加 `--self-signed`（不带 `--domain` 时本就是自签）。客户端用服务器的公钥 pin 认服务器，做法见 [自签证书注意事项](#自签证书注意事项)。国内自签 + IP + 高位端口的完整做法见 [国内部署专题](#国内部署专题)。
 
 ### 安装时卡在下载 / 下载失败？（国内常见）
 
@@ -1522,7 +1536,7 @@ curl -X PATCH -H "Authorization: $AUTH" -H "Content-Type: application/json" \
 
 ### 网页能打开，但客户端敲门失败？
 
-- 多半是**自签证书校验**没关：`knock.py` 在 `config.yaml` 里设 `verify_ssl: false`，`knock.sh` 在配置里加 `INSECURE=1`。
+- 多半是**自签证书**没配好：给客户端配上服务器的公钥 pin（`knock.py`、`knock.ps1` 的 `pin_sha256`，`knock.sh` 的 `PIN_SHA256`），见 [客户端连自签证书](#客户端连自签证书)。`knock.py`、`knock.ps1` 报 pin 不符时，信息里会带上这次连接对方出示的 pin（`knock.sh` 只有 curl 的错误）：它可能来自中间人，要以服务器上算出的为准，不要照抄。
 - 返回 `Signature expired`：客户端时钟与服务器相差超过 `signature_ttl`（默认 300 秒），请校准时间（例如启用 NTP）。
 - 手动验证：`python3 knock.py -c config.yaml status`，看返回的具体错误。
 
