@@ -174,7 +174,8 @@ harden_unit() {
     local file="$dir/50-umask.conf"
     systemctl cat "$unit" >/dev/null 2>&1 || return 0
     [[ "$(systemctl show -p UMask --value "$unit" 2>/dev/null)" == "0077" ]] && return 0
-    if systemctl cat "$unit" 2>/dev/null | grep -q '^[[:space:]]*UMask='; then
+    # (grep reads to the end: with -q an early exit could fail the pipeline)
+    if systemctl cat "$unit" 2>/dev/null | grep -E '^[[:space:]]*UMask[[:space:]]*=' >/dev/null; then
         warn "$unit sets its own UMask ($(systemctl show -p UMask --value "$unit" 2>/dev/null)); left as it is."
         return 0
     fi
@@ -194,6 +195,8 @@ harden_unit() {
         warn "$unit: its UMask is set in another drop-in; left as configured (systemctl cat $unit)"
     fi
 }
+# Read what systemd will run: the unit files on disk, loaded.
+systemctl daemon-reload 2>/dev/null || true
 harden_unit "$SERVICE.service"
 harden_unit "$SERVICE-cleanup.service"
 
