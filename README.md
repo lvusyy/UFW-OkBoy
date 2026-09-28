@@ -68,7 +68,7 @@ curl -fsSL https://raw.githubusercontent.com/lvusyy/UFW-OkBoy/master/deploy/quic
 或者用发布包安装指定版本（包内带 Python 依赖，不需要访问 PyPI）：
 
 ```bash
-V=v2.4.1
+V=v2.4.2
 curl -fsSLO https://github.com/lvusyy/UFW-OkBoy/releases/download/$V/ufw-okboy-$V.tar.gz
 curl -fsSLO https://github.com/lvusyy/UFW-OkBoy/releases/download/$V/ufw-okboy-$V.tar.gz.sha256
 sha256sum -c ufw-okboy-$V.tar.gz.sha256
@@ -112,10 +112,10 @@ Linux（安装 `knock.py` 和 systemd 定时器，默认每 30 秒敲一次）�
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/lvusyy/UFW-OkBoy/master/deploy/install-client.sh \
-  | sudo bash -s -- --server https://your-server:8443 --user alice --secret <密钥> --no-verify-ssl
+  | sudo bash -s -- --server https://your-server:8443 --user alice --secret <密钥> --pin-sha256 <服务器公钥 pin>
 ```
 
-Windows（以管理员身份打开 PowerShell；密钥会提示输入且不回显；服务器用自签证书时末尾加 `-NoVerifySsl`）：
+Windows（以管理员身份打开 PowerShell；密钥会提示输入且不回显；服务器用自签证书时末尾加 `-PinSha256 <服务器公钥 pin>`）：
 
 ```powershell
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 3072
@@ -124,13 +124,13 @@ Windows（以管理员身份打开 PowerShell；密钥会提示输入且不回�
 
 计划任务以 SYSTEM 身份每分钟敲一次，开机即生效。要敲多台服务器，换一个 `-Server` 再运行一次；卸载加 `-Uninstall`。
 
-`--no-verify-ssl`、`-NoVerifySsl` 关闭 TLS 证书校验，用于自签证书。关闭之后，网络路径上的中间人可以截获敲门请求，在签名有效期内（默认 300 秒）重放它，把他自己的地址加进白名单。在不可信的网络上请使用受信任的证书，例如用 `--domain` 申请的 Let's Encrypt 证书。
+服务器用自签证书（不带 `--domain` 安装时的默认做法）时，客户端靠**公钥 pin** 认服务器：服务端安装结束时会打印它（`Client key pin`），也可以随时在服务器上重新算出（见 [客户端连自签证书](GUIDE.md#客户端连自签证书)）。上面的 `--pin-sha256`、`-PinSha256` 把它写进配置，客户端之后只接受这把公钥，连到别的服务器（包括中间人）时在发出请求之前就会停下。服务器有 CA 签发的证书（例如用 `--domain` 申请的 Let's Encrypt 证书）时不需要 pin。`--no-verify-ssl`、`-NoVerifySsl` 则是直接关闭证书校验，不推荐：网络路径上的中间人可以截获敲门请求，在签名有效期内（默认 300 秒）重放它，把他自己的地址加进白名单。
 
 ## 升级
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/lvusyy/UFW-OkBoy/master/deploy/upgrade.sh \
-  | sudo bash -s -- --branch v2.4.1
+  | sudo bash -s -- --branch v2.4.2
 ```
 
 脚本依次备份数据库、更新代码和依赖、重启服务并做健康检查，失败时自动退回旧代码。配置、证书和数据库都会保留。也可以在解压好的发布包里离线升级：`sudo bash deploy/upgrade.sh --repo-dir . -y`。如果 `/opt/ufw-okboy` 是 git 检出的仓库，请按 [GUIDE 的升级章节](GUIDE.md#升级与版本管理) 操作。升级后浏览器按 Ctrl+Shift+R 强制刷新。

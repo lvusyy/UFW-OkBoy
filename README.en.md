@@ -68,7 +68,7 @@ With a domain name that resolves to the server, replace `--self-signed` with `--
 Or install a specific version from its release package (the Python dependencies are included, no PyPI access needed):
 
 ```bash
-V=v2.4.1
+V=v2.4.2
 curl -fsSLO https://github.com/lvusyy/UFW-OkBoy/releases/download/$V/ufw-okboy-$V.tar.gz
 curl -fsSLO https://github.com/lvusyy/UFW-OkBoy/releases/download/$V/ufw-okboy-$V.tar.gz.sha256
 sha256sum -c ufw-okboy-$V.tar.gz.sha256
@@ -112,10 +112,10 @@ Linux (installs `knock.py` and a systemd timer; knocks every 30 seconds by defau
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/lvusyy/UFW-OkBoy/master/deploy/install-client.sh \
-  | sudo bash -s -- --server https://your-server:8443 --user alice --secret <secret> --no-verify-ssl
+  | sudo bash -s -- --server https://your-server:8443 --user alice --secret <secret> --pin-sha256 <server key pin>
 ```
 
-Windows (in PowerShell run as Administrator; the secret is prompted for and not echoed; add `-NoVerifySsl` for a self-signed server):
+Windows (in PowerShell run as Administrator; the secret is prompted for and not echoed; for a self-signed server add `-PinSha256 <server key pin>`):
 
 ```powershell
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 3072
@@ -124,13 +124,13 @@ Windows (in PowerShell run as Administrator; the secret is prompted for and not 
 
 The scheduled task knocks every minute as SYSTEM and starts at boot. For more servers, run it again with another `-Server`; add `-Uninstall` to remove it.
 
-`--no-verify-ssl` and `-NoVerifySsl` turn off TLS certificate verification, for self-signed certificates. With verification off, a man in the middle can capture a knock and replay it while the signature is valid (300 seconds by default), getting their own address allowlisted. On networks you don't trust, use a trusted certificate, such as the Let's Encrypt one `--domain` obtains.
+For a server with a self-signed certificate (the default when installing without `--domain`), clients recognise the server by its **key pin**: the server install prints it at the end (`Client key pin`), and it can be computed again on the server at any time (see [the guide](GUIDE.md#客户端连自签证书), in Chinese). `--pin-sha256` and `-PinSha256` above write it into the config; the client then accepts only that key and stops before sending anything to another server, a man in the middle included. A server with a CA-issued certificate (such as the Let's Encrypt one `--domain` obtains) needs no pin. `--no-verify-ssl` and `-NoVerifySsl` turn certificate verification off instead, which is not recommended: a man in the middle can capture a knock and replay it while the signature is valid (300 seconds by default), getting their own address allowlisted.
 
 ## Upgrading
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/lvusyy/UFW-OkBoy/master/deploy/upgrade.sh \
-  | sudo bash -s -- --branch v2.4.1
+  | sudo bash -s -- --branch v2.4.2
 ```
 
 The script backs up the database, updates the code and dependencies, restarts the service and health-checks it, and moves back to the previous code if the check fails. The configuration, certificates and database are kept. You can also upgrade offline from an unpacked release package: `sudo bash deploy/upgrade.sh --repo-dir . -y`. If `/opt/ufw-okboy` is a git checkout, follow [the upgrade section of the guide](GUIDE.md#升级与版本管理) instead. After upgrading, reload the page with Ctrl+Shift+R.

@@ -7,7 +7,7 @@
 # Usage:
 #   bash deploy/build-release.sh [version] [output_dir]
 #   bash deploy/build-release.sh              # version from VERSION, output in dist/
-#   bash deploy/build-release.sh v2.4.1 out
+#   bash deploy/build-release.sh v2.4.2 out
 #
 # REQUIRE_WHEELS=1 turns a missing wheel set into an error (the release
 # workflow sets it, so a published package always installs offline).
