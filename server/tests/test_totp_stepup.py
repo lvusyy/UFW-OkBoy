@@ -116,10 +116,13 @@ class TestTOTPStepUp(unittest.TestCase):
         ).get_json()
         secret = r["secret"]
         self.assertTrue(r["otpauth_uri"].startswith("otpauth://totp/"))
+        # Activation consumes its code (RFC 6238 §5.2): confirm with the previous
+        # step's code (still inside the ±1 window), leaving the current one for
+        # the step-ups the tests perform next.
         act = self.client.post(
             "/api/admin/totp/activate",
             headers={"Authorization": self._admin_header()},
-            json={"totp_code": auth.totp_now(secret)},
+            json={"totp_code": auth.totp_now(secret, t=int(time.time()) - 30)},
         )
         self.assertEqual(act.status_code, 200)
         self.assertTrue(act.get_json()["totp_enabled"])

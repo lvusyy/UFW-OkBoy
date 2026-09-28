@@ -35,6 +35,9 @@ ProtectSystem=full
 ReadWritePaths=/var/lib/ufw-okboy /var/log/ufw-okboy /run /etc/ufw /lib/ufw
 ProtectHome=yes
 PrivateTmp=yes
+# Files it creates (database, backups, logs) are owner-only: the database holds
+# plaintext HMAC secrets and TOTP seeds.
+UMask=0077
 
 [Install]
 WantedBy=multi-user.target

@@ -6,14 +6,23 @@ user_group_membership, audit_log, operation_log, failed_attempts) plus
 CRUD, logging helpers, state queries, and one-time JSON state migration.
 """
 
+import contextlib
+import glob
 import hashlib
 import json
 import logging
+import os
 import secrets
 import sqlite3
+import sys
 import threading
 import time
 from pathlib import Path
+
+try:
+    import fcntl
+except ImportError:  # not POSIX: no claims on the database (see _claim)
+    fcntl = None
 
 logger = logging.getLogger("ufw-okboy.db")
 
@@ -21,6 +30,117 @@ logger = logging.getLogger("ufw-okboy.db")
 # "CHANGE_ME_run_python_app_py_gen_secret_alice"). Anyone can read them in
 # the repo, so they must never become a working credential.
 PLACEHOLDER_SECRET_PREFIX = "CHANGE_ME"
+
+
+def _claim_path(db_path: str) -> str:
+    return os.path.join(os.path.dirname(os.path.abspath(db_path)), "db.lock")
+
+
+class DatabaseInUse(RuntimeError):
+    """Another process holds the database (see exclusive_claim)."""
+
+
+class _Claim:
+    """A shared lock on db.lock, and the connections opened under it. The lock
+    goes only after each of them is closed — by release(), or by this object's
+    finalizer for a Database dropped without close(): a connection closing
+    after it could checkpoint its -wal into a database a restore has just
+    replaced. (The connections' own finalization order, in a reference cycle
+    as they are, is not to be relied on.)"""
+
+    _fd = None
+
+    def __init__(self, path: str) -> None:
+        self._mu = threading.Lock()
+        self._conns: list[tuple[threading.Thread, sqlite3.Connection]] = []
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BaseException:
+            os.close(fd)
+            raise
+        self._fd = fd
+
+    def track(self, conn: sqlite3.Connection) -> None:
+        """Hold *conn*, the calling thread's, until release(); close those of
+        threads that have ended (a threaded server starts one per request)."""
+        with self._mu:
+            live = []
+            for thread, c in self._conns:
+                if thread.is_alive():
+                    live.append((thread, c))
+                else:
+                    c.close()
+            live.append((threading.current_thread(), conn))
+            self._conns = live
+
+    def release(self) -> None:
+        with self._mu:
+            for _, conn in self._conns:
+                conn.close()
+            self._conns = []
+            if self._fd is not None:
+                os.close(self._fd)
+                self._fd = None
+
+    __del__ = release
+
+
+def _processes_with_open(db_path: str) -> list[int]:
+    """Other processes with the database's files open, from Linux's /proc.
+    What cannot be looked at counts as open (DatabaseInUse): /proc on Linux,
+    or, for root, a process's descriptors. Not root, another user's process
+    is passed over — only root could open the owner-only files. Elsewhere
+    than Linux (no ufw there) there is nothing to look at."""
+    targets = {os.path.realpath(db_path + side) for side in ("", "-wal", "-shm")}
+    try:
+        entries = os.listdir("/proc")
+    except OSError as exc:
+        if sys.platform.startswith("linux"):
+            raise DatabaseInUse(f"cannot tell which processes have {db_path} open: {exc}") from None
+        return []
+    pids = []
+    for entry in entries:
+        if not entry.isdigit() or int(entry) == os.getpid():
+            continue
+        try:
+            fds = os.listdir(f"/proc/{entry}/fd")
+        except FileNotFoundError:
+            continue  # gone
+        except PermissionError:
+            if os.geteuid() == 0:
+                raise DatabaseInUse(f"cannot see what process {entry} has open") from None
+            continue
+        for fd in fds:
+            try:
+                if os.readlink(f"/proc/{entry}/fd/{fd}") in targets:
+                    pids.append(int(entry))
+                    break
+            except OSError:
+                continue
+    return pids
+
+
+@contextlib.contextmanager
+def exclusive_claim(db_path: str):
+    """Hold the database exclusively for the block: no other process has it
+    open, and none can open it meanwhile (each takes a shared claim to, see
+    Database). A claim cannot vouch for SQLite's own handles — a statement
+    still held keeps one open past close() — so the files' open descriptors
+    are looked for too, once the claim is exclusive. Raises DatabaseInUse at
+    once when the database is open elsewhere."""
+    db_path = os.path.realpath(db_path)  # its claim and sidecars are beside the file itself
+    Path(db_path).parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with os.fdopen(os.open(_claim_path(db_path), os.O_RDWR | os.O_CREAT, 0o600), "r+") as f:
+        if fcntl is not None:
+            try:
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise DatabaseInUse(f"{db_path} is open in another process") from None
+        pids = _processes_with_open(db_path)
+        if pids:
+            raise DatabaseInUse(f"{db_path} is open in process(es) {pids}")
+        yield
 
 
 def is_placeholder_secret(secret) -> bool:
@@ -49,6 +169,7 @@ SCHEMA: dict[str, str] = {
             totp_secret TEXT,
             totp_enabled INTEGER NOT NULL DEFAULT 0,
             totp_last_counter INTEGER NOT NULL DEFAULT 0,
+            totp_pending_secret TEXT,
             created_at TEXT NOT NULL DEFAULT (datetime('now'))
         )
     """,
@@ -115,6 +236,7 @@ MIGRATIONS: list[tuple[int, str]] = [
     (3, "add totp_last_counter to users (TOTP replay protection)"),
     (4, "add UNIQUE(port, proto) index on groups when data permits"),
     (5, "rotate public CHANGE_ME* sample secrets seeded from the example config"),
+    (6, "add totp_pending_secret to users (re-enrollment keeps the active TOTP until confirmed)"),
 ]
 
 CURRENT_SCHEMA_VERSION: int = MIGRATIONS[-1][0]
@@ -131,23 +253,73 @@ class Database:
     """
 
     def __init__(self, db_path: str) -> None:
-        self.db_path = db_path
-        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+        # The file itself, not a link to it: SQLite puts the -wal beside the
+        # file, and the claim (see _claim_shared) must be the same for every
+        # path leading there.
+        self.db_path = os.path.realpath(db_path)
+        self.fresh = False  # set by init(): the database was created just now
+        Path(db_path).parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self._lifecycle = threading.Lock()  # connecting vs close()
+        self._claim = self._claim_shared()
         # One connection per thread. The constructing thread's connection is
         # opened eagerly so init()/migrations/CLI/tests run without surprises.
         self._local = threading.local()
         self._connect()
+        self._restrict_files()
+
+    def _claim_shared(self):
+        """A shared lock on ``db.lock`` beside the database, held until this
+        object's connections are closed (see _Claim): a restore takes it
+        exclusively, so it never replaces the database under a process that
+        has it open — whether or not close() was called. While a restore runs,
+        opening fails at once."""
+        if fcntl is None:
+            return None
+        try:
+            return _Claim(_claim_path(self.db_path))
+        except BlockingIOError:
+            raise DatabaseInUse(f"{self.db_path} is being restored; retry when that is done") from None
+
+    def _restrict_files(self) -> None:
+        """Make the database files owner-only: they hold plaintext HMAC secrets
+        and TOTP seeds (older versions left them 0644). SQLite gives the -wal and
+        -shm it creates later the database file's mode. Some filesystems refuse
+        chmod; that is tolerated only while nobody else can read the file.
+        Snapshots next to the database (``.pre-upgrade-*``, ``.pre-restore*``)
+        hold the same secrets, and older versions left them readable too."""
+        for path in (self.db_path, self.db_path + "-wal", self.db_path + "-shm",
+                     *glob.glob(glob.escape(self.db_path) + ".pre-*")):
+            try:
+                os.chmod(path, 0o600)
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                try:
+                    exposed = os.stat(path).st_mode & 0o077
+                except OSError:
+                    exposed = True
+                if exposed:
+                    raise RuntimeError(
+                        f"{path} holds plaintext secrets and is readable by other "
+                        f"users, and chmod 600 failed: {exc}") from exc
+                logger.warning("could not chmod %s (%s); it is owner-only already", path, exc)
 
     def _connect(self) -> sqlite3.Connection:
-        """Open and configure a SQLite connection for the calling thread."""
-        conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys = ON")
-        conn.execute("PRAGMA journal_mode = WAL")
-        # Wait (up to 5s) for a competing writer instead of erroring out with
-        # SQLITE_BUSY: under WAL multiple connections can attempt writes at once.
-        conn.execute("PRAGMA busy_timeout = 5000")
-        self._local.conn = conn
+        """Open and configure a SQLite connection for the calling thread —
+        under a claim: after close(), a new one is taken."""
+        with self._lifecycle:
+            if self._claim is None:
+                self._claim = self._claim_shared()
+            conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            if self._claim is not None:
+                self._claim.track(conn)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA foreign_keys = ON")
+            conn.execute("PRAGMA journal_mode = WAL")
+            # Wait (up to 5s) for a competing writer instead of erroring out
+            # with SQLITE_BUSY: under WAL several connections can write at once.
+            conn.execute("PRAGMA busy_timeout = 5000")
+            self._local.conn = conn
         return conn
 
     @property
@@ -164,6 +336,7 @@ class Database:
 
     def init(self) -> None:
         """Create all tables if they do not already exist, then run migrations."""
+        self.fresh = not self._table_exists("users")
         for name, ddl in SCHEMA.items():
             if self._table_exists(name):
                 continue
@@ -258,6 +431,8 @@ class Database:
                 self._migration_004_groups_port_proto_unique()
             elif version == 5:
                 self._migration_005_rotate_placeholder_secrets()
+            elif version == 6:
+                self._migration_006_totp_pending()
             self._record_migration(version)
             applied.append(version)
         if applied:
@@ -349,8 +524,23 @@ class Database:
                 "closes its ports and prints a new secret.", ", ".join(rotated),
             )
 
+    def _migration_006_totp_pending(self) -> None:
+        """v6: a separate column for an enrollment awaiting confirmation, so a
+        re-enrollment no longer switches the active TOTP off until the new
+        authenticator is confirmed (idempotent ALTER)."""
+        cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(users)")}
+        if "totp_pending_secret" not in cols:
+            self.conn.execute("ALTER TABLE users ADD COLUMN totp_pending_secret TEXT")
+            self.conn.commit()
+
     def close(self) -> None:
-        """Close the calling thread's connection (if one was opened)."""
+        """Close this object's connections — every thread's — and let go of its
+        claim on the database (see _claim_shared); without one (not POSIX),
+        the calling thread's connection."""
+        with self._lifecycle:
+            if self._claim is not None:
+                self._claim.release()
+                self._claim = None
         conn = getattr(self._local, "conn", None)
         if conn is not None:
             conn.close()
@@ -362,11 +552,13 @@ class Database:
 
     def create_user(self, username: str, secret: str, is_admin: bool = False) -> int:
         """Insert a new user and return its id."""
-        cur = self.conn.execute(
-            "INSERT INTO users (username, secret, is_admin) VALUES (?, ?, ?)",
-            (username, secret, 1 if is_admin else 0),
-        )
-        self.conn.commit()
+        # A failed insert (a duplicate) must roll back: its open transaction
+        # would keep the write lock from every other process.
+        with self.conn:
+            cur = self.conn.execute(
+                "INSERT INTO users (username, secret, is_admin) VALUES (?, ?, ?)",
+                (username, secret, 1 if is_admin else 0),
+            )
         return cur.lastrowid
 
     def get_user_by_username(self, username: str) -> sqlite3.Row | None:
@@ -425,6 +617,22 @@ class Database:
         )
         self.conn.commit()
 
+    def set_totp_pending(self, user_id: int, secret: str) -> None:
+        """Store a TOTP secret awaiting confirmation (enrollment or
+        re-enrollment). An active TOTP stays in force until it is confirmed."""
+        self.conn.execute(
+            "UPDATE users SET totp_pending_secret=? WHERE id=?", (secret, user_id),
+        )
+        self.conn.commit()
+
+    def activate_totp(self, user_id: int, secret: str) -> None:
+        """Make *secret* (just confirmed) the active TOTP and turn TOTP on."""
+        self.conn.execute(
+            "UPDATE users SET totp_secret=?, totp_pending_secret=NULL, totp_enabled=1 "
+            "WHERE id=?", (secret, user_id),
+        )
+        self.conn.commit()
+
     def enable_totp(self, user_id: int) -> None:
         """Activate TOTP for a user (after the enrollment code is verified)."""
         self.conn.execute(
@@ -435,7 +643,8 @@ class Database:
     def disable_totp(self, user_id: int) -> None:
         """Remove TOTP enrollment for a user (clears the secret and the flag)."""
         self.conn.execute(
-            "UPDATE users SET totp_secret=NULL, totp_enabled=0 WHERE id=?", (user_id,),
+            "UPDATE users SET totp_secret=NULL, totp_pending_secret=NULL, totp_enabled=0 "
+            "WHERE id=?", (user_id,),
         )
         self.conn.commit()
 
@@ -461,11 +670,11 @@ class Database:
 
     def create_group(self, name: str, port: int, proto: str = "tcp") -> int:
         """Insert a new group and return its id."""
-        cur = self.conn.execute(
-            "INSERT INTO groups (name, port, proto) VALUES (?, ?, ?)",
-            (name, port, proto),
-        )
-        self.conn.commit()
+        with self.conn:  # rolls a failed insert back (see create_user)
+            cur = self.conn.execute(
+                "INSERT INTO groups (name, port, proto) VALUES (?, ?, ?)",
+                (name, port, proto),
+            )
         return cur.lastrowid
 
     def get_group(self, group_id: int) -> sqlite3.Row | None:
@@ -641,6 +850,18 @@ class Database:
             (username, ip, reason),
         )
         self.conn.commit()
+
+    def count_recent_user_failures(self, username: str, reason: str,
+                                   window_seconds: int) -> int:
+        """Count *username*'s failed attempts of one kind (*reason*) within the
+        window, from any IP — a per-account cap an attacker cannot spread across
+        addresses."""
+        row = self.conn.execute(
+            "SELECT COUNT(*) AS c FROM failed_attempts "
+            "WHERE username=? AND reason=? AND created_at >= datetime('now', ?)",
+            (username, reason, f"-{window_seconds} seconds"),
+        ).fetchone()
+        return row["c"]
 
     def count_recent_failed_attempts(self, ip: str | None,
                                      window_seconds: int) -> int:
@@ -828,7 +1049,10 @@ class Database:
         still in the -wal not yet checkpointed into the main file). The backup
         target is a self-contained, checkpointed database.
         """
-        Path(dest_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(dest_path).parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        # Owner-only from the first byte: the snapshot holds the same secrets.
+        os.close(os.open(dest_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600))
+        os.chmod(dest_path, 0o600)
         dest = sqlite3.connect(dest_path)
         try:
             with dest:

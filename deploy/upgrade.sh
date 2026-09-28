@@ -65,8 +65,12 @@ pip_install() {
         fi
     fi
     if [[ -n "$index" ]]; then
-        local host; host="$(echo "$index" | awk -F/ '{print $3}')"
-        "$pip" install -i "$index" --trusted-host "$host" "$@"
+        # --trusted-host also switches certificate checks off for an https
+        # index (a man in the middle could then serve packages that run as
+        # root): pass it only for a plain-http index chosen with --mirror.
+        local trust=()
+        [[ "$index" == http://* ]] && trust=(--trusted-host "$(echo "$index" | awk -F/ '{print $3}')")
+        "$pip" install -i "$index" ${trust[@]+"${trust[@]}"} "$@"
     else
         "$pip" install "$@"
     fi
@@ -87,13 +91,19 @@ info "Current version: ${OLD_VER:-unknown}   dir: $APP_DIR   service: $SERVICE"
 
 # 1) Back up the database first (safety net). Capture the path so the rollback
 #    hint can name the exact file to restore.
+#    The installed (old) code writes it: under umask 077, else versions before
+#    2.4.0 leave it readable to every local user, secrets and all.
 DB_BAK=""
 if [[ -f "$CONF" ]]; then
     info "Backing up the database..."
-    DB_BAK="$("$PY" "$APP_DIR/server/app.py" -c "$CONF" backup 2>/dev/null \
+    DB_BAK="$(umask 077; "$PY" "$APP_DIR/server/app.py" -c "$CONF" backup 2>/dev/null \
         | awk '/Backup written:/{print $NF}')" \
         || warn "DB backup step skipped/failed; make sure you have a backup."
     [[ -n "$DB_BAK" ]] && info "DB backup: $DB_BAK"
+    # Earlier backups, the config (legacy seed users carry secrets) and the
+    # code snapshots' copies of it: owner-only too.
+    [[ -n "$DB_BAK" ]] && chmod 600 "$(dirname "$DB_BAK")"/ufw-okboy-*.db 2>/dev/null || true
+    chmod 600 "$CONF" "$APP_DIR"/server.bak-*/config.yaml 2>/dev/null || true
 fi
 
 # 2) Fetch the latest code (unless a local --repo-dir was given).

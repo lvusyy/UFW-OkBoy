@@ -41,12 +41,13 @@ def build_auth_header(username: str, secret: str, ts: int | None = None) -> str:
 
 
 class StubUFWManager(UFWManager):
-    """UFWManager subclass that records add_rule/remove_rule calls without running ufw."""
+    """UFWManager subclass that records add/remove/purge calls without running ufw."""
 
     def __init__(self, db: Database) -> None:
         super().__init__(rule_prefix="ufw-okboy", db=db)
         self.add_calls: list[dict] = []
         self.remove_calls: list[dict] = []
+        self.purge_calls: list[dict] = []
 
     def add_rule(self, ip: str, port: int, username: str, proto: str = "tcp",
                  group: str | None = None) -> None:
@@ -61,6 +62,16 @@ class StubUFWManager(UFWManager):
             "ip": ip, "port": port, "username": username,
             "proto": proto, "group": group,
         })
+
+    def purge_rules(self, username: str | None = None, group: str | None = None,
+                    port: int | None = None, proto: str | None = None) -> int:
+        self.purge_calls.append({
+            "username": username, "group": group, "port": port, "proto": proto,
+        })
+        return 0
+
+    def list_rules_by_comment(self, comment_prefix: str, strict: bool = False) -> list[dict]:
+        return []  # no ufw here: nothing listed
 
 
 class CommentCaptureUFW(UFWManager):
@@ -216,11 +227,10 @@ class TestIPLifecycle(unittest.TestCase):
         self.assertTrue(body["ok"])
         self.assertFalse(body["enabled"])
 
-        self.assertEqual(len(self.ufw.remove_calls), 1)
-        rm = self.ufw.remove_calls[0]
-        self.assertEqual(rm["ip"], "203.0.113.40")
-        self.assertEqual(rm["port"], 8080)
-        self.assertEqual(rm["group"], "web")
+        # Every rule of the membership, whatever its address.
+        self.assertEqual(self.ufw.purge_calls, [
+            {"username": "alice", "group": "web", "port": 8080, "proto": "tcp"},
+        ])
         self.assertEqual(len(self.ufw.add_calls), 0)
 
     def test_toggle_membership_on_adds_rules(self) -> None:
@@ -234,11 +244,13 @@ class TestIPLifecycle(unittest.TestCase):
         self.assertTrue(body["ok"])
         self.assertTrue(body["enabled"])
 
-        self.assertEqual(len(self.ufw.add_calls), 1)
-        add = self.ufw.add_calls[0]
+        # Reconcile covers ALL enabled groups — the stub lists no existing
+        # rules, so web is re-asserted too; the newly enabled db group is added.
+        adds = {a["group"]: a for a in self.ufw.add_calls}
+        self.assertEqual(set(adds), {"web", "db"})
+        add = adds["db"]
         self.assertEqual(add["ip"], "203.0.113.50")
         self.assertEqual(add["port"], 3306)
-        self.assertEqual(add["group"], "db")
         self.assertEqual(len(self.ufw.remove_calls), 0)
 
     def test_toggle_membership_forbidden_for_other_user(self) -> None:
@@ -278,14 +290,14 @@ class TestIPLifecycle(unittest.TestCase):
     def test_add_rule_comment_includes_group_suffix(self) -> None:
         ufw = CommentCaptureUFW(self.db)
         ufw.add_rule("1.2.3.4", 8080, "alice", "tcp", group="web")
-        args = ufw.captured[0]
+        args = ufw.captured[-1]  # after the look for a host rule
         comment = args[args.index("comment") + 1]
         self.assertEqual(comment, "ufw-okboy:alice:web")
 
     def test_add_rule_comment_backward_compatible(self) -> None:
         ufw = CommentCaptureUFW(self.db)
         ufw.add_rule("1.2.3.4", 8080, "alice", "tcp")
-        args = ufw.captured[0]
+        args = ufw.captured[-1]
         comment = args[args.index("comment") + 1]
         self.assertEqual(comment, "ufw-okboy:alice")
 
@@ -435,7 +447,7 @@ class TestReconcileResilience(unittest.TestCase):
             def __init__(self, db):
                 super().__init__(rule_prefix="ufw-okboy", db=db)
 
-            def list_rules_by_comment(self, prefix):
+            def list_rules_by_comment(self, prefix, strict=False):
                 return existing
 
             def add_rule(self, ip, port, username, proto="tcp", group=None):

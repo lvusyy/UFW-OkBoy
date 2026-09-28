@@ -56,7 +56,7 @@ class TestPlaceholderSeed(unittest.TestCase):
         alice = db.create_user("alice", SAMPLE_SECRET)
         db.add_membership(alice, db.create_group("default-8080", 8080, "tcp"))
         db.set_user_ip(alice, "203.0.113.7")
-        db.conn.execute("DELETE FROM schema_version WHERE version = 5")
+        db.conn.execute("DELETE FROM schema_version WHERE version >= 5")  # v2.2.1 stopped at 4
         db.conn.commit()
         db.close()
         return alice
@@ -115,7 +115,7 @@ class TestPlaceholderSeed(unittest.TestCase):
         db = Database(self.db_path)
         db.create_user("bob", "b" * 64)
         try:
-            self.assertEqual(db.run_migrations(), [5])
+            self.assertEqual(db.run_migrations(), [5, 6])
             row = db.get_user_by_username("alice")
             self.assertFalse(is_placeholder_secret(row["secret"]))
             self.assertEqual(len(row["secret"]), 64)
