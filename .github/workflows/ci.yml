@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ['3.10', '3.11', '3.12']
+        python-version: ['3.10', '3.11', '3.12', '3.13', '3.14']
 
     steps:
       - uses: actions/checkout@v4
@@ -67,3 +67,40 @@ jobs:
             mount --bind "$tmp/ufw" /etc/ufw
             export LANG=C LC_ALL=C UFW_OKBOY_INTEGRATION=1
             "$PY" -m unittest tests.test_ufw_integration -v'
+
+  scripts:
+    # Installer, upgrade and client shell scripts: syntax and static checks.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: bash -n
+        run: for f in deploy/*.sh client/knock.sh; do bash -n "$f"; done
+
+      - name: shellcheck
+        run: shellcheck -S warning deploy/*.sh client/knock.sh
+
+  package:
+    # The release package, built as the release workflow builds it, must
+    # install its Python dependencies offline and import.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Build the package
+        env:
+          REQUIRE_WHEELS: '1'
+        run: bash deploy/build-release.sh v0.0.0-ci dist
+
+      - name: Offline install from the package
+        run: |
+          tar xzf dist/ufw-okboy-v0.0.0-ci.tar.gz -C dist
+          cd dist/ufw-okboy-v0.0.0-ci
+          test -f deploy/upgrade.sh && test -f LICENSE
+          python -m venv /tmp/venv
+          /tmp/venv/bin/pip install --no-index --find-links vendor -r server/requirements.txt
+          cd server && /tmp/venv/bin/python -c "import app; print('ok')"

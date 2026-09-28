@@ -1,15 +1,19 @@
 #!/usr/bin/env bash
 # UFW OkBoy - Release Package Builder
-# Creates a self-contained tar.gz with everything needed for offline installation
+# Creates a self-contained tar.gz: the server, the clients, the deploy scripts,
+# the docs, and Python wheels for an OFFLINE install. The release workflow
+# builds the published packages with this same script.
 #
 # Usage:
-#   bash build-release.sh <version> [output_dir]
-#   bash build-release.sh v2.0.0
+#   bash deploy/build-release.sh [version] [output_dir]
+#   bash deploy/build-release.sh              # version from VERSION, output in dist/
+#   bash deploy/build-release.sh v2.4.1 out
+#
+# REQUIRE_WHEELS=1 turns a missing wheel set into an error (the release
+# workflow sets it, so a published package always installs offline).
 
 set -euo pipefail
 
-# Version: explicit arg first, else read from repo-root VERSION file (single
-# source of truth). Allows `bash build-release.sh` with no args.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 if [[ -n "${1:-}" ]]; then
@@ -18,98 +22,81 @@ elif [[ -f "$REPO_DIR/VERSION" ]]; then
     VERSION="v$(tr -d '[:space:]' < "$REPO_DIR/VERSION")"
 else
     echo "Usage: bash build-release.sh <version> [output_dir]"
-    echo "Example: bash build-release.sh v2.1.0   (or create a VERSION file)"
     exit 1
 fi
 OUTPUT_DIR="${2:-dist}"
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 PKG_NAME="ufw-okboy-${VERSION}"
 PKG_DIR="$OUTPUT_DIR/$PKG_NAME"
 
-echo "=== Building UFW OkBoy Release Package: $VERSION ==="
+# Target interpreters and platforms for the bundled wheels. The server needs
+# Python 3.10+; pure-Python wheels are shared, compiled ones (PyYAML,
+# MarkupSafe) are per interpreter and CPU.
+PY_VERSIONS="3.10 3.11 3.12 3.13 3.14"
+ARCHES="x86_64 aarch64"
 
-# Clean and create package directory
+echo "=== Building UFW OkBoy Release Package: $VERSION ==="
 rm -rf "$PKG_DIR"
 mkdir -p "$PKG_DIR"
 
-# Copy application files
-echo "[1/4] Copying server files..."
-mkdir -p "$PKG_DIR/server/static" "$PKG_DIR/server/tests"
-cp "$REPO_DIR/server/app.py" "$PKG_DIR/server/"
-cp "$REPO_DIR/server/ufw_ops.py" "$PKG_DIR/server/"
-cp "$REPO_DIR/server/db.py" "$PKG_DIR/server/"
-cp "$REPO_DIR/server/auth.py" "$PKG_DIR/server/"
-cp "$REPO_DIR/server/requirements.txt" "$PKG_DIR/server/"
-cp "$REPO_DIR/server/config.example.yaml" "$PKG_DIR/server/"
-cp "$REPO_DIR/server/static/index.html" "$PKG_DIR/server/static/" 2>/dev/null || true
-cp "$REPO_DIR/server/tests/"*.py "$PKG_DIR/server/tests/" 2>/dev/null || true
-cp "$REPO_DIR/server/tests/__init__.py" "$PKG_DIR/server/tests/" 2>/dev/null || true
+# Copy repo files into the package at the same relative path. Every file named
+# must exist: a missing one fails the build instead of shipping without it.
+put() {
+    local f
+    for f in "$@"; do
+        mkdir -p "$PKG_DIR/$(dirname "$f")"
+        cp -p "$REPO_DIR/$f" "$PKG_DIR/$f"
+    done
+}
 
-# Copy client files
-echo "[2/4] Copying client files..."
-mkdir -p "$PKG_DIR/client"
-cp "$REPO_DIR/client/knock.py" "$PKG_DIR/client/"
-cp "$REPO_DIR/client/knock.sh" "$PKG_DIR/client/"
-cp "$REPO_DIR/client/knock.ps1" "$PKG_DIR/client/"
-cp "$REPO_DIR/client/config.example.yaml" "$PKG_DIR/client/"
+echo "[1/3] Copying files..."
+put server/app.py server/ufw_ops.py server/db.py server/auth.py \
+    server/requirements.txt server/config.example.yaml server/static/index.html
+for f in "$REPO_DIR"/server/tests/*.py; do put "server/tests/${f##*/}"; done
+put client/knock.py client/knock.sh client/knock.ps1 client/config.example.yaml
+put deploy/deploy.sh deploy/quick-install.sh deploy/upgrade.sh deploy/install-server.sh \
+    deploy/install-client.sh deploy/install-client.ps1 \
+    deploy/ufw-okboy.service deploy/ufw-okboy-cleanup.service deploy/ufw-okboy-cleanup.timer \
+    deploy/knock.service deploy/knock.timer
+put nginx/ufw-okboy.conf
+put README.md README.en.md GUIDE.md CHANGELOG.md SECURITY.md LICENSE docs/web-client.png
+# VERSION sits next to the app so --version and /health report it.
+put VERSION
 
-# Copy deploy files
-echo "[3/4] Copying deploy files..."
-mkdir -p "$PKG_DIR/deploy" "$PKG_DIR/nginx"
-cp "$REPO_DIR/deploy/deploy.sh" "$PKG_DIR/deploy/"
-cp "$REPO_DIR/deploy/quick-install.sh" "$PKG_DIR/deploy/"
-cp "$REPO_DIR/deploy/install-client.sh" "$PKG_DIR/deploy/"
-cp "$REPO_DIR/deploy/install-client.ps1" "$PKG_DIR/deploy/"
-cp "$REPO_DIR/deploy/ufw-okboy.service" "$PKG_DIR/deploy/" 2>/dev/null || true
-cp "$REPO_DIR/deploy/ufw-okboy-cleanup.service" "$PKG_DIR/deploy/" 2>/dev/null || true
-cp "$REPO_DIR/deploy/ufw-okboy-cleanup.timer" "$PKG_DIR/deploy/" 2>/dev/null || true
-cp "$REPO_DIR/deploy/knock.service" "$PKG_DIR/deploy/" 2>/dev/null || true
-cp "$REPO_DIR/deploy/knock.timer" "$PKG_DIR/deploy/" 2>/dev/null || true
-cp "$REPO_DIR/deploy/install-server.sh" "$PKG_DIR/deploy/" 2>/dev/null || true
-cp "$REPO_DIR/nginx/ufw-okboy.conf" "$PKG_DIR/nginx/" 2>/dev/null || true
-
-# Copy docs
-echo "[4/4] Copying documentation..."
-cp "$REPO_DIR/README.md" "$PKG_DIR/" 2>/dev/null || true
-cp "$REPO_DIR/README.en.md" "$PKG_DIR/" 2>/dev/null || true
-cp "$REPO_DIR/GUIDE.md" "$PKG_DIR/" 2>/dev/null || true
-cp "$REPO_DIR/CLAUDE.md" "$PKG_DIR/" 2>/dev/null || true
-
-# Copy VERSION file so installed app can report its version (for upgrade checks)
-cp "$REPO_DIR/VERSION" "$PKG_DIR/" 2>/dev/null || true
-
-# Vendor Python wheels for OFFLINE install — the reliable path where PyPI is slow
-# or blocked (e.g. mainland China). Downloads manylinux x86_64 wheels for a range
-# of CPython versions so `pip install --no-index --find-links vendor` works on a
-# typical server with zero network. --platform + --only-binary pin the target, so
-# this produces Linux wheels even when the release is built on macOS/Windows.
-# Skipped (with a warning) if pip is unavailable — the online/mirror path still works.
-echo "[*] Vendoring Python wheels for offline install..."
+# Wheels for OFFLINE install — the reliable path where PyPI is slow or blocked.
+# --platform/--only-binary pin the target, so this works from any build host;
+# deploy.sh/upgrade.sh install from vendor/ first and fall back to an index.
+echo "[2/3] Vendoring Python wheels..."
 PIPBIN="$(command -v pip3 || command -v pip || true)"
+missing=()
 if [[ -n "$PIPBIN" ]]; then
     mkdir -p "$PKG_DIR/vendor"
-    for pyver in 3.8 3.9 3.10 3.11 3.12; do
-        "$PIPBIN" download -r "$REPO_DIR/server/requirements.txt" \
-            -d "$PKG_DIR/vendor" \
-            --only-binary=:all: \
-            --platform manylinux2014_x86_64 \
-            --python-version "$pyver" \
-            --implementation cp >/dev/null 2>&1 || true
+    for arch in $ARCHES; do
+        for pyver in $PY_VERSIONS; do
+            "$PIPBIN" download -r "$REPO_DIR/server/requirements.txt" -d "$PKG_DIR/vendor" \
+                --only-binary=:all: --implementation cp --python-version "$pyver" \
+                --platform "manylinux2014_$arch" --platform "manylinux_2_28_$arch" \
+                --quiet >/dev/null 2>&1 || missing+=("cp$pyver-$arch")
+        done
     done
-    WHEEL_COUNT=$(find "$PKG_DIR/vendor" -name '*.whl' 2>/dev/null | wc -l | tr -d ' ')
-    if [[ "${WHEEL_COUNT:-0}" -gt 0 ]]; then
-        echo "    Vendored $WHEEL_COUNT wheel(s) -> vendor/ (offline install enabled)"
-    else
-        echo "    [WARN] No wheels vendored (offline build?); release will rely on online/mirror install."
-        rmdir "$PKG_DIR/vendor" 2>/dev/null || true
-    fi
 else
-    echo "    [WARN] pip not found; skipping offline wheels (online/mirror install only)."
+    missing=("all (pip not found)")
 fi
+WHEEL_COUNT=0
+if [[ -d "$PKG_DIR/vendor" ]]; then
+    WHEEL_COUNT="$(find "$PKG_DIR/vendor" -name '*.whl' | wc -l | tr -d ' ')"
+    [[ "$WHEEL_COUNT" -gt 0 ]] || rm -rf "$PKG_DIR/vendor"
+fi
+if [[ ${#missing[@]} -gt 0 ]]; then
+    msg="no complete wheel set for: ${missing[*]} (installs there need a package index)"
+    if [[ "${REQUIRE_WHEELS:-0}" == 1 ]]; then
+        echo "[ERROR] $msg" >&2
+        exit 1
+    fi
+    echo "    [WARN] $msg"
+fi
+echo "    $WHEEL_COUNT wheel(s) in vendor/"
 
-# Create a simple install.sh wrapper in the package root
+# Installer entry point at the package root.
 cat > "$PKG_DIR/install.sh" << 'INSTALLEOF'
 #!/usr/bin/env bash
 # UFW OkBoy - Package Installer
@@ -120,25 +107,21 @@ exec bash "$SCRIPT_DIR/deploy/deploy.sh" "$@"
 INSTALLEOF
 chmod +x "$PKG_DIR/install.sh"
 
-# Create tarball
+echo "[3/3] Creating the archive..."
 cd "$OUTPUT_DIR"
 tar czf "${PKG_NAME}.tar.gz" "$PKG_NAME"
 rm -rf "$PKG_NAME"
-
-# Show checksum
-CHECKSUM=$(sha256sum "${PKG_NAME}.tar.gz" | awk '{print $1}')
-SIZE=$(du -h "${PKG_NAME}.tar.gz" | awk '{print $1}')
+{ sha256sum "${PKG_NAME}.tar.gz" 2>/dev/null || shasum -a 256 "${PKG_NAME}.tar.gz"; } > "${PKG_NAME}.tar.gz.sha256"
 
 echo ""
 echo "=== Release Package Built ==="
 echo "  File:     $OUTPUT_DIR/${PKG_NAME}.tar.gz"
-echo "  Size:     $SIZE"
-echo "  SHA256:   $CHECKSUM"
+echo "  Size:     $(du -h "${PKG_NAME}.tar.gz" | awk '{print $1}')"
+echo "  SHA256:   $(awk '{print $1}' "${PKG_NAME}.tar.gz.sha256")"
 echo ""
-echo "  Install from package (OFFLINE — recommended for CN; uses bundled wheels if present):"
-echo "    tar xzf ${PKG_NAME}.tar.gz"
-echo "    cd ${PKG_NAME}"
-echo "    bash install.sh --self-signed -y          # auto-detects vendor/ for offline pip"
+echo "  Install (as root; uses the bundled wheels, no PyPI needed):"
+echo "    tar xzf ${PKG_NAME}.tar.gz && cd ${PKG_NAME}"
+echo "    bash install.sh --self-signed -y"
 echo ""
-echo "  Or one-line install (needs GitHub + PyPI reachable; add --gh-mirror / --mirror in CN):"
-echo "    curl -fsSL https://raw.githubusercontent.com/lvusyy/UFW-OkBoy/master/deploy/quick-install.sh | bash"
+echo "  Upgrade an existing install from the unpacked package:"
+echo "    bash deploy/upgrade.sh --repo-dir . -y"
