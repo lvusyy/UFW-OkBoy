@@ -478,7 +478,7 @@ class TestAdminAPI(unittest.TestCase):
         db = self._open_db()
         try:
             ufw = UFWManager("ufw-okboy", db=db)
-            with patch("ufw_ops.subprocess.run", return_value=Mock(stdout=self._SAMPLE_UFW)):
+            with patch("ufw_ops._run", return_value=Mock(stdout=self._SAMPLE_UFW)):
                 rules = ufw.list_all_rules()
         finally:
             db.close()
@@ -506,7 +506,7 @@ class TestAdminAPI(unittest.TestCase):
         try:
             ufw = UFWManager("ufw-okboy", db=db)
             with patch.object(UFWManager, "_detect_ssh_ports", return_value={"2222"}), \
-                    patch("ufw_ops.subprocess.run", return_value=Mock(stdout=sample)):
+                    patch("ufw_ops._run", return_value=Mock(stdout=sample)):
                 rules = ufw.list_all_rules()
         finally:
             db.close()

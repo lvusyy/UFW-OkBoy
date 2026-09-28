@@ -70,6 +70,9 @@ class StubUFWManager(UFWManager):
         })
         return 0
 
+    def list_rules_by_comment(self, comment_prefix: str, strict: bool = False) -> list[dict]:
+        return []  # no ufw here: nothing listed
+
 
 class CommentCaptureUFW(UFWManager):
     """UFWManager subclass that captures raw _run_ufw args to verify comment text."""
@@ -444,7 +447,7 @@ class TestReconcileResilience(unittest.TestCase):
             def __init__(self, db):
                 super().__init__(rule_prefix="ufw-okboy", db=db)
 
-            def list_rules_by_comment(self, prefix):
+            def list_rules_by_comment(self, prefix, strict=False):
                 return existing
 
             def add_rule(self, ip, port, username, proto="tcp", group=None):

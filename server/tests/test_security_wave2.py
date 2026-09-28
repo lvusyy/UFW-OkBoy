@@ -24,9 +24,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import app as app_module  # noqa: E402
 import auth  # noqa: E402
+import ufw_ops  # noqa: E402
 from app import create_app, open_database  # noqa: E402
 from db import Database  # noqa: E402
-from ufw_ops import HostLock, LockTimeout, UFWManager, canonical_ip, fcntl  # noqa: E402
+from ufw_ops import (  # noqa: E402
+    DeadlineExceeded, HostLock, LockTimeout, UFWManager, canonical_ip, fcntl,
+)
 
 
 def build_auth_header(username: str, secret: str) -> str:
@@ -50,7 +53,7 @@ def _flock_held(path: str) -> bool:
 
 
 class FakeUfw:
-    """A ufw rule table standing in for subprocess.run, faithful where the
+    """A ufw rule table standing in for ufw_ops._run, faithful where the
     numbered deletes depend on it: IPv4 rules are listed before IPv6 ones (each
     family in the order added), `status numbered` numbers them from 1, and
     `--force delete N` removes the N-th, renumbering every rule after it. Adding
@@ -149,7 +152,7 @@ class _Base(unittest.TestCase):
         self.db.init()
         self.ufw = UFWManager(rule_prefix="ufw-okboy", db=self.db)
         self.fake = FakeUfw()
-        self._p = patch("ufw_ops.subprocess.run", self.fake)
+        self._p = patch("ufw_ops._run", self.fake)
         self._p.start()
         self.addCleanup(self._p.stop)
         self.config_path = os.path.join(self.tmpdir, "config.yaml")
@@ -456,12 +459,42 @@ class TestFilesAndSeeding(unittest.TestCase):
                  and not p.endswith(("-wal", "-shm"))]
         self.assertEqual(len(snaps), 1)
         snap = os.path.join(os.path.dirname(self.db_path), snaps[0])
-        self.assertEqual(users(snap), ["bob", "carol"])
+        self.assertTrue(os.path.exists(snap + "-wal"))  # carol: there, not in its file
         self.assertEqual(users(self.db_path), ["bob"])
+        # Back to before the restore, through a link: the snapshot's -wal must
+        # come along, and the snapshot itself survive.
+        latest = os.path.join(self.tmpdir, "latest")
+        os.symlink(snap, latest)
         time.sleep(0.01)  # a distinct snapshot name
-        restore(snap)  # back to before the restore; the snapshot itself must survive
+        restore(latest)
         self.assertEqual(users(self.db_path), ["bob", "carol"])
         self.assertEqual(users(snap), ["bob", "carol"])
+
+    @unittest.skipIf(fcntl is None, "POSIX flock")
+    def test_restore_excludes_other_database_users(self) -> None:
+        # The service, a cleanup run or a CLI command could use the database
+        # while it was copied and replaced.
+        cfg_path = os.path.join(self.tmpdir, "config.yaml")
+        with open(cfg_path, "w", encoding="utf-8") as f:
+            yaml.dump({"db_path": self.db_path,
+                       "state_file": os.path.join(self.tmpdir, "none.json")}, f)
+        db = open_database(app_module.load_config(cfg_path))
+        backup = db.backup(os.path.join(self.tmpdir, "b.db"))
+        db.close()
+        ns = argparse.Namespace(config=cfg_path, backup=backup)
+        with patch("app._service_running", return_value=True), self.assertRaises(SystemExit):
+            app_module.cmd_restore(ns)
+        held = []
+        real = app_module._copy_private
+
+        def spy(src, dest):
+            held.append(_flock_held(os.path.join(os.path.dirname(self.db_path), "ufw.lock")))
+            return real(src, dest)
+
+        with patch("app._copy_private", spy), contextlib.redirect_stdout(io.StringIO()):
+            app_module.cmd_restore(ns)
+        self.assertTrue(held)
+        self.assertTrue(all(held))
 
     @unittest.skipIf(os.name != "posix", "POSIX file modes")
     def test_snapshot_copies_are_owner_only(self) -> None:
@@ -796,17 +829,48 @@ class TestHostRulesStayTheHosts(_Base):
         self.assertEqual(self._knock().status_code, 200)
         self.assertEqual(self.fake.rules(), [("22/tcp", "DENY IN", "203.0.113.10", "")])
 
-    def test_request_commands_are_bounded_and_in_the_c_locale(self) -> None:
+    def test_a_logged_host_rule_is_seen(self) -> None:
+        # ufw lists a logged rule's source as "203.0.113.10 (log)".
+        self.fake.add("22/tcp", "DENY IN", "203.0.113.10 (log)")
+        self.assertEqual(self._knock().status_code, 200)
+        self.assertEqual(self.fake.rules(), [("22/tcp", "DENY IN", "203.0.113.10 (log)", "")])
+
+    def test_an_ipv4_mapped_host_rule_is_another_rule(self) -> None:
+        # ::ffff:203.0.113.10 is not 203.0.113.10 to ufw: its rule does not
+        # stand in for the user's.
+        self.fake.add("22/tcp", "ALLOW IN", "::ffff:203.0.113.10", v6=True)
+        self.assertEqual(self._knock().status_code, 200)
+        self.assertIn(("22/tcp", "ALLOW IN", "203.0.113.10", "ufw-okboy:alice:ssh"),
+                      self.fake.rules())
+
+    def test_a_knock_out_of_time_records_nothing(self) -> None:
+        # Out of time, the listings read as empty and every add failed quietly:
+        # the knock recorded the new address and answered "updated", while the
+        # old address kept its rule.
+        real = UFWManager.deadline
+        self.ufw.deadline = lambda seconds: real(self.ufw, 0)
+        self.assertEqual(self._knock().status_code, 503)
+        self.assertIsNone(self.db.get_user(self.alice)["current_ip"])
+
+    def test_deadlines_nest(self) -> None:
+        with self.ufw.deadline(0):
+            with self.ufw.deadline(100):  # a later inner deadline does not extend it
+                with self.assertRaises(DeadlineExceeded):
+                    self.ufw._timeout(30)
+            with self.assertRaises(DeadlineExceeded):  # nor clears it on the way out
+                self.ufw._timeout(30)
+        self.assertEqual(self.ufw._timeout(30), 30)
+
+    def test_request_commands_are_bounded(self) -> None:
         # Each ufw command could take 30 s after a 20 s wait for the lock:
         # gunicorn killed the worker, and the command ran on after the lock
-        # was released. And ufw translates the status line read here.
+        # was released.
         self.assertEqual(self._knock().status_code, 200)
         self.assertTrue(self.fake.calls)
         for args, kwargs in self.fake.calls:
             self.assertLessEqual(kwargs["timeout"], 25, args)
-            self.assertEqual((kwargs["env"]["LANGUAGE"], kwargs["env"]["LC_ALL"]), ("C", "C"))
         with self.ufw.deadline(0):
-            with self.assertRaises(RuntimeError):
+            with self.assertRaises(DeadlineExceeded):
                 self.ufw._run_ufw("status")
 
     @unittest.skipIf(fcntl is None, "POSIX flock")
@@ -889,6 +953,34 @@ class TestHostLock(unittest.TestCase):
             with HostLock(path, timeout=0.2):
                 pass
         self.assertLess(time.monotonic() - start, 5)
+
+
+@unittest.skipIf(os.name != "posix", "POSIX processes")
+class TestUfwProcess(unittest.TestCase):
+    """How ufw is run: in the C locale (it translates the status line read
+    here), and on timeout killed with all it started — its iptables-restore
+    would otherwise go on applying rules after the lock is released."""
+
+    def test_runs_in_the_c_locale(self) -> None:
+        out = ufw_ops._run(["sh", "-c", 'echo "$LANGUAGE:$LC_ALL:$LANG"'], timeout=5).stdout
+        self.assertEqual(out, "C:C:C\n")
+
+    def test_a_timeout_kills_what_it_started(self) -> None:
+        pidfile = os.path.join(tempfile.mkdtemp(prefix="ufw-okboy-run-"), "pid")
+        with self.assertRaises(subprocess.TimeoutExpired):
+            ufw_ops._run(["sh", "-c", f"sleep 30 & echo $! > {pidfile}; wait"], timeout=1)
+        with open(pidfile, encoding="utf-8") as f:
+            pid = int(f.read())
+        for _ in range(50):  # killed: gone, or a zombie not reaped yet
+            try:
+                with open(f"/proc/{pid}/stat", encoding="utf-8") as f:
+                    if f.read().rsplit(")", 1)[1].split()[0] == "Z":
+                        break
+            except FileNotFoundError:
+                break
+            time.sleep(0.1)
+        else:
+            self.fail(f"what ufw started ({pid}) is still running")
 
 
 @unittest.skipIf(fcntl is None, "POSIX flock")

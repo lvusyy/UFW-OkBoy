@@ -359,7 +359,13 @@ def create_app(config_path: str = "config.yaml",
         # so it is the comprehensive self-heal — any transient cross-knock orphan
         # is cleaned on the next heartbeat. Fixes BUG-A/C; per-group proto
         # preserved (fixes H-2).
-        ufw.reconcile_user_rules(username, client_ip, enabled_groups_ports)
+        try:
+            ufw.reconcile_user_rules(username, client_ip, enabled_groups_ports)
+        except RuntimeError as exc:
+            # Not done — the rules could not be listed, or the request ran out
+            # of time. Record nothing: the next knock does it all again.
+            logger.warning("Knock %s@%s not applied: %s", username, client_ip, exc)
+            return jsonify({"ok": False, "error": "Firewall busy; retry shortly"}), 503
 
         # Atomic state write: read the prior IP and write current_ip + last_knock
         # (+ an ip_change log row only when it actually changed) in ONE
@@ -531,10 +537,13 @@ def create_app(config_path: str = "config.yaml",
             # enabled groups: reconcile removes the rules of every group
             # missing from the map, so passing only this one would close the
             # user's other groups until their next knock.
-            ufw.reconcile_user_rules(
-                requester["username"], user_ip,
-                db.get_user_enabled_groups_ports(requester["id"]),
-            )
+            try:
+                ufw.reconcile_user_rules(
+                    requester["username"], user_ip,
+                    db.get_user_enabled_groups_ports(requester["id"]),
+                )
+            except RuntimeError:  # enabled in the DB: the next knock adds it
+                return jsonify({"ok": False, "error": "Firewall update failed; retry"}), 500
 
         db.log_audit(
             username, "self_toggle_membership",
@@ -624,10 +633,13 @@ def create_app(config_path: str = "config.yaml",
         elif user_ip:
             # Idempotent add via reconcile (fixes H-11), with ALL enabled
             # groups (see self_toggle_membership).
-            ufw.reconcile_user_rules(
-                target["username"], user_ip,
-                db.get_user_enabled_groups_ports(user_id),
-            )
+            try:
+                ufw.reconcile_user_rules(
+                    target["username"], user_ip,
+                    db.get_user_enabled_groups_ports(user_id),
+                )
+            except RuntimeError:  # enabled in the DB: the next knock adds it
+                return jsonify({"ok": False, "error": "Firewall update failed; retry"}), 500
 
         db.log_audit(
             username, "toggle_membership",
@@ -1830,6 +1842,17 @@ def cmd_backup(args):
             print(f"Pruned old backup: {old.name}")
 
 
+def _service_running() -> bool:
+    """Whether the service, or a cleanup run, is active under systemd (False
+    where there is no systemd)."""
+    import subprocess as _sp
+    try:
+        return _sp.run(["systemctl", "is-active", "--quiet", "ufw-okboy",
+                        "ufw-okboy-cleanup"]).returncode == 0
+    except OSError:
+        return False
+
+
 def cmd_restore(args):
     """Restore the DB from a backup file (verifies checksum; snapshots current first).
 
@@ -1837,11 +1860,15 @@ def cmd_restore(args):
     """
     cfg = load_config(args.config)
     db_path = cfg.get("db_path", "/var/lib/ufw-okboy/ufw-okboy.db")
-    src = args.backup
+    # The file itself, not a link to it: its -wal and checksum are beside it.
+    src = os.path.realpath(args.backup)
     if not os.path.exists(src):
-        sys.exit(f"Backup not found: {src}")
+        sys.exit(f"Backup not found: {args.backup}")
     if os.path.exists(db_path) and os.path.samefile(src, db_path):
-        sys.exit(f"{src} is the live database itself: nothing to restore.")
+        sys.exit(f"{args.backup} is the live database itself: nothing to restore.")
+    if _service_running():
+        sys.exit("Stop ufw-okboy first (and let a running cleanup finish): "
+                 "they keep the database open while it is replaced.")
     sidecar = src + ".sha256"
     if os.path.exists(sidecar):
         with open(sidecar, encoding="utf-8") as f:
@@ -1852,22 +1879,26 @@ def cmd_restore(args):
         print("Checksum verified.")
     else:
         print("WARNING: no .sha256 sidecar — restoring without integrity verification.")
-    if os.path.exists(db_path):
-        # A byte copy — the database being replaced may be the broken one — of
-        # the file and its -wal, which can hold commits not in the file yet.
-        # Named uniquely: restoring an earlier snapshot must not overwrite it.
-        snap = f"{db_path}.pre-restore-{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}"
-        for side in ("", "-wal"):
-            if os.path.exists(db_path + side):
-                _copy_private(db_path + side, snap + side)
-        print(f"Current DB snapshotted to {snap}")
-    _copy_private(src, db_path)
-    for ext in ("-wal", "-shm"):
-        stale = db_path + ext
-        if os.path.exists(stale):
-            os.remove(stale)
-    if os.path.exists(src + "-wal"):  # a raw snapshot's commits not yet in its file
-        _copy_private(src + "-wal", db_path + "-wal")
+    # Under the host lock: a CLI command, or a cleanup run, starting meanwhile
+    # waits (each opens the database under it).
+    with HostLock(os.path.join(os.path.dirname(os.path.abspath(db_path)), "ufw.lock")):
+        if os.path.exists(db_path):
+            # A byte copy — the database being replaced may be the broken one —
+            # of the file and its -wal, which can hold commits not in the file
+            # yet. Named uniquely: restoring an earlier snapshot must not
+            # overwrite it.
+            snap = f"{db_path}.pre-restore-{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}"
+            for side in ("", "-wal"):
+                if os.path.exists(db_path + side):
+                    _copy_private(db_path + side, snap + side)
+            print(f"Current DB snapshotted to {snap}")
+        _copy_private(src, db_path)
+        for ext in ("-wal", "-shm"):
+            stale = db_path + ext
+            if os.path.exists(stale):
+                os.remove(stale)
+        if os.path.exists(src + "-wal"):  # a raw snapshot's commits not yet in its file
+            _copy_private(src + "-wal", db_path + "-wal")
     print(f"Restored {db_path} from {src}. Restart the server to load it.")
 
 

@@ -14,6 +14,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -31,7 +32,13 @@ def _ufw(*args: str) -> str:
 class TestUfwIntegration(unittest.TestCase):
 
     def setUp(self) -> None:
-        _ufw("--force", "reset")
+        # ufw keeps each file a reset replaces as <file>.<time to the second>
+        # and will not overwrite one: a second reset within that second fails.
+        try:
+            _ufw("--force", "reset")
+        except subprocess.CalledProcessError:
+            time.sleep(1.1)
+            _ufw("--force", "reset")
         # enable can exit non-zero where kernel logging modules are missing (a
         # container) while the firewall itself is up: check the status instead.
         subprocess.run(["ufw", "--force", "enable"], capture_output=True)
@@ -108,16 +115,21 @@ class TestUfwIntegration(unittest.TestCase):
 
     def test_host_rules_are_not_taken_over(self) -> None:
         # ufw would replace them — a DENY with an ALLOW — for the same source,
-        # port and protocol.
-        _ufw("deny", "from", "203.0.113.10", "to", "any", "port", "8080", "proto", "tcp")
+        # port and protocol; a logged one lists its source as "... (log)".
+        _ufw("deny", "log", "from", "203.0.113.10", "to", "any", "port", "8080", "proto", "tcp")
         _ufw("allow", "from", "203.0.113.11", "to", "any", "port", "8080", "proto", "tcp",
              "comment", "office")
         self.ufw.add_rule("203.0.113.10", 8080, "alice", "tcp", "web")
         self.ufw.add_rule("203.0.113.11", 8080, "bob", "tcp", "web")
         self.assertEqual(self._rules(), [
-            "8080/tcp DENY IN 203.0.113.10",
+            "8080/tcp DENY IN 203.0.113.10 (log)",
             "8080/tcp ALLOW IN 203.0.113.11 # office",
         ])
+
+    def test_an_ipv4_mapped_host_rule_is_another_rule(self) -> None:
+        _ufw("allow", "from", "::ffff:203.0.113.10", "to", "any", "port", "8080", "proto", "tcp")
+        self.ufw.add_rule("203.0.113.10", 8080, "alice", "tcp", "web")
+        self.assertIn("8080/tcp ALLOW IN 203.0.113.10 # okboy-it:alice:web", self._rules())
 
     def test_an_inactive_ufw_cannot_be_purged(self) -> None:
         # It lists nothing, though the rules stay saved for `ufw enable`.

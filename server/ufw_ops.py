@@ -12,6 +12,7 @@ import ipaddress
 import logging
 import os
 import re
+import signal
 import subprocess
 import threading
 import time
@@ -31,6 +32,37 @@ def _ufw_env() -> dict:
     line ("Status: active" / "Status: inactive"), which is read here; the rule
     lines it prints untranslated either way."""
     return {**os.environ, "LANGUAGE": "C", "LC_ALL": "C", "LANG": "C"}
+
+
+def _run(cmd: list[str], timeout: float) -> subprocess.CompletedProcess:
+    """Run ufw like subprocess.run — in the C locale, and in its own process
+    group, all of which is killed on timeout: ufw hands its changes to
+    iptables-restore, and killing ufw alone would leave that applying them
+    after the host lock is released, maybe an older rule set over a newer."""
+    with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          text=True, env=_ufw_env(), start_new_session=True) as proc:
+        try:
+            out, err = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.communicate()
+            raise
+    return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+
+
+def _rule_source(column: str) -> str:
+    """The source address of a rule as ``ufw status`` lists it ("203.0.113.7",
+    "203.0.113.7 (log)", "::ffff:203.0.113.7", "Anywhere (v6)"), normalized;
+    "" when it is not one address. Unlike canonical_ip, an IPv4-mapped IPv6
+    address stays IPv6: ufw keeps a rule for it apart from the IPv4 one."""
+    column = re.sub(r"\s+\((?:log|log-all)\)$", "", column.strip())
+    try:
+        return str(ipaddress.ip_address(column))
+    except ValueError:
+        return ""
 
 
 def canonical_ip(value) -> str:
@@ -55,6 +87,10 @@ def canonical_ip(value) -> str:
 
 class LockTimeout(RuntimeError):
     """The host lock was not free within HostLock.timeout."""
+
+
+class DeadlineExceeded(RuntimeError):
+    """A request's time for ufw commands ran out (see UFWManager.deadline)."""
 
 
 class HostLock:
@@ -142,22 +178,25 @@ class UFWManager:
         """Within the block, every ufw command must end *seconds* from now: one
         still running then is killed, and none starts after. A server request
         must end before gunicorn kills its worker — that would leave a ufw
-        command running on after the host lock is released."""
-        self._limit.at = time.monotonic() + seconds
+        command running on after the host lock is released. Nested, the earlier
+        deadline holds."""
+        before = getattr(self._limit, "at", None)
+        at = time.monotonic() + seconds
+        self._limit.at = at if before is None else min(before, at)
         try:
             yield
         finally:
-            self._limit.at = None
+            self._limit.at = before
 
     def _timeout(self, cap: float) -> float:
         """Seconds a ufw command may take: *cap*, or less when the deadline (see
-        :meth:`deadline`) is nearer; RuntimeError once it has passed."""
+        :meth:`deadline`) is nearer; DeadlineExceeded once it has passed."""
         at = getattr(self._limit, "at", None)
         if at is None:
             return cap
         left = at - time.monotonic()
         if left <= 0:
-            raise RuntimeError("UFW command not run: out of time")
+            raise DeadlineExceeded("UFW command not run: out of time")
         return min(cap, left)
 
     # ------------------------------------------------------------------ #
@@ -173,15 +212,17 @@ class UFWManager:
         """
         cmd = ["ufw", *args]
         logger.info("Exec: %s", " ".join(cmd))
+        # One exception type for every failure: callers keep their state on
+        # RuntimeError, and a timeout used to escape that (a CLI revoke then
+        # exited before rotating the secret).
+        limit = self._timeout(30)
         try:
-            result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=self._timeout(30),
-                check=False, env=_ufw_env(),
-            )
-        except (subprocess.TimeoutExpired, OSError) as exc:
-            # One exception type for every failure: callers keep their state on
-            # RuntimeError, and a timeout used to escape that (a CLI revoke then
-            # exited before rotating the secret).
+            result = _run(cmd, timeout=limit)
+        except subprocess.TimeoutExpired as exc:
+            if limit < 30:  # killed at the request's deadline, not ufw's own limit
+                raise DeadlineExceeded(f"UFW command killed: out of time ({exc})") from exc
+            raise RuntimeError(f"UFW command failed: {exc}") from exc
+        except OSError as exc:
             raise RuntimeError(f"UFW command failed: {exc}") from exc
         if result.returncode != 0:
             logger.error(
@@ -214,7 +255,7 @@ class UFWManager:
             to = f"{port}/{proto}"
             for r in self.list_all_rules(strict=True):
                 if (r["to"] == to and r["action"].endswith(" IN")
-                        and canonical_ip(r["from"]) == src
+                        and _rule_source(r["from"]) == src
                         and not r["comment"].startswith(f"{self.rule_prefix}:")):
                     logger.warning("Not adding %s -> port %s/%s (%s): host rule [%d] %s %s "
                                    "stays as it is", src, port, proto, comment,
@@ -312,10 +353,7 @@ class UFWManager:
                 raise RuntimeError("ufw is inactive: its rules cannot be listed")
             return output
         try:
-            return subprocess.run(
-                ["ufw", "status", "numbered"], capture_output=True, text=True,
-                timeout=self._timeout(15), check=False, env=_ufw_env(),
-            ).stdout
+            return _run(["ufw", "status", "numbered"], timeout=self._timeout(15)).stdout
         except Exception:
             return ""
 
@@ -457,7 +495,10 @@ class UFWManager:
         *client_ip* — repairing cross-group collisions, stale memberships,
         concurrent membership changes, AND stale old-IP rules for enabled groups.
 
-        Returns ``{"added": [...], "removed": [...]}`` (group names).
+        Returns ``{"added": [...], "removed": [...]}`` (group names). Raises
+        RuntimeError when the rules cannot be listed, DeadlineExceeded when out
+        of time: then it is not done, and the caller must not act as if it were.
+        A single rule that ufw fails to add or delete is only logged.
         """
         with self.lock:  # numbers from a listing are only valid under it
             return self._reconcile_locked(username, client_ip, enabled_groups)
@@ -474,7 +515,7 @@ class UFWManager:
         pre_group = prefix[:-1]
 
         def listing() -> list[dict]:
-            return [r for r in self.list_rules_by_comment(pre_group)
+            return [r for r in self.list_rules_by_comment(pre_group, strict=True)
                     if r["comment"] == pre_group or r["comment"].startswith(prefix)]
 
         user_rules = listing()
@@ -492,6 +533,8 @@ class UFWManager:
                 try:
                     self.add_rule(client_ip, port, username, proto, group_name)
                     added.append(group_name)
+                except DeadlineExceeded:
+                    raise
                 except RuntimeError:
                     logger.warning(
                         "reconcile: failed to add rule for group %s (%s:%s)",
@@ -518,6 +561,8 @@ class UFWManager:
                 try:
                     self._run_ufw("--force", "delete", str(rule["number"]))
                     removed.append(group_name or rule["comment"])
+                except DeadlineExceeded:
+                    raise
                 except RuntimeError:
                     logger.warning(
                         "reconcile: failed to remove stale rule %s (%s)",
@@ -645,10 +690,7 @@ class UFWManager:
     def list_managed_rules(self) -> list[str]:
         """Parse ``ufw status`` output and return lines containing our rule prefix."""
         try:
-            output = subprocess.run(
-                ["ufw", "status"], capture_output=True, text=True,
-                timeout=self._timeout(15), check=False, env=_ufw_env(),
-            ).stdout
+            output = _run(["ufw", "status"], timeout=self._timeout(15)).stdout
         except Exception:
             return []
 
@@ -706,7 +748,10 @@ class UFWManager:
                     gname: (gport, gproto)
                     for gname, gport, gproto in user_group_ports.get(username, [])
                 }
-                self.reconcile_user_rules(username, ip, enabled)
+                try:
+                    self.reconcile_user_rules(username, ip, enabled)
+                except RuntimeError as exc:  # the next knock reconciles
+                    logger.warning("sync: could not reconcile %s: %s", username, exc)
 
         if recovered:
             logger.info("Recovered %d users from UFW rules", len(recovered))
