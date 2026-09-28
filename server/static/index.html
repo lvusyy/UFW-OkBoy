@@ -1382,6 +1382,9 @@ function disconnect(reason) {
   // must not bring the credentials (and then the admin console) back unasked.
   fSecret.value = "";
   fPin.value = "";
+  fLoginPin.value = "";
+  totpSecretEl.innerHTML = ""; // an enrollment's TOTP seed
+  totpEnrollBox.hidden = true;
 
   // Switch views
   dashView.hidden = true;
@@ -1462,6 +1465,7 @@ loginForm.addEventListener("submit", async (e) => {
   const secret = fSecret.value;
   if (!user || !secret) return;
   pendingPin = fLoginPin.value || null;
+  fLoginPin.value = ""; // kept only until the vault is written
   btnConnect.disabled = true;
   btnConnect.textContent = t("login_connecting");
   await connect(user, secret, fRemember.checked);
@@ -1485,10 +1489,19 @@ btnDisconnect.addEventListener("click", () => {
 // ================================================================ //
 
 // Two storage modes:
-//  (a) plaintext legacy (STORAGE_KEY) -> direct auto-connect, no PIN
-//  (b) encrypted vault (VAULT_KEY) -> requires PIN to unlock before connect
+//  (a) encrypted vault (VAULT_KEY) -> requires PIN to unlock before connect
+//  (b) plaintext legacy (STORAGE_KEY) -> direct auto-connect, no PIN
+// The vault wins: a plaintext copy next to it (older versions wrote one when
+// connecting without a PIN) would undo its protection, so it is removed.
 (function autoConnect() {
   try {
+    if (readVaultBlob()) {
+      localStorage.removeItem(STORAGE_KEY);
+      pinView.hidden = false;
+      loginView.hidden = true;
+      fPin.focus();
+      return;
+    }
     const plain = localStorage.getItem(STORAGE_KEY);
     if (plain) {
       const { username, secret } = JSON.parse(plain);
@@ -1497,13 +1510,6 @@ btnDisconnect.addEventListener("click", () => {
         fSecret.value = secret;
         connect(username, secret, true);
       }
-      return;
-    }
-    // Encrypted vault present -> show PIN entry to unlock credentials.
-    if (readVaultBlob()) {
-      pinView.hidden = false;
-      loginView.hidden = true;
-      fPin.focus();
     }
   } catch {
     localStorage.removeItem(STORAGE_KEY);
@@ -1971,6 +1977,10 @@ adminUsersEl.addEventListener("click", async (e) => {
     }
     await loadAdminConsole();
     if (newSecret) showSecret(newSecret); // persistent reveal, survives re-render
+    if (r.warning) { // rotated, but the firewall rules may still be open
+      adminError.textContent = r.warning;
+      adminError.style.display = "block";
+    }
   } else {
     adminError.textContent = r.error || t("err_revoke_failed");
     adminError.style.display = "block";
@@ -2001,6 +2011,10 @@ adminUsersEl.addEventListener("click", async (e) => {
     addLog(t("log_secret_rotated"), "ok");
     await loadAdminConsole();
     showSecret(r.secret);
+    if (r.warning) {
+      adminError.textContent = r.warning;
+      adminError.style.display = "block";
+    }
   } else {
     adminError.textContent = r.error || t("err_revoke_failed");
     adminError.style.display = "block";
@@ -2141,7 +2155,9 @@ btnRefreshAudit.addEventListener("click", async () => {
 // ---- System firewall rules (advanced / high-risk) ---- //
 // Opt-in (loaded only when the admin clicks "Show firewall rules"), so the raw
 // UFW view stays out of the way until explicitly requested.
+let lastFwRules = []; // as displayed: a delete names the rule the admin saw
 function renderFwRules(rules) {
+  lastFwRules = rules;
   if (!rules.length) {
     adminFwEl.innerHTML = `<span style="color:var(--text2);font-size:.75rem">${esc(t("admin_fw_none"))}</span>`;
     return;
@@ -2181,6 +2197,10 @@ adminFwEl.addEventListener("click", async (e) => {
   const desc = btn.dataset.desc;
   if (!confirm(t("confirm_fw_delete", desc))) return;
   const body = { number: Number(btn.dataset.fwdel) };
+  // The rule as displayed: if a deletion elsewhere renumbered the list since,
+  // the server refuses instead of deleting whatever has this number now.
+  const shown = lastFwRules.find(x => String(x.number) === btn.dataset.fwdel);
+  if (shown) body.expect = { to: shown.to, action: shown.action, from: shown.from, comment: shown.comment };
   let r = await apiAdmin("POST", "/api/admin/ufw/delete", body);
   // SSH lock-out guard (server flags it BEFORE consuming a TOTP code).
   if (!r.ok && r.ssh_warning) {
@@ -2199,6 +2219,7 @@ adminFwEl.addEventListener("click", async (e) => {
     addLog(t("log_fw_deleted", btn.dataset.fwdel), "warn");
     renderFwRules(r.rules || []); // server returns the refreshed list (numbers shift)
   } else {
+    if (r.stale) await loadFwRules(); // show the list as it is now
     adminError.textContent = r.error || t("err_failed");
     adminError.style.display = "block";
   }

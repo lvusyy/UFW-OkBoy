@@ -84,7 +84,7 @@ class TestUfwIntegration(unittest.TestCase):
         self.ufw.add_rule("198.51.100.99", 3306, "alice", "tcp", "db")   # a stale address
         _ufw("allow", "from", "any", "to", "any", "port", "9090", "proto", "tcp",
              "comment", "okboy-it:alice:web")  # an injected "any": an IPv4 and an IPv6 rule
-        self.ufw.add_rule("203.0.113.11", 8080, "bob", "tcp", "web")     # behind the same NAT
+        self.ufw.add_rule("203.0.113.11", 8080, "bob", "tcp", "web")     # another user's
         self.ufw.remove_rule("203.0.113.11", 8080, "alice", "tcp", "web")  # not alice's rule
         self.assertIn("8080/tcp ALLOW IN 203.0.113.11 # okboy-it:bob:web", self._rules())
         self.assertEqual(self.ufw.purge_rules(username="alice"), 4)
@@ -93,6 +93,31 @@ class TestUfwIntegration(unittest.TestCase):
             "8080/tcp ALLOW IN 203.0.113.11 # okboy-it:bob:web",
             "22/tcp (v6) ALLOW IN Anywhere (v6)",
         ])
+
+    def test_one_rule_per_address_and_port(self) -> None:
+        # Two users of a group behind one NAT address share a single rule: ufw
+        # keeps one per address and port, with the last comment. Removing the
+        # user it names closes it for the other until their next knock — only
+        # availability: the address is allowed while one of its users is.
+        self.ufw.add_rule("203.0.113.10", 8080, "alice", "tcp", "web")
+        self.ufw.add_rule("203.0.113.10", 8080, "bob", "tcp", "web")
+        self.assertEqual(self._rules(), ["8080/tcp ALLOW IN 203.0.113.10 # okboy-it:bob:web"])
+        self.assertEqual(self.ufw.purge_rules(username="alice"), 0)
+        self.assertEqual(self.ufw.purge_rules(username="bob"), 1)
+        self.assertEqual(self._rules(), [])
+
+    def test_sync_reads_the_numbered_listing(self) -> None:
+        # Plain `ufw status` prints "ALLOW": sync's pattern for "ALLOW IN" there
+        # never matched a rule.
+        uid = self.db.create_user("alice", "s" * 64)
+        self.db.add_membership(uid, self.db.create_group("web", 8080, "tcp"), enabled=1)
+        self.ufw.add_rule("203.0.113.10", 8080, "alice", "tcp", "web")
+        _ufw("allow", "from", "any", "to", "any", "port", "9090", "proto", "tcp",
+             "comment", "okboy-it:alice:web")  # injected: not an address to recover
+        self.ufw.sync_state_from_ufw(
+            [], user_group_ports=self.db.get_all_user_group_ports(only_enabled=True))
+        self.assertEqual(self.db.get_user(uid)["current_ip"], "203.0.113.10")
+        self.assertEqual(self._rules(), ["8080/tcp ALLOW IN 203.0.113.10 # okboy-it:alice:web"])
 
 
 if __name__ == "__main__":

@@ -1,11 +1,14 @@
-"""Security wave 2: numbered deletes, client IP, TOTP caps, host lock, files.
+"""Security wave 2: numbered deletes, client IP, TOTP, host lock, files, removals.
 
 Run from the server/ directory with:
     python -m unittest tests.test_security_wave2 -v
 """
 
+import argparse
+import contextlib
 import hashlib
 import hmac
+import io
 import os
 import subprocess
 import sys
@@ -18,10 +21,11 @@ import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import app as app_module  # noqa: E402
 import auth  # noqa: E402
 from app import create_app, open_database  # noqa: E402
 from db import Database  # noqa: E402
-from ufw_ops import HostLock, UFWManager, canonical_ip, fcntl  # noqa: E402
+from ufw_ops import HostLock, LockTimeout, UFWManager, canonical_ip, fcntl  # noqa: E402
 
 
 def build_auth_header(username: str, secret: str) -> str:
@@ -29,6 +33,19 @@ def build_auth_header(username: str, secret: str) -> str:
     ts = int(time.time())
     sig = hmac.new(secret.encode(), f"{username}:{ts}".encode(), hashlib.sha256).hexdigest()
     return f"HMAC-SHA256 {username}:{ts}:{sig}"
+
+
+def _flock_held(path: str) -> bool:
+    """Whether an flock on *path* is held — by this process too: a lock taken
+    through another open file description conflicts with one taken here."""
+    fd = os.open(path, os.O_RDWR | os.O_CREAT)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return False
+    except BlockingIOError:
+        return True
+    finally:
+        os.close(fd)
 
 
 class FakeUfw:
@@ -44,6 +61,8 @@ class FakeUfw:
         self.v4: list[tuple] = []
         self.v6: list[tuple] = []
         self.fail_deletes = False  # make every delete fail, as a wedged ufw would
+        self.fail_list = False  # make `status numbered` fail
+        self.raise_on_delete = None  # an exception every delete raises (a timeout)
 
     def add(self, to: str, action: str, frm: str, comment: str = "", v6: bool = False) -> None:
         table = self.v6 if v6 else self.v4
@@ -74,8 +93,13 @@ class FakeUfw:
         args = list(cmd[1:])
         rc, out = 0, ""
         if args == ["status", "numbered"]:
-            out = self._render()
+            if self.fail_list:
+                rc = 1
+            else:
+                out = self._render()
         elif args[:2] == ["--force", "delete"] and len(args) == 3 and args[2].isdigit():
+            if self.raise_on_delete is not None:
+                raise self.raise_on_delete
             if self.fail_deletes:
                 rc = 1
             else:
@@ -310,6 +334,42 @@ class TestFilesAndSeeding(unittest.TestCase):
         self.assertIsNone(db.get_user_by_username("bob"))
         db.close()
 
+    @unittest.skipIf(fcntl is None, "POSIX flock")
+    def test_migrations_and_seeding_run_under_the_host_lock(self) -> None:
+        # gunicorn starts its workers together: both ran a pending migration.
+        held = []
+        real = Database.init
+
+        def spy(db):
+            held.append(_flock_held(os.path.join(os.path.dirname(self.db_path), "ufw.lock")))
+            return real(db)
+
+        cfg = {"db_path": self.db_path, "users": {}, "protected_ports": [],
+               "state_file": os.path.join(self.tmpdir, "none.json")}
+        with patch.object(Database, "init", spy):
+            open_database(cfg).close()
+        self.assertEqual(held, [True])
+
+    @unittest.skipIf(os.name != "posix", "POSIX file modes")
+    def test_snapshot_copies_are_owner_only(self) -> None:
+        # copy2 wrote the secrets under the umask's mode before copying the
+        # source's; an existing copy kept its own.
+        src = os.path.join(self.tmpdir, "src.db")
+        dest = os.path.join(self.tmpdir, "dest.db")
+        with open(src, "wb") as f:
+            f.write(b"secrets")
+        with open(dest, "wb"):
+            pass
+        os.chmod(dest, 0o644)  # an older, world-readable snapshot
+        old = os.umask(0)
+        try:
+            app_module._copy_private(src, dest)
+        finally:
+            os.umask(old)
+        self.assertEqual(os.stat(dest).st_mode & 0o777, 0o600)
+        with open(dest, "rb") as f:
+            self.assertEqual(f.read(), b"secrets")
+
 
 class TestRemovals(_Base):
     """Removals delete only the user's own rules, at any address, and a removal
@@ -328,7 +388,7 @@ class TestRemovals(_Base):
         f.add("8080/tcp", "ALLOW IN", "203.0.113.10", "ufw-okboy:alice:web")
         f.add("3306/tcp", "ALLOW IN", "198.51.100.99", "ufw-okboy:alice:db")  # a stale address
         f.add("9090/tcp", "ALLOW IN", "Anywhere", "ufw-okboy:alice:web")      # an injected "any" ...
-        f.add("8080/tcp", "ALLOW IN", "203.0.113.11", "ufw-okboy:bob:web")    # behind the same NAT
+        f.add("8080/tcp", "ALLOW IN", "203.0.113.11", "ufw-okboy:bob:web")    # another user's
         f.add("22/tcp", "ALLOW IN", "Anywhere")
         f.add("9090/tcp (v6)", "ALLOW IN", "Anywhere (v6)", "ufw-okboy:alice:web", v6=True)  # ... its v6 half
 
@@ -368,7 +428,8 @@ class TestRemovals(_Base):
         self.assertNotIn("ufw-okboy:alice:db", self._left())
 
     def test_removal_never_touches_a_neighbours_rule(self) -> None:
-        # alice has no rule of her own at this address: the NAT neighbour's stays.
+        # alice's state may still name bob's address (hers before, say): the
+        # ip/port/proto match once used deleted bob's rule there.
         self.ufw.remove_rule("203.0.113.11", 8080, "alice", "tcp", "web")
         self.assertIn("ufw-okboy:bob:web", self._left())
 
@@ -386,6 +447,98 @@ class TestRemovals(_Base):
         self.fake.fail_deletes = True
         self.assertEqual(self.ufw.cleanup_stale(7 * 86400), [])
         self.assertEqual(self.db.get_user(self.alice)["current_ip"], "203.0.113.10")
+
+    def test_a_listing_failure_is_not_a_removal(self) -> None:
+        # A failing `ufw status numbered` listed nothing: "nothing to remove",
+        # and the records went while the rules stayed.
+        self.fake.fail_list = True
+        self.assertEqual(self._admin("DELETE", f"/api/admin/users/{self.alice}").status_code, 500)
+        self.assertIsNotNone(self.db.get_user(self.alice))
+        r = self._admin("POST", "/api/admin/memberships/remove",
+                        json={"username": "alice", "group_name": "web"})
+        self.assertEqual(r.status_code, 500)
+        self.assertTrue(self.db.membership_exists(self.alice, self.web))
+        self.db.conn.execute("UPDATE users SET last_knock=1 WHERE id=?", (self.alice,))
+        self.db.conn.commit()
+        self.assertEqual(self.ufw.cleanup_stale(7 * 86400), [])
+        self.assertEqual(self.db.get_user(self.alice)["current_ip"], "203.0.113.10")
+
+    def test_cli_revoke_rotates_when_ufw_times_out(self) -> None:
+        # A timeout was no RuntimeError: the CLI revoke died before rotating.
+        self.fake.raise_on_delete = subprocess.TimeoutExpired(["ufw"], 30)
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(SystemExit):
+            app_module.cmd_revoke(argparse.Namespace(
+                config=self.config_path, username="alice", no_rotate=False))
+        user = self.db.get_user(self.alice)
+        self.assertNotEqual(user["secret"], "secret-alice")
+        self.assertEqual(user["current_ip"], "203.0.113.10")  # kept for the retry
+
+    def test_disabling_a_membership_closes_it_at_every_address(self) -> None:
+        # The toggles removed only the rule at the current address, and nothing
+        # without one.
+        r = self.client.patch(f"/api/me/membership/{self.web}", json={"enabled": False},
+                              headers={"Authorization": build_auth_header("alice", "secret-alice")})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(self._left(), ["ufw-okboy:alice:db", "ufw-okboy:bob:web", ""])
+        r = self._admin("PATCH", f"/api/membership/{self.alice}/{self.dbg}", json={"enabled": False})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(self._left(), ["ufw-okboy:bob:web", ""])
+
+    def test_pre_group_rules_go_with_their_group(self) -> None:
+        # Rules from before groups carry "<prefix>:<user>": removing a membership
+        # or a group skipped them, and the port stayed open.
+        f = self.fake
+        f.add("8080/tcp", "ALLOW IN", "198.51.100.7", "ufw-okboy:alice")
+        f.add("5432/tcp", "ALLOW IN", "198.51.100.7", "ufw-okboy:alice")  # not web's port
+        f.add("8080/tcp", "ALLOW IN", "198.51.100.8", "ufw-okboy:carol")
+        r = self._admin("POST", "/api/admin/memberships/remove",
+                        json={"username": "alice", "group_name": "web"})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(self._left(), ["ufw-okboy:alice:db", "ufw-okboy:bob:web", "",
+                                        "ufw-okboy:alice", "ufw-okboy:carol"])
+        self.assertEqual(self._admin("DELETE", f"/api/admin/groups/{self.web}").status_code, 200)
+        self.assertEqual(self._left(), ["ufw-okboy:alice:db", "", "ufw-okboy:alice"])
+
+    def test_knock_supersedes_pre_group_rules(self) -> None:
+        f = self.fake
+        f.add("8080/tcp", "ALLOW IN", "203.0.113.10", "ufw-okboy:alice")  # her rule, relabelled
+        f.add("8080/tcp", "ALLOW IN", "198.51.100.7", "ufw-okboy:alice")  # at an old address
+        self.ufw.reconcile_user_rules(
+            "alice", "203.0.113.10", {"web": (8080, "tcp"), "db": (3306, "tcp")})
+        self.assertEqual(f.rules(), [
+            ("8080/tcp", "ALLOW IN", "203.0.113.10", "ufw-okboy:alice:web"),
+            ("8080/tcp", "ALLOW IN", "203.0.113.11", "ufw-okboy:bob:web"),
+            ("22/tcp", "ALLOW IN", "Anywhere", ""),
+            ("3306/tcp", "ALLOW IN", "203.0.113.10", "ufw-okboy:alice:db"),
+        ])
+
+    def test_sync_takes_addresses_not_anywhere(self) -> None:
+        # sync read plain `ufw status` expecting "ALLOW IN" (it says "ALLOW"),
+        # and would have taken "Anywhere" for an address.
+        del self.fake.v4[1]  # alice's rule at a stale address: one address left
+        self.db.clear_user_state(self.alice)  # the database lost it
+        recovered = self.ufw.sync_state_from_ufw(
+            [], user_group_ports=self.db.get_all_user_group_ports(only_enabled=True))
+        self.assertEqual(recovered["alice"]["ip"], "203.0.113.10")
+        self.assertEqual(self.db.get_user(self.alice)["current_ip"], "203.0.113.10")
+        self.assertEqual(self._left(), ["ufw-okboy:alice:web", "ufw-okboy:bob:web", "",
+                                        "ufw-okboy:alice:db"])
+
+    @unittest.skipIf(fcntl is None, "POSIX flock")
+    def test_cli_sync_reads_memberships_under_the_host_lock(self) -> None:
+        # Read before the lock, the memberships could predate a deletion that
+        # sync then undid.
+        held = []
+        real = Database.get_all_user_group_ports
+
+        def spy(db, *args, **kwargs):
+            held.append(_flock_held(os.path.join(self.tmpdir, "ufw.lock")))
+            return real(db, *args, **kwargs)
+
+        with patch.object(Database, "get_all_user_group_ports", spy), \
+                contextlib.redirect_stdout(io.StringIO()):
+            app_module.cmd_sync(argparse.Namespace(config=self.config_path))
+        self.assertEqual(held, [True])
 
 
 class TestSelfToggleNeedsMembership(_Base):
@@ -443,6 +596,64 @@ class TestTOTPReenroll(_Base):
         self.assertEqual(self._disable(self.step(self.old, 1)).status_code, 403)
         self.assertEqual(self._disable(self.step(new, 1)).status_code, 200)
 
+    def test_pending_seed_is_not_listed(self) -> None:
+        # /api/admin/users stripped the active seed but returned the pending one.
+        self._post("/api/admin/totp/enroll", totp_code=self.step(self.old, 0))
+        self.assertIsNotNone(self.db.get_user(self.uid)["totp_pending_secret"])
+        r = self.client.get("/api/admin/users", headers={
+            "Authorization": build_auth_header("root", "secret-root")})
+        for user in r.get_json()["users"]:
+            self.assertNotIn("totp_pending_secret", user)
+            self.assertNotIn("totp_secret", user)
+
+    @unittest.skipIf(fcntl is None, "POSIX flock")
+    def test_totp_state_is_read_and_changed_under_the_totp_lock(self) -> None:
+        # A disable could read "off" while an activation completed, and two
+        # activations could both accept one code for the same pending secret.
+        lock = os.path.join(self.tmpdir, "totp.lock")
+        held = []
+        real = auth.require_admin
+
+        def spy(*args, **kwargs):
+            held.append(_flock_held(lock))
+            return real(*args, **kwargs)
+
+        with patch("auth.require_admin", spy):
+            new = self._post("/api/admin/totp/enroll",
+                             totp_code=self.step(self.old, 0)).get_json()["secret"]
+            self.assertEqual(self._post("/api/admin/totp/activate",
+                                        totp_code=self.step(new, 0)).status_code, 200)
+            self.assertEqual(self._disable(self.step(new, 1)).status_code, 200)
+        self.assertEqual(held, [True, True, True])
+
+
+class TestFwDeleteNamesTheRule(_Base):
+    """The console sent only a number: after a deletion elsewhere renumbered the
+    rules, the handler deleted whatever rule had that number by then."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.db.create_user("root", "secret-root", is_admin=True)
+
+    def _delete(self, number, expect):
+        return self.client.post("/api/admin/ufw/delete", json={"number": number, "expect": expect},
+                                headers={"Authorization": build_auth_header("root", "secret-root")})
+
+    def test_a_renumbered_rule_is_not_deleted(self) -> None:
+        f = self.fake
+        f.add("8080/tcp", "ALLOW IN", "Anywhere")
+        f.add("9090/tcp", "ALLOW IN", "Anywhere")
+        listed = self.ufw.list_all_rules()[1]  # 9090, number 2 as the admin saw it
+        shown = {k: listed[k] for k in ("to", "action", "from", "comment")}
+        del f.v4[0]  # a deletion elsewhere: 9090 is number 1 now ...
+        f.add("Anywhere", "DENY IN", "192.0.2.66")  # ... and the host's DENY number 2
+        r = self._delete(2, shown)
+        self.assertEqual(r.status_code, 409)
+        self.assertTrue(r.get_json()["stale"])
+        self.assertIn(("Anywhere", "DENY IN", "192.0.2.66", ""), f.rules())
+        self.assertEqual(self._delete(1, shown).status_code, 200)
+        self.assertEqual(f.rules(), [("Anywhere", "DENY IN", "192.0.2.66", "")])
+
 
 @unittest.skipIf(fcntl is None, "POSIX flock")
 class TestHostLock(unittest.TestCase):
@@ -459,6 +670,35 @@ class TestHostLock(unittest.TestCase):
                 self.assertNotEqual(subprocess.run(probe, capture_output=True).returncode, 0)
             self.assertNotEqual(subprocess.run(probe, capture_output=True).returncode, 0)
         self.assertEqual(subprocess.run(probe, capture_output=True).returncode, 0)
+
+    def test_waits_are_bounded(self) -> None:
+        # Unbounded, a request behind a long CLI or cleanup run waited until
+        # gunicorn killed its worker.
+        path = os.path.join(tempfile.mkdtemp(prefix="ufw-okboy-lock-"), "ufw.lock")
+        fd = os.open(path, os.O_RDWR | os.O_CREAT)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_EX)  # another holder
+        start = time.monotonic()
+        with self.assertRaises(LockTimeout):
+            with HostLock(path, timeout=0.2):
+                pass
+        self.assertLess(time.monotonic() - start, 5)
+
+
+@unittest.skipIf(fcntl is None, "POSIX flock")
+class TestLockBusy(_Base):
+
+    def test_a_request_behind_a_busy_lock_gets_503(self) -> None:
+        self.db.create_user("alice", "secret-alice")
+        self.ufw.lock.timeout = 0.2
+        fd = os.open(os.path.join(self.tmpdir, "ufw.lock"), os.O_RDWR | os.O_CREAT)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_EX)  # a CLI command, or the cleanup timer
+        r = self.client.post("/api/knock", headers={
+            "Authorization": build_auth_header("alice", "secret-alice"),
+            "X-Real-IP": "203.0.113.5"})
+        self.assertEqual(r.status_code, 503)
+        self.assertEqual(self.fake.rules(), [])
 
 
 if __name__ == "__main__":

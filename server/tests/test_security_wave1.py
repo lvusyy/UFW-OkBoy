@@ -312,7 +312,7 @@ class TestSecurityWave1(unittest.TestCase):
                          [("--force", "delete", "5"), ("--force", "delete", "3")])
 
     def test_revoke_offline_user_skips_ufw(self) -> None:
-        """A user who never knocked (current_ip None) revokes without UFW calls."""
+        """A user who never knocked (current_ip None) revokes without deleting a rule."""
         self._mock_ufw.reset_mock()
         resp = self.client.post(
             f"/api/admin/users/{self.alice_id}/revoke",
@@ -320,7 +320,9 @@ class TestSecurityWave1(unittest.TestCase):
         )
         self.assertEqual(resp.status_code, 200)
         self.assertTrue(resp.get_json()["rotated"])
-        self.assertFalse(self._mock_ufw.called)
+        # Only a look (rules at older addresses would go too), and no delete.
+        self.assertEqual([c.args for c in self._mock_ufw.call_args_list],
+                         [("status", "numbered")])
 
     def test_cli_revoke_clears_state_and_rotates(self) -> None:
         self._knock_online("203.0.113.9")

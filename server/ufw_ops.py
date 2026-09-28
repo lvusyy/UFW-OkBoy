@@ -45,6 +45,10 @@ def canonical_ip(value) -> str:
     return str(ip)
 
 
+class LockTimeout(RuntimeError):
+    """The host lock was not free within HostLock.timeout."""
+
+
 class HostLock:
     """An exclusive lock shared by every thread and process on the host (gunicorn
     workers, CLI commands, the cleanup timer): an flock on *path*, re-entrant
@@ -57,19 +61,26 @@ class HostLock:
     never interleave with another's.
     """
 
-    def __init__(self, path: str) -> None:
+    def __init__(self, path: str, timeout: float | None = None) -> None:
         self.path = path
+        # Seconds to wait before giving up with LockTimeout (None: as long as it
+        # takes). The server sets one below gunicorn's worker timeout, so a
+        # request stuck behind a long CLI or cleanup run fails cleanly instead
+        # of having its worker killed.
+        self.timeout = timeout
         self._mu = threading.RLock()
         self._depth = 0
         self._fd = None
 
     def __enter__(self):
-        self._mu.acquire()
+        deadline = None if self.timeout is None else time.monotonic() + self.timeout
+        if not self._mu.acquire(timeout=-1 if deadline is None else self.timeout):
+            raise LockTimeout(f"{self.path} is busy")
         if self._depth == 0 and fcntl is not None:
             try:
                 fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
                 try:
-                    fcntl.flock(fd, fcntl.LOCK_EX)
+                    self._flock(fd, deadline)
                 except BaseException:
                     os.close(fd)
                     raise
@@ -79,6 +90,19 @@ class HostLock:
             self._fd = fd
         self._depth += 1
         return self
+
+    def _flock(self, fd: int, deadline: float | None) -> None:
+        if deadline is None:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            return
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise LockTimeout(f"{self.path} is busy") from None
+                time.sleep(0.05)
 
     def __exit__(self, *exc) -> bool:
         self._depth -= 1
@@ -118,9 +142,15 @@ class UFWManager:
         """
         cmd = ["ufw", *args]
         logger.info("Exec: %s", " ".join(cmd))
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=30, check=False,
-        )
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=30, check=False,
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            # One exception type for every failure: callers keep their state on
+            # RuntimeError, and a timeout used to escape that (a CLI revoke then
+            # exited before rotating the secret).
+            raise RuntimeError(f"UFW command failed: {exc}") from exc
         if result.returncode != 0:
             logger.error(
                 "UFW failed (rc=%d): cmd=%s | stderr=%s",
@@ -153,7 +183,7 @@ class UFWManager:
             )
         logger.info("Added rule: %s -> port %s/%s (%s)", src, port, proto, comment)
 
-    def list_rules_by_comment(self, comment_prefix: str) -> list[dict]:
+    def list_rules_by_comment(self, comment_prefix: str, strict: bool = False) -> list[dict]:
         """Return UFW rules whose comment starts with *comment_prefix*.
 
         Parses ``ufw status numbered`` output. Each returned item is::
@@ -161,15 +191,20 @@ class UFWManager:
             {"number": int, "ip": str, "port": int, "proto": str, "comment": str}
 
         Rules without a number (very old UFW) or failing to parse are
-        skipped. Returns an empty list if the numbered view is unavailable.
+        skipped. Returns an empty list if the numbered view is unavailable —
+        unless *strict*: then that raises RuntimeError, as a removal must not
+        take "could not list the rules" for "no rule to remove".
         """
-        try:
-            output = subprocess.run(
-                ["ufw", "status", "numbered"], capture_output=True,
-                text=True, timeout=15, check=False,
-            ).stdout
-        except Exception:
-            return []
+        if strict:
+            output = self._run_ufw("status", "numbered")
+        else:
+            try:
+                output = subprocess.run(
+                    ["ufw", "status", "numbered"], capture_output=True,
+                    text=True, timeout=15, check=False,
+                ).stdout
+            except Exception:
+                return []
 
         # Lines look like:
         # [ 1] 22/tcp                     ALLOW IN    1.2.3.4        # ufw-okboy:alice:web
@@ -319,7 +354,7 @@ class UFWManager:
         base = f"{self.rule_prefix}:{username}"
         wanted = {f"{base}:{group}", base} if group else {base}
         with self.lock:  # the number found must still be this rule's
-            for rule in self.list_rules_by_comment(base):
+            for rule in self.list_rules_by_comment(base, strict=True):
                 if (rule["comment"] in wanted and rule["ip"] == ip
                         and rule["port"] == port and rule["proto"] == proto):
                     self._run_ufw("--force", "delete", str(rule["number"]))
@@ -328,23 +363,33 @@ class UFWManager:
                     return
         logger.info("No rule to remove: %s -> port %s/%s (%s)", ip, port, proto, base)
 
-    def purge_rules(self, username: str | None = None, group: str | None = None) -> int:
+    def purge_rules(self, username: str | None = None, group: str | None = None,
+                    port: int | None = None, proto: str | None = None) -> int:
         """Delete every rule of *username* (any group), of *group* (any user), or
         of that user in that group — whatever the source address: a stale IP, or
         an "any" injected before addresses were validated, must go too. For when
         the user, group or membership is going away, or access is revoked.
 
+        A rule from before groups (comment ``<prefix>:<user>``) names no group:
+        with *group*, it counts as that group's when it is on the group's
+        *port*/*proto*.
+
         Deletes from the highest number down, under the host lock. Returns how
-        many were deleted; raises RuntimeError when ufw fails, so the caller can
-        keep what it would otherwise forget until the rule is really gone.
+        many were deleted; raises RuntimeError when ufw fails — listing the
+        rules included — so the caller can keep what it would otherwise forget
+        until the rule is really gone.
         """
         prefix = f"{self.rule_prefix}:"
         with self.lock:
             doomed = []
-            for rule in self.list_rules_by_comment(prefix):
+            for rule in self.list_rules_by_comment(prefix, strict=True):
                 user, _, grp = rule["comment"][len(prefix):].partition(":")
-                if (username is None or user == username) and (group is None or grp == group):
-                    doomed.append(rule)
+                if username is not None and user != username:
+                    continue
+                pre_group = grp == "" and (rule["port"], rule["proto"]) == (port, proto)
+                if group is not None and grp != group and not pre_group:
+                    continue
+                doomed.append(rule)
             for rule in sorted(doomed, key=lambda r: r["number"], reverse=True):
                 self._run_ufw("--force", "delete", str(rule["number"]))
                 logger.info("Removed rule: %s -> port %s/%s (%s)",
@@ -374,9 +419,17 @@ class UFWManager:
         added: list[str] = []
         removed: list[str] = []
 
-        # Single pass: fetch all of this user's rules once (fixes N+1).
+        # Single pass: fetch all of this user's rules once (fixes N+1) — a rule
+        # from before groups ("<prefix>:<user>") too: the per-group rules
+        # supersede it, and nothing else would ever remove it.
         prefix = f"{self.rule_prefix}:{username}:"
-        user_rules = self.list_rules_by_comment(prefix)
+        pre_group = prefix[:-1]
+
+        def listing() -> list[dict]:
+            return [r for r in self.list_rules_by_comment(pre_group)
+                    if r["comment"] == pre_group or r["comment"].startswith(prefix)]
+
+        user_rules = listing()
         existing = {(r["ip"], r["port"], r["proto"], r["comment"]): r for r in user_rules}
 
         # Add missing rules for every enabled group (per-group proto preserved).
@@ -403,16 +456,16 @@ class UFWManager:
         # untouched (ascending, the second delete would hit the rule that moved
         # into the first one's place — another user's, or a host DENY).
         if added:
-            user_rules = self.list_rules_by_comment(prefix)
+            user_rules = listing()
         enabled_names = set(enabled_groups.keys())
         for rule in sorted(user_rules, key=lambda r: r["number"], reverse=True):
             suffix = rule["comment"][len(prefix):]
             group_name = suffix.split(":", 1)[0] if suffix else ""
             stale = (group_name not in enabled_names) or (rule["ip"] != client_ip)
-            if group_name and stale:
+            if stale:
                 try:
                     self._run_ufw("--force", "delete", str(rule["number"]))
-                    removed.append(group_name)
+                    removed.append(group_name or rule["comment"])
                 except RuntimeError:
                     logger.warning(
                         "reconcile: failed to remove stale rule %s (%s)",
@@ -565,26 +618,22 @@ class UFWManager:
         ENABLED groups) is provided, each recovered user's rules are reconciled
         against their currently-enabled groups: rules for disabled groups are
         removed, so UFW ends up consistent with DB enabled state (fixes ORPHAN-B).
-        """
-        pattern = re.compile(
-            rf"ALLOW\s+IN?\s+(\S+)\s+.*#\s*{re.escape(self.rule_prefix)}:([^:\s]+)(?::([^:\s]+))?"
-        )
-        try:
-            output = subprocess.run(
-                ["ufw", "status"], capture_output=True, text=True, timeout=15, check=False,
-            ).stdout
-        except Exception:
-            return {}
 
+        Hold :attr:`lock` from reading *user_group_ports* until this returns: a
+        deletion completing in between would otherwise be undone from the
+        stale map.
+        """
+        # The numbered listing: plain `ufw status` prints "ALLOW", not "ALLOW
+        # IN", and the pattern once used on it never matched a rule.
+        prefix = f"{self.rule_prefix}:"
         recovered: dict = {}
         now = int(time.time())
         # Group recovery by user so reconcile runs once per user.
         by_user: dict[str, str] = {}
-        for line in output.splitlines():
-            m = pattern.search(line)
-            if m:
-                ip, username = m.group(1), m.group(2)
-                by_user[username] = ip
+        for rule in self.list_rules_by_comment(prefix):
+            ip = canonical_ip(rule["ip"])
+            if ip:  # not "Anywhere" (a rule injected before addresses were checked)
+                by_user[rule["comment"][len(prefix):].split(":", 1)[0]] = ip
 
         for username, ip in by_user.items():
             user = self.db.get_user_by_username(username)

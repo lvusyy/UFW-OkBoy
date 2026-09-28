@@ -540,7 +540,11 @@ else
     warn "  CLI clients: set verify_ssl: false (knock.py) or INSECURE=1 (knock.sh) for self-signed."
 fi
 echo ""
-echo "  Firewall:        UFW active; SSH ($SSH_PORTS) + $HTTPS_PORT/tcp allowed."
+if [[ -n "${SSH_PORTS:-}" ]]; then
+    echo "  Firewall:        UFW active; SSH ($SSH_PORTS) + $HTTPS_PORT/tcp allowed."
+else
+    echo "  Firewall:        UFW active; $HTTPS_PORT/tcp allowed, SSH rules left as they were."
+fi
 warn "  Keep the SSH rule — removing it (or letting the tool manage port 22) can lock you out."
 echo ""
 echo "  Management commands (run from any directory):"

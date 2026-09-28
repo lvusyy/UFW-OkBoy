@@ -41,12 +41,13 @@ def build_auth_header(username: str, secret: str, ts: int | None = None) -> str:
 
 
 class StubUFWManager(UFWManager):
-    """UFWManager subclass that records add_rule/remove_rule calls without running ufw."""
+    """UFWManager subclass that records add/remove/purge calls without running ufw."""
 
     def __init__(self, db: Database) -> None:
         super().__init__(rule_prefix="ufw-okboy", db=db)
         self.add_calls: list[dict] = []
         self.remove_calls: list[dict] = []
+        self.purge_calls: list[dict] = []
 
     def add_rule(self, ip: str, port: int, username: str, proto: str = "tcp",
                  group: str | None = None) -> None:
@@ -61,6 +62,13 @@ class StubUFWManager(UFWManager):
             "ip": ip, "port": port, "username": username,
             "proto": proto, "group": group,
         })
+
+    def purge_rules(self, username: str | None = None, group: str | None = None,
+                    port: int | None = None, proto: str | None = None) -> int:
+        self.purge_calls.append({
+            "username": username, "group": group, "port": port, "proto": proto,
+        })
+        return 0
 
 
 class CommentCaptureUFW(UFWManager):
@@ -216,11 +224,10 @@ class TestIPLifecycle(unittest.TestCase):
         self.assertTrue(body["ok"])
         self.assertFalse(body["enabled"])
 
-        self.assertEqual(len(self.ufw.remove_calls), 1)
-        rm = self.ufw.remove_calls[0]
-        self.assertEqual(rm["ip"], "203.0.113.40")
-        self.assertEqual(rm["port"], 8080)
-        self.assertEqual(rm["group"], "web")
+        # Every rule of the membership, whatever its address.
+        self.assertEqual(self.ufw.purge_calls, [
+            {"username": "alice", "group": "web", "port": 8080, "proto": "tcp"},
+        ])
         self.assertEqual(len(self.ufw.add_calls), 0)
 
     def test_toggle_membership_on_adds_rules(self) -> None:
