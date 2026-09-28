@@ -9,7 +9,8 @@ Authentication: HMAC-SHA256 with timestamp (secret never transmitted).
 """
 
 import argparse
-import hashlib
+import functools
+import ipaddress
 import json
 import logging
 import re
@@ -30,7 +31,7 @@ from werkzeug.exceptions import HTTPException
 
 import auth
 from db import Database, is_placeholder_secret
-from ufw_ops import UFWManager
+from ufw_ops import HostLock, UFWManager, canonical_ip
 
 logger = logging.getLogger("ufw-okboy")
 
@@ -84,7 +85,9 @@ def open_database(cfg: dict) -> Database:
     """Construct, initialize, and (if empty) migrate the Database from config."""
     db = Database(cfg.get("db_path", "/var/lib/ufw-okboy/ufw-okboy.db"))
     db.init()
-    if not db.list_users():
+    # Only a database created just now: seeding whenever the users table is
+    # empty would bring back, with their old secrets, users an admin deleted.
+    if db.fresh:
         db.migrate_from_json(
             cfg.get("state_file", "/var/lib/ufw-okboy/state.json"),
             cfg["users"],
@@ -167,7 +170,7 @@ def create_app(config_path: str = "config.yaml",
 
     def _auth():
         return auth.verify_hmac(
-            db, request.headers.get("Authorization"), ttl, _client_ip(),
+            db, request.headers.get("Authorization"), ttl, _request_ip(),
         )
 
     def _client_ip() -> str:
@@ -178,21 +181,88 @@ def create_app(config_path: str = "config.yaml",
         list, so a client reaching Flask directly cannot spoof these headers to
         register an arbitrary IP in the firewall allowlist (fixes H-9). Default
         trusted: localhost.
+
+        Only one IP address comes out, canonical. A trusted proxy's header that
+        is anything else ("any", a CIDR, a hostname) — or no header at all —
+        yields "", which knock refuses: the address goes into a ufw rule, where
+        "any" or "0.0.0.0/0" means everyone, and falling back to the peer would
+        allowlist the proxy itself when it is not on loopback.
         """
         peer = request.remote_addr or ""
         trusted = cfg.get("trusted_proxies", ["127.0.0.1", "::1"])
         if peer in trusted:
+            xri = (request.headers.get("X-Real-IP") or "").strip()
+            if xri:
+                return canonical_ip(xri)
             xff = request.headers.get("X-Forwarded-For", "")
-            return (
-                request.headers.get("X-Real-IP")
+            if xff.strip():
                 # Rightmost XFF entry = the address the trusted proxy actually
                 # saw; the leftmost is client-supplied and spoofable (nginx
                 # APPENDS the real peer via $proxy_add_x_forwarded_for).
-                or (xff.split(",")[-1].strip() if xff.strip() else "")
-                or peer
-            )
+                return canonical_ip(xff.split(",")[-1])
+            return ""
         # Not behind a trusted proxy: the peer IS the real client.
-        return peer
+        return canonical_ip(peer)
+
+    def _request_ip() -> str:
+        """The address failures are recorded and throttled under: the client's,
+        or the direct peer's when that is unknown — never "", which would let a
+        request with a bad proxy header escape the throttle."""
+        return _client_ip() or request.remote_addr or ""
+
+    # Every sequence that changes the firewall and the database together — a
+    # knock, a membership change, a revoke, a deletion — runs under the host lock
+    # the ufw layer uses, also taken by the CLI and the cleanup timer. So they
+    # never interleave: a revoke cannot land between a knock's signature check
+    # and its rule write, and a delete by number cannot hit a shifted rule.
+    def _serialized(handler):
+        @functools.wraps(handler)
+        def wrapper(*args, **kwargs):
+            with ufw.lock:
+                return handler(*args, **kwargs)
+        return wrapper
+
+    # TOTP checks are atomic with their per-account cap: concurrent requests
+    # (several gunicorn workers) cannot all pass the cap check together.
+    totp_lock = HostLock(os.path.join(os.path.dirname(os.path.abspath(db.db_path)), "totp.lock"))
+    TOTP_FAILURE = "Invalid TOTP code"
+
+    def _totp_attempt(user, code, pending: str | None = None) -> str:
+        """Check a TOTP *code* for *user* — against the *pending* secret when
+        confirming an enrollment, else the active one — consuming it on success
+        (RFC 6238 §5.2: an accepted code is never accepted again).
+
+        Returns "ok", "missing", "locked", "bad" or "replay". A missing code is
+        not a guess and is not counted (the console first asks without one to
+        learn a code is needed). Every wrong or replayed code is recorded, which
+        counts toward the caller IP's throttle and toward a per-account cap that
+        holds across IPs and endpoints (step-up, activate, re-enroll, disable):
+        past it every check is "locked" until old failures age out — otherwise a
+        stolen admin HMAC secret could brute-force the 6-digit code.
+        """
+        code = code.strip() if isinstance(code, str) else ""
+        if not code:
+            return "missing"
+        with totp_lock:
+            if throttle_max > 0 and db.count_recent_user_failures(
+                    user["username"], TOTP_FAILURE, throttle_window) >= throttle_max:
+                return "locked"
+            fresh = db.get_user(user["id"]) or user  # the last counter as of now
+            matched = auth.verify_totp_counter(pending or fresh["totp_secret"], code)
+            last = fresh["totp_last_counter"] if "totp_last_counter" in fresh.keys() else 0
+            # The counter guards the active secret; a pending one has never had
+            # a code accepted (its first step may well be the one just used).
+            replayed = (pending is None and totp_replay_protection and matched is not None
+                        and matched <= (last or 0))
+            if matched is None or replayed:
+                db.record_failed_attempt(user["username"], _request_ip(), TOTP_FAILURE)
+                return "replay" if replayed else "bad"
+            if totp_replay_protection:
+                db.set_totp_last_counter(user["id"], matched)
+            return "ok"
+
+    def _totp_locked_response():
+        return jsonify({"ok": False, "error": "Too many failed TOTP codes; try again later"}), 429
 
     @app.before_request
     def _throttle_gate():
@@ -203,24 +273,28 @@ def create_app(config_path: str = "config.yaml",
         """
         if not request.path.startswith("/api/"):
             return None
-        err = auth.check_ip_throttle(db, _client_ip(), throttle_max, throttle_window)
+        err = auth.check_ip_throttle(db, _request_ip(), throttle_max, throttle_window)
         if err:
-            logger.warning("Throttled %s on %s", _client_ip(), request.path)
+            logger.warning("Throttled %s on %s", _request_ip(), request.path)
             return jsonify({"ok": False, "error": err}), 429
         return None
 
     # ---- API Routes ---- #
 
     @app.route("/api/knock", methods=["POST"])
+    @_serialized
     def knock():
         """Register or update the caller's IP in the firewall allowlist."""
         username, err = _auth()
         if err:
-            logger.warning("Auth failed from %s: %s", _client_ip(), err)
+            logger.warning("Auth failed from %s: %s", _request_ip(), err)
             return jsonify({"ok": False, "error": err}), 401
 
+        # Only a real remote address may be allowlisted: not loopback (a direct,
+        # un-proxied caller or a missing proxy header), not unspecified.
         client_ip = _client_ip()
-        if not client_ip or client_ip == "127.0.0.1":
+        if not client_ip or ipaddress.ip_address(client_ip).is_loopback \
+                or ipaddress.ip_address(client_ip).is_unspecified:
             return jsonify({
                 "ok": False,
                 "error": "Cannot determine real client IP. Check Nginx X-Real-IP header.",
@@ -266,7 +340,10 @@ def create_app(config_path: str = "config.yaml",
         # swap (not a stale read), so it always hits the right address.
         if old_ip:
             for grp in enabled_groups:
-                ufw.remove_rule(old_ip, grp["port"], username, grp["proto"], grp["name"])
+                try:
+                    ufw.remove_rule(old_ip, grp["port"], username, grp["proto"], grp["name"])
+                except RuntimeError as exc:  # the next knock's reconcile retries it
+                    logger.warning("Old-IP rule removal failed for %s: %s", username, exc)
             logger.info("Removed old-IP rules for %s (was %s)", username, old_ip)
 
         logger.info("Knock: %s@%s (was %s)", username, client_ip, old_ip or "new")
@@ -347,6 +424,7 @@ def create_app(config_path: str = "config.yaml",
         return jsonify({"ok": True, "username": username, "groups": groups})
 
     @app.route("/api/me/membership/<int:group_id>", methods=["PATCH"])
+    @_serialized
     def self_toggle_membership(group_id: int):
         """Toggle the caller's own group membership (self-authorization).
 
@@ -375,38 +453,44 @@ def create_app(config_path: str = "config.yaml",
         if not group:
             return jsonify({"ok": False, "error": "Group not found"}), 404
 
-        # Self-enable authorization check (VULN-A): re-enable only if the
-        # user was previously authorized for this group.
-        if enabled and not auth.is_admin(db, username):
-            if not auth.user_has_group_access(
-                db, username, group_id, allow_reenable=True,
-            ):
-                db.log_audit(
-                    username, "unauthorized_reenable_attempt",
-                    f"self/{group_id}", "self-enable of never-authorized group",
-                )
-                return jsonify({
-                    "ok": False,
-                    "error": "Forbidden: you may only re-enable a previously "
-                             "authorized group. Ask an admin to grant access.",
-                }), 403
+        # Self-toggle authorization (VULN-A): only a membership the user already
+        # has — previously authorized — can be switched, by anyone, admins
+        # included. A new grant goes through the admin endpoint and its TOTP
+        # step-up; admins used to skip this check, and with no membership row
+        # the update below changes nothing, yet the port was opened.
+        if not auth.user_has_group_access(db, username, group_id, allow_reenable=True):
+            if not enabled:
+                return jsonify({"ok": False, "error": "Membership not found"}), 404
+            db.log_audit(
+                username, "unauthorized_reenable_attempt",
+                f"self/{group_id}", "self-enable of never-authorized group",
+            )
+            return jsonify({
+                "ok": False,
+                "error": "Forbidden: you may only re-enable a previously "
+                         "authorized group. Ask an admin to grant access.",
+            }), 403
 
         db.set_membership_enabled(requester["id"], group_id, 1 if enabled else 0)
 
         user_ip = requester["current_ip"]
         if user_ip:
             if not enabled:
-                ufw.remove_rule(
-                    user_ip, group["port"], requester["username"],
-                    group["proto"], group["name"],
-                )
+                try:
+                    ufw.remove_rule(
+                        user_ip, group["port"], requester["username"],
+                        group["proto"], group["name"],
+                    )
+                except RuntimeError:  # disabled in the DB: the next knock removes it
+                    return jsonify({"ok": False, "error": "Firewall update failed; retry"}), 500
             else:
-                # Idempotent add via reconcile: checks existence first so
-                # re-enabling a group whose rule already exists is a no-op
-                # rather than a duplicate-add error (fixes H-11).
+                # Idempotent add via reconcile (fixes H-11), with ALL the user's
+                # enabled groups: reconcile removes the rules of every group
+                # missing from the map, so passing only this one would close the
+                # user's other groups until their next knock.
                 ufw.reconcile_user_rules(
                     requester["username"], user_ip,
-                    {group["name"]: (group["port"], group["proto"])},
+                    db.get_user_enabled_groups_ports(requester["id"]),
                 )
 
         db.log_audit(
@@ -418,6 +502,7 @@ def create_app(config_path: str = "config.yaml",
         })
 
     @app.route("/api/membership/<int:user_id>/<int:group_id>", methods=["PATCH"])
+    @_serialized
     def toggle_membership(user_id: int, group_id: int):
         """Toggle a user's group membership and sync UFW rules immediately.
 
@@ -465,37 +550,42 @@ def create_app(config_path: str = "config.yaml",
         if not target:
             return jsonify({"ok": False, "error": "User not found"}), 404
 
-        # Self-enable authorization check (VULN-A): a non-admin user may only
-        # re-enable a group they were previously authorized for. Enabling a
-        # group they have never been granted requires an admin (join API).
-        if is_self and enabled and not auth.is_admin(db, username):
-            if not auth.user_has_group_access(
-                db, username, group_id, allow_reenable=True,
-            ):
-                db.log_audit(
-                    username, "unauthorized_reenable_attempt",
-                    f"{user_id}/{group_id}", "self-enable of never-authorized group",
-                )
-                return jsonify({
-                    "ok": False,
-                    "error": "Forbidden: you may only re-enable a group you were "
-                             "previously authorized for. Ask an admin to grant access.",
-                }), 403
+        # Only an existing membership can be toggled — a new grant goes through
+        # the admin join API and its TOTP step-up. For a self-enable, admins
+        # included, that is the VULN-A rule: re-enable a previously authorized
+        # group only (admins skipped it, and with no membership row the update
+        # below changes nothing, yet the port was opened).
+        if not db.membership_exists(user_id, group_id):
+            if not (is_self and enabled):
+                return jsonify({"ok": False, "error": "Membership not found"}), 404
+            db.log_audit(
+                username, "unauthorized_reenable_attempt",
+                f"{user_id}/{group_id}", "self-enable of never-authorized group",
+            )
+            return jsonify({
+                "ok": False,
+                "error": "Forbidden: you may only re-enable a group you were "
+                         "previously authorized for. Ask an admin to grant access.",
+            }), 403
 
         db.set_membership_enabled(user_id, group_id, 1 if enabled else 0)
 
         user_ip = target["current_ip"]
         if user_ip:
             if not enabled:
-                ufw.remove_rule(
-                    user_ip, group["port"], target["username"],
-                    group["proto"], group["name"],
-                )
+                try:
+                    ufw.remove_rule(
+                        user_ip, group["port"], target["username"],
+                        group["proto"], group["name"],
+                    )
+                except RuntimeError:  # disabled in the DB: the next knock removes it
+                    return jsonify({"ok": False, "error": "Firewall update failed; retry"}), 500
             else:
-                # Idempotent add via reconcile (fixes H-11).
+                # Idempotent add via reconcile (fixes H-11), with ALL enabled
+                # groups (see self_toggle_membership).
                 ufw.reconcile_user_rules(
                     target["username"], user_ip,
-                    {group["name"]: (group["port"], group["proto"])},
+                    db.get_user_enabled_groups_ports(user_id),
                 )
 
         db.log_audit(
@@ -546,23 +636,17 @@ def create_app(config_path: str = "config.yaml",
         if enabled:
             code = (request.headers.get("X-TOTP-Code")
                     or (request.get_json(silent=True) or {}).get("totp_code"))
-            matched = auth.verify_totp_counter(user["totp_secret"], code)
-            last = user["totp_last_counter"] if "totp_last_counter" in user.keys() else 0
-            replayed = (totp_replay_protection and matched is not None
-                        and matched <= last)
-            if matched is None or replayed:
-                db.log_audit(user["username"], "stepup_failed", user["username"],
-                             "replay" if replayed else None)
-                # Count a bad/replayed step-up code toward the IP throttle; else an
-                # already-admin-authenticated caller could brute-force the 6-digit
-                # code unbounded (the HMAC throttle never sees these attempts).
-                db.record_failed_attempt(user["username"], _client_ip(), "Invalid TOTP step-up")
+            result = _totp_attempt(user, code)
+            if result == "locked":
+                return _totp_locked_response()
+            if result != "ok":
+                if result != "missing":
+                    db.log_audit(user["username"], "stepup_failed", user["username"],
+                                 "replay" if result == "replay" else None)
                 return jsonify({
                     "ok": False, "error": "Valid TOTP code required",
                     "totp_required": True,
                 }), 403
-            if totp_replay_protection:
-                db.set_totp_last_counter(user["id"], matched)
         elif require_admin_totp:
             return jsonify({
                 "ok": False,
@@ -571,30 +655,11 @@ def create_app(config_path: str = "config.yaml",
             }), 403
         return None
 
-    def _consume_totp(user, code: str | None) -> bool:
-        """Counter-based TOTP verify with replay protection (RFC 6238 §5.2),
-        consuming the code on success.
-
-        Returns True for a fresh valid code (advancing ``totp_last_counter`` when
-        replay protection is on), False for an invalid OR replayed code. Used by
-        the TOTP disable / re-enroll paths so the most security-critical 2FA
-        operations honor the same replay protection as ``_step_up_error`` —
-        previously they used the bare ``verify_totp`` bool and a single captured
-        code stayed valid for its whole ±window.
-        """
-        matched = auth.verify_totp_counter(user["totp_secret"], code)
-        last = user["totp_last_counter"] if "totp_last_counter" in user.keys() else 0
-        if matched is None or (totp_replay_protection and matched <= last):
-            return False
-        if totp_replay_protection:
-            db.set_totp_last_counter(user["id"], matched)
-        return True
-
     @app.route("/api/admin/users", methods=["GET"])
     def admin_list_users():
         """List all users (admin only). Secrets are stripped from the response."""
         user, err = auth.require_admin(
-            db, request.headers.get("Authorization"), ttl, _client_ip(),
+            db, request.headers.get("Authorization"), ttl, _request_ip(),
         )
         if err:
             return _admin_error_response(err)
@@ -610,7 +675,7 @@ def create_app(config_path: str = "config.yaml",
     def admin_create_user():
         """Create a new user (admin only). Returns the generated/explied secret."""
         user, err = auth.require_admin(
-            db, request.headers.get("Authorization"), ttl, _client_ip(),
+            db, request.headers.get("Authorization"), ttl, _request_ip(),
         )
         if err:
             return _admin_error_response(err)
@@ -640,10 +705,11 @@ def create_app(config_path: str = "config.yaml",
         }), 201
 
     @app.route("/api/admin/users/<int:user_id>", methods=["DELETE"])
+    @_serialized
     def admin_delete_user(user_id: int):
         """Delete a user and clean up their UFW rules (admin only)."""
         user, err = auth.require_admin(
-            db, request.headers.get("Authorization"), ttl, _client_ip(),
+            db, request.headers.get("Authorization"), ttl, _request_ip(),
         )
         if err:
             return _admin_error_response(err)
@@ -653,9 +719,13 @@ def create_app(config_path: str = "config.yaml",
         target = db.get_user(user_id)
         if not target:
             return jsonify({"ok": False, "error": "User not found"}), 404
-        if target["current_ip"]:
-            for g in db.get_user_groups(user_id, only_enabled=True):
-                ufw.remove_rule(target["current_ip"], g["port"], target["username"], g["proto"], g["name"])
+        # Every rule of the user, at any address — and none left behind: once
+        # the user is gone nothing would ever remove a remaining rule.
+        try:
+            ufw.purge_rules(username=target["username"])
+        except RuntimeError as exc:
+            return jsonify({"ok": False, "error": f"Removing the user's firewall rules "
+                                                  f"failed; user kept, retry: {exc}"}), 500
         db.delete_user(user_id)
         db.log_audit(user["username"], "user_del", target["username"], None)
         return jsonify({"ok": True, "deleted": user_id})
@@ -664,7 +734,7 @@ def create_app(config_path: str = "config.yaml",
     def admin_list_groups():
         """List all groups (admin only)."""
         user, err = auth.require_admin(
-            db, request.headers.get("Authorization"), ttl, _client_ip(),
+            db, request.headers.get("Authorization"), ttl, _request_ip(),
         )
         if err:
             return _admin_error_response(err)
@@ -675,7 +745,7 @@ def create_app(config_path: str = "config.yaml",
     def admin_create_group():
         """Create a new group (admin only)."""
         user, err = auth.require_admin(
-            db, request.headers.get("Authorization"), ttl, _client_ip(),
+            db, request.headers.get("Authorization"), ttl, _request_ip(),
         )
         if err:
             return _admin_error_response(err)
@@ -691,6 +761,8 @@ def create_app(config_path: str = "config.yaml",
         if name_err:
             return jsonify({"ok": False, "error": name_err}), 400
         proto = data.get("proto", "tcp")
+        if proto not in ("tcp", "udp"):
+            return jsonify({"ok": False, "error": "proto must be tcp or udp"}), 400
 
         # Port whitelist (VULN-B): when an admin explicitly configures
         # `allowed_ports`, new groups may only bind to ports in that set.
@@ -739,10 +811,11 @@ def create_app(config_path: str = "config.yaml",
         }), 201
 
     @app.route("/api/admin/groups/<int:group_id>", methods=["DELETE"])
+    @_serialized
     def admin_delete_group(group_id: int):
         """Delete a group and clean up UFW rules for its members (admin only)."""
         user, err = auth.require_admin(
-            db, request.headers.get("Authorization"), ttl, _client_ip(),
+            db, request.headers.get("Authorization"), ttl, _request_ip(),
         )
         if err:
             return _admin_error_response(err)
@@ -752,18 +825,21 @@ def create_app(config_path: str = "config.yaml",
         group = db.get_group(group_id)
         if not group:
             return jsonify({"ok": False, "error": "Group not found"}), 404
-        for m in db.get_group_members(group_id):
-            if m["current_ip"]:
-                ufw.remove_rule(m["current_ip"], group["port"], m["username"], group["proto"], group["name"])
+        try:
+            ufw.purge_rules(group=group["name"])  # every member's, at any address
+        except RuntimeError as exc:
+            return jsonify({"ok": False, "error": f"Removing the group's firewall rules "
+                                                  f"failed; group kept, retry: {exc}"}), 500
         db.delete_group(group_id)
         db.log_audit(user["username"], "group_del", group["name"], None)
         return jsonify({"ok": True, "deleted": group_id})
 
     @app.route("/api/admin/users/<int:user_id>/groups", methods=["POST"])
+    @_serialized
     def admin_add_membership(user_id: int):
         """Add a user to a group (admin only)."""
         user, err = auth.require_admin(
-            db, request.headers.get("Authorization"), ttl, _client_ip(),
+            db, request.headers.get("Authorization"), ttl, _request_ip(),
         )
         if err:
             return _admin_error_response(err)
@@ -786,13 +862,19 @@ def create_app(config_path: str = "config.yaml",
             return jsonify({"ok": False, "error": "Group not found"}), 404
         enabled = 1 if data.get("enabled", True) else 0
         db.add_membership(user_id, group_id, enabled=enabled)
-        # Immediate UFW sync: if the target user is online, open the port now.
-        target_ip = target["current_ip"]
-        if target_ip and enabled:
-            ufw.add_rule(
-                target_ip, group["port"], target["username"],
-                group["proto"], group["name"],
-            )
+        # Immediate UFW sync. Enabling opens the port now if the user is online;
+        # disabling an existing membership (enabled: false) closes it — it used
+        # to stay open, and cleanup skips disabled groups.
+        try:
+            if not enabled:
+                ufw.purge_rules(username=target["username"], group=group["name"])
+            elif target["current_ip"]:
+                ufw.reconcile_user_rules(
+                    target["username"], target["current_ip"],
+                    db.get_user_enabled_groups_ports(user_id),
+                )
+        except RuntimeError as exc:
+            return jsonify({"ok": False, "error": f"Firewall update failed; retry: {exc}"}), 500
         db.log_audit(user["username"], "user_join", target["username"], group["name"])
         return jsonify({
             "ok": True, "user_id": user_id,
@@ -800,10 +882,11 @@ def create_app(config_path: str = "config.yaml",
         }), 201
 
     @app.route("/api/admin/memberships/remove", methods=["POST"])
+    @_serialized
     def admin_remove_membership():
         """Remove a user from a group and clean up the UFW rule (admin only)."""
         user, err = auth.require_admin(
-            db, request.headers.get("Authorization"), ttl, _client_ip(),
+            db, request.headers.get("Authorization"), ttl, _request_ip(),
         )
         if err:
             return _admin_error_response(err)
@@ -817,14 +900,14 @@ def create_app(config_path: str = "config.yaml",
             return jsonify({"ok": False, "error": "User not found"}), 404
         if not group:
             return jsonify({"ok": False, "error": "Group not found"}), 404
+        # The rule goes first, at any address: with the membership gone nothing
+        # would remove it later.
+        try:
+            ufw.purge_rules(username=target["username"], group=group["name"])
+        except RuntimeError as exc:
+            return jsonify({"ok": False, "error": f"Removing the firewall rule failed; "
+                                                  f"membership kept, retry: {exc}"}), 500
         db.remove_membership(target["id"], group["id"])
-        # Immediate UFW cleanup: if the target user is online, remove the rule.
-        target_ip = target["current_ip"]
-        if target_ip:
-            ufw.remove_rule(
-                target_ip, group["port"], target["username"],
-                group["proto"], group["name"],
-            )
         db.log_audit(
             user["username"], "remove_membership",
             target["username"], group["name"],
@@ -838,6 +921,7 @@ def create_app(config_path: str = "config.yaml",
         })
 
     @app.route("/api/admin/users/<int:user_id>/revoke", methods=["POST"])
+    @_serialized
     def admin_revoke_user(user_id: int):
         """Revoke a user's active access (admin only).
 
@@ -848,7 +932,7 @@ def create_app(config_path: str = "config.yaml",
         credential. When rotated, the new secret is returned ONCE.
         """
         user, err = auth.require_admin(
-            db, request.headers.get("Authorization"), ttl, _client_ip(),
+            db, request.headers.get("Authorization"), ttl, _request_ip(),
         )
         if err:
             return _admin_error_response(err)
@@ -859,13 +943,16 @@ def create_app(config_path: str = "config.yaml",
         if not target:
             return jsonify({"ok": False, "error": "User not found"}), 404
 
-        if target["current_ip"]:
-            for g in db.get_user_groups(user_id, only_enabled=True):
-                ufw.remove_rule(
-                    target["current_ip"], g["port"], target["username"],
-                    g["proto"], g["name"],
-                )
-        db.clear_user_state(user_id)
+        # Every rule of the user, at any address. If ufw fails, the secret is
+        # still rotated below, but the state (current IP) is kept and the admin
+        # is told, so a retry — or cleanup — can still find and close the rule.
+        fw_error = None
+        try:
+            ufw.purge_rules(username=target["username"])
+        except RuntimeError as exc:
+            fw_error = str(exc)
+        if fw_error is None:
+            db.clear_user_state(user_id)
         data = request.get_json(silent=True) or {}
         rotate = bool(data.get("rotate_secret", True))
         new_secret = None
@@ -877,6 +964,10 @@ def create_app(config_path: str = "config.yaml",
         resp = {"ok": True, "user_id": user_id, "rotated": rotate}
         if new_secret:
             resp["secret"] = new_secret
+        if fw_error:
+            resp["warning"] = ("Removing the user's firewall rules failed — their "
+                               "current IP may still be allowed; revoke again: " + fw_error)
+            db.log_audit(user["username"], "revoke_fw_error", target["username"], fw_error)
         return jsonify(resp)
 
     @app.route("/api/admin/audit", methods=["GET"])
@@ -886,7 +977,7 @@ def create_app(config_path: str = "config.yaml",
         Query param ``limit`` (default 100, clamped to 1..1000).
         """
         user, err = auth.require_admin(
-            db, request.headers.get("Authorization"), ttl, _client_ip(),
+            db, request.headers.get("Authorization"), ttl, _request_ip(),
         )
         if err:
             return _admin_error_response(err)
@@ -904,7 +995,7 @@ def create_app(config_path: str = "config.yaml",
         manual entry into an authenticator app.
         """
         user, err = auth.require_admin(
-            db, request.headers.get("Authorization"), ttl, _client_ip(),
+            db, request.headers.get("Authorization"), ttl, _request_ip(),
         )
         if err:
             return _admin_error_response(err)
@@ -916,13 +1007,18 @@ def create_app(config_path: str = "config.yaml",
         if user["totp_enabled"]:
             recode = (request.headers.get("X-TOTP-Code")
                       or (request.get_json(silent=True) or {}).get("totp_code"))
-            if not _consume_totp(user, recode):
+            result = _totp_attempt(user, recode)
+            if result == "locked":
+                return _totp_locked_response()
+            if result != "ok":
                 return jsonify({
                     "ok": False, "error": "Valid TOTP code required to re-enroll",
                     "totp_required": True,
                 }), 403
         secret = auth.generate_totp_secret()
-        db.set_totp_secret(user["id"], secret)
+        # Pending until confirmed: a TOTP already on stays in force meanwhile —
+        # an abandoned re-enrollment must not leave the account without it.
+        db.set_totp_pending(user["id"], secret)
         db.log_audit(user["username"], "totp_enroll_start", user["username"], None)
         return jsonify({
             "ok": True,
@@ -934,16 +1030,22 @@ def create_app(config_path: str = "config.yaml",
     def admin_totp_activate():
         """Activate a pending TOTP enrollment by confirming a code (admin only)."""
         user, err = auth.require_admin(
-            db, request.headers.get("Authorization"), ttl, _client_ip(),
+            db, request.headers.get("Authorization"), ttl, _request_ip(),
         )
         if err:
             return _admin_error_response(err)
-        if not user["totp_secret"]:
+        pending = user["totp_pending_secret"] if "totp_pending_secret" in user.keys() else None
+        if not pending and not user["totp_enabled"]:
+            pending = user["totp_secret"]  # an enrollment started before v6
+        if not pending:
             return jsonify({"ok": False, "error": "No pending enrollment; call enroll first"}), 400
         code = (request.get_json(silent=True) or {}).get("totp_code", "")
-        if not auth.verify_totp(user["totp_secret"], code):
+        result = _totp_attempt(user, code, pending=pending)
+        if result == "locked":
+            return _totp_locked_response()
+        if result != "ok":
             return jsonify({"ok": False, "error": "Invalid code"}), 400
-        db.enable_totp(user["id"])
+        db.activate_totp(user["id"], pending)
         db.log_audit(user["username"], "totp_activate", user["username"], None)
         return jsonify({"ok": True, "totp_enabled": True})
 
@@ -951,13 +1053,16 @@ def create_app(config_path: str = "config.yaml",
     def admin_totp_disable():
         """Disable TOTP for the calling admin. Requires a current code when enabled."""
         user, err = auth.require_admin(
-            db, request.headers.get("Authorization"), ttl, _client_ip(),
+            db, request.headers.get("Authorization"), ttl, _request_ip(),
         )
         if err:
             return _admin_error_response(err)
         if user["totp_enabled"]:
             code = (request.get_json(silent=True) or {}).get("totp_code", "")
-            if not _consume_totp(user, code):
+            result = _totp_attempt(user, code)
+            if result == "locked":
+                return _totp_locked_response()
+            if result != "ok":
                 return jsonify({"ok": False, "error": "Valid TOTP code required to disable"}), 403
         db.disable_totp(user["id"])
         db.log_audit(user["username"], "totp_disable", user["username"], None)
@@ -972,7 +1077,7 @@ def create_app(config_path: str = "config.yaml",
         checkbox per group.
         """
         user, err = auth.require_admin(
-            db, request.headers.get("Authorization"), ttl, _client_ip(),
+            db, request.headers.get("Authorization"), ttl, _request_ip(),
         )
         if err:
             return _admin_error_response(err)
@@ -996,7 +1101,7 @@ def create_app(config_path: str = "config.yaml",
     def admin_set_admin(user_id: int):
         """Promote/demote a user's admin flag (admin only, step-up protected)."""
         user, err = auth.require_admin(
-            db, request.headers.get("Authorization"), ttl, _client_ip(),
+            db, request.headers.get("Authorization"), ttl, _request_ip(),
         )
         if err:
             return _admin_error_response(err)
@@ -1020,13 +1125,14 @@ def create_app(config_path: str = "config.yaml",
     def admin_ufw_rules():
         """List ALL UFW rules (admin only, read-only)."""
         user, err = auth.require_admin(
-            db, request.headers.get("Authorization"), ttl, _client_ip(),
+            db, request.headers.get("Authorization"), ttl, _request_ip(),
         )
         if err:
             return _admin_error_response(err)
         return jsonify({"ok": True, "rules": ufw.list_all_rules()})
 
     @app.route("/api/admin/ufw/delete", methods=["POST"])
+    @_serialized
     def admin_ufw_delete():
         """Delete a UFW rule by its current number (admin only, HIGH-RISK).
 
@@ -1037,7 +1143,7 @@ def create_app(config_path: str = "config.yaml",
         Returns the refreshed rule list (numbers shift after a deletion).
         """
         user, err = auth.require_admin(
-            db, request.headers.get("Authorization"), ttl, _client_ip(),
+            db, request.headers.get("Authorization"), ttl, _request_ip(),
         )
         if err:
             return _admin_error_response(err)
@@ -1069,7 +1175,14 @@ def create_app(config_path: str = "config.yaml",
             return se
 
         try:
-            ufw.delete_rule(number)
+            # The handler holds the host lock, so the rule found above is still
+            # at this number; delete_rule checks it once more regardless.
+            ufw.delete_rule(number, expect=target)
+        except LookupError:
+            return jsonify({
+                "ok": False,
+                "error": "Rule not found — the list may have changed; refresh and retry.",
+            }), 404
         except Exception as exc:  # ufw failure → report, don't 500-HTML
             return jsonify({"ok": False, "error": f"delete failed: {exc}"}), 500
         db.log_audit(
@@ -1224,36 +1337,29 @@ def cmd_upgrade(args):
     backup_path = f"{db_path}.pre-upgrade-{current}-{int(datetime.now().timestamp())}"
     if Path(db_path).exists():
         shutil.copy2(db_path, backup_path)
+        os.chmod(backup_path, 0o600)  # the copy holds the same secrets
         print(f"DB backed up to: {backup_path}")
     else:
         backup_path = None
         print("No DB file to back up (fresh install?).")
 
-    # --- Step 4: pull new code (git pull preferred; tarball fallback w/ SHA256) ---
-    code_backed_up = False
-    if (repo_root / ".git").exists():
-        print("Pulling new code via git...")
-        import subprocess as _sp
-        if _sp.run(["git", "pull", "--ff-only"], cwd=repo_root).returncode != 0:
-            print("git pull failed.")
-            _rollback(db_path, backup_path, repo_root, code_backed_up)
-            sys.exit(1)
-    else:
-        # Tarball fallback: download + SHA256 verify.
-        tarball_url = f"https://github.com/{github_repo}/archive/refs/tags/v{latest}.tar.gz"
-        print(f"Downloading release tarball ({_gh(tarball_url)})...")
-        try:
-            tmp_tar, _ = urllib.request.urlretrieve(_gh(tarball_url))
-        except Exception as exc:
-            print(f"Download failed: {exc}")
-            sys.exit(1)
-        digest = hashlib.sha256(Path(tmp_tar).read_bytes()).hexdigest()
-        print(f"Downloaded. SHA256: {digest}")
-        print("Extracting over current tree...")
-        import tarfile
-        with tarfile.open(tmp_tar) as tf:
-            tf.extractall(repo_root.parent)
-        Path(tmp_tar).unlink(missing_ok=True)
+    # --- Step 4: pull new code (git checkouts only) ---
+    import subprocess as _sp
+    if not (repo_root / ".git").exists():
+        # Installs from the release package or the installer are not git
+        # checkouts. (This used to download the source archive — unverified,
+        # possibly through a mirror — and unpack it NEXT to the install, so
+        # nothing was upgraded; deploy/upgrade.sh does it properly.)
+        print("This install is not a git checkout: upgrade it with deploy/upgrade.sh "
+              "(see README, Upgrade).")
+        sys.exit(1)
+    old_head = _sp.run(["git", "rev-parse", "HEAD"], cwd=repo_root,
+                       capture_output=True, text=True).stdout.strip() or None
+    print("Pulling new code via git...")
+    if _sp.run(["git", "pull", "--ff-only"], cwd=repo_root).returncode != 0:
+        print("git pull failed.")
+        _rollback(db_path, backup_path, repo_root, old_head)
+        sys.exit(1)
 
     # --- Step 5: run DB migrations ---
     print("Running DB migrations...")
@@ -1266,12 +1372,11 @@ def cmd_upgrade(args):
         db.close()
 
     # --- Step 6: restart the service + health check ---
-    import subprocess as _sp
     print("Restarting service...")
     _sp.run(["systemctl", "restart", "ufw-okboy"])
     if not _health_check():
         print("Health check FAILED after upgrade — rolling back.")
-        _rollback(db_path, backup_path, repo_root, code_backed_up)
+        _rollback(db_path, backup_path, repo_root, old_head)
         sys.exit(1)
     print(f"Upgrade complete: {current} -> {latest}. DB backup at {backup_path}")
 
@@ -1307,15 +1412,17 @@ def _health_check(url: str = "http://127.0.0.1:5000/health", retries: int = 3) -
 
 
 def _rollback(db_path: str, backup_path: str | None,
-              repo_root: Path, code_backed_up: bool) -> None:
-    """Restore DB backup and revert code if possible."""
+              repo_root: Path, old_head: str | None) -> None:
+    """Restore DB backup and move the checkout back to *old_head*, the commit
+    it was on before the pull (``git checkout -- .`` would only have discarded
+    local edits: after a fast-forward the new code would have stayed)."""
     if backup_path and Path(backup_path).exists():
         shutil.copy2(backup_path, db_path)
         print(f"DB restored from {backup_path}")
-    if (repo_root / ".git").exists():
+    if old_head and (repo_root / ".git").exists():
         import subprocess as _sp
-        _sp.run(["git", "checkout", "--", "."], cwd=repo_root)
-        print("Code reverted via git checkout.")
+        _sp.run(["git", "reset", "--hard", old_head], cwd=repo_root)
+        print(f"Code reverted to {old_head[:12]}.")
     print("Rollback complete. Inspect logs: journalctl -u ufw-okboy")
 
 
@@ -1419,14 +1526,16 @@ def cmd_user_del(args):
     cfg = load_config(args.config)
     db = open_database(cfg)
     ufw = UFWManager(rule_prefix=cfg.get("rule_prefix", "ufw-okboy"), db=db)
-    user = db.get_user_by_username(args.username)
-    if not user:
-        print(f"User '{args.username}' not found.")
-        return
-    if user["current_ip"]:
-        for g in db.get_user_groups(user["id"], only_enabled=True):
-            ufw.remove_rule(user["current_ip"], g["port"], args.username, g["proto"], g["name"])
-    db.delete_user(user["id"])
+    with ufw.lock:  # serialized with the server's knocks and admin changes
+        user = db.get_user_by_username(args.username)
+        if not user:
+            print(f"User '{args.username}' not found.")
+            return
+        try:
+            ufw.purge_rules(username=args.username)  # every rule, at any address
+        except RuntimeError as exc:
+            sys.exit(f"Removing the user's firewall rules failed; user kept, retry: {exc}")
+        db.delete_user(user["id"])
     db.log_audit("cli", "user_del", args.username, None)
     print(f"Deleted user '{args.username}'.")
 
@@ -1474,14 +1583,16 @@ def cmd_group_del(args):
     cfg = load_config(args.config)
     db = open_database(cfg)
     ufw = UFWManager(rule_prefix=cfg.get("rule_prefix", "ufw-okboy"), db=db)
-    group = db.get_group_by_name(args.name)
-    if not group:
-        print(f"Group '{args.name}' not found.")
-        return
-    for m in db.get_group_members(group["id"]):
-        if m["current_ip"]:
-            ufw.remove_rule(m["current_ip"], group["port"], m["username"], group["proto"], group["name"])
-    db.delete_group(group["id"])
+    with ufw.lock:  # serialized with the server's knocks and admin changes
+        group = db.get_group_by_name(args.name)
+        if not group:
+            print(f"Group '{args.name}' not found.")
+            return
+        try:
+            ufw.purge_rules(group=args.name)  # every member's, at any address
+        except RuntimeError as exc:
+            sys.exit(f"Removing the group's firewall rules failed; group kept, retry: {exc}")
+        db.delete_group(group["id"])
     db.log_audit("cli", "group_del", args.name, None)
     print(f"Deleted group '{args.name}'.")
 
@@ -1504,22 +1615,23 @@ def cmd_user_join(args):
     cfg = load_config(args.config)
     db = open_database(cfg)
     ufw = UFWManager(rule_prefix=cfg.get("rule_prefix", "ufw-okboy"), db=db)
-    user = db.get_user_by_username(args.username)
-    group = db.get_group_by_name(args.groupname)
-    if not user:
-        print(f"User '{args.username}' not found.")
-        return
-    if not group:
-        print(f"Group '{args.groupname}' not found.")
-        return
-    db.add_membership(user["id"], group["id"])
-    # Immediate UFW sync: if the user is online, open the port now.
-    current_ip = user["current_ip"]
-    if current_ip:
-        ufw.add_rule(
-            current_ip, group["port"], args.username,
-            group["proto"], group["name"],
-        )
+    with ufw.lock:  # serialized with the server's knocks and admin changes
+        user = db.get_user_by_username(args.username)
+        group = db.get_group_by_name(args.groupname)
+        if not user:
+            print(f"User '{args.username}' not found.")
+            return
+        if not group:
+            print(f"Group '{args.groupname}' not found.")
+            return
+        db.add_membership(user["id"], group["id"])
+        # Immediate UFW sync: if the user is online, open the port now.
+        current_ip = user["current_ip"]
+        if current_ip:
+            ufw.add_rule(
+                current_ip, group["port"], args.username,
+                group["proto"], group["name"],
+            )
     db.log_audit("cli", "user_join", args.username, args.groupname)
     print(f"Added '{args.username}' to group '{args.groupname}'.")
 
@@ -1529,17 +1641,20 @@ def cmd_user_leave(args):
     cfg = load_config(args.config)
     db = open_database(cfg)
     ufw = UFWManager(rule_prefix=cfg.get("rule_prefix", "ufw-okboy"), db=db)
-    user = db.get_user_by_username(args.username)
-    group = db.get_group_by_name(args.groupname)
-    if not user:
-        print(f"User '{args.username}' not found.")
-        return
-    if not group:
-        print(f"Group '{args.groupname}' not found.")
-        return
-    if user["current_ip"]:
-        ufw.remove_rule(user["current_ip"], group["port"], args.username, group["proto"], group["name"])
-    db.remove_membership(user["id"], group["id"])
+    with ufw.lock:  # serialized with the server's knocks and admin changes
+        user = db.get_user_by_username(args.username)
+        group = db.get_group_by_name(args.groupname)
+        if not user:
+            print(f"User '{args.username}' not found.")
+            return
+        if not group:
+            print(f"Group '{args.groupname}' not found.")
+            return
+        try:
+            ufw.purge_rules(username=args.username, group=args.groupname)
+        except RuntimeError as exc:
+            sys.exit(f"Removing the firewall rule failed; membership kept, retry: {exc}")
+        db.remove_membership(user["id"], group["id"])
     db.log_audit("cli", "user_leave", args.username, args.groupname)
     print(f"Removed '{args.username}' from group '{args.groupname}'.")
 
@@ -1562,22 +1677,32 @@ def cmd_revoke(args):
     cfg = load_config(args.config)
     db = open_database(cfg)
     ufw = UFWManager(rule_prefix=cfg.get("rule_prefix", "ufw-okboy"), db=db)
-    user = db.get_user_by_username(args.username)
-    if not user:
-        print(f"User '{args.username}' not found.")
-        return
-    if user["current_ip"]:
-        for g in db.get_user_groups(user["id"], only_enabled=True):
-            ufw.remove_rule(user["current_ip"], g["port"], args.username, g["proto"], g["name"])
-    db.clear_user_state(user["id"])
-    new_secret = None
-    if not args.no_rotate:
-        new_secret = secrets.token_hex(32)
-        db.rotate_secret(user["id"], new_secret)
+    with ufw.lock:  # a knock in flight cannot put the access back afterwards
+        user = db.get_user_by_username(args.username)
+        if not user:
+            print(f"User '{args.username}' not found.")
+            return
+        fw_error = None
+        try:
+            ufw.purge_rules(username=args.username)  # every rule, at any address
+        except RuntimeError as exc:
+            fw_error = str(exc)  # keep the state: a retry or cleanup can close it
+        if fw_error is None:
+            db.clear_user_state(user["id"])
+        new_secret = None
+        if not args.no_rotate:
+            new_secret = secrets.token_hex(32)
+            db.rotate_secret(user["id"], new_secret)
     db.log_audit("cli", "revoke", args.username, f"rotate={not args.no_rotate}")
-    print(f"Revoked '{args.username}'. Ports closed, runtime state cleared.")
+    if fw_error:
+        print(f"WARNING: removing the firewall rules of '{args.username}' failed — their "
+              f"current IP may still be allowed; run revoke again: {fw_error}")
+    else:
+        print(f"Revoked '{args.username}'. Ports closed, runtime state cleared.")
     if new_secret:
         print(f"New secret (deliver to the user out-of-band): {new_secret}")
+    if fw_error:
+        sys.exit(1)
 
 
 def cmd_backup(args):
@@ -1586,7 +1711,7 @@ def cmd_backup(args):
     db = open_database(cfg)
     backup_dir = args.dir or cfg.get("backup_dir", "/var/lib/ufw-okboy/backups")
     keep = cfg.get("backup_keep", 7)
-    Path(backup_dir).mkdir(parents=True, exist_ok=True)
+    Path(backup_dir).mkdir(mode=0o700, parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     dest = os.path.join(backup_dir, f"ufw-okboy-{stamp}.db")
     db.backup(dest)
@@ -1595,8 +1720,12 @@ def cmd_backup(args):
         f.write(f"{digest}  {os.path.basename(dest)}\n")
     print(f"Backup written: {dest}")
     print(f"  sha256: {digest}")
+    backups = sorted(Path(backup_dir).glob("ufw-okboy-*.db"))
+    # Backups written by older versions are world-readable; they hold the same
+    # plaintext secrets as the database. Tighten them all, pruned or not.
+    for b in backups:
+        b.chmod(0o600)
     if keep > 0:
-        backups = sorted(Path(backup_dir).glob("ufw-okboy-*.db"))
         for old in backups[:-keep]:
             old.unlink(missing_ok=True)
             Path(str(old) + ".sha256").unlink(missing_ok=True)
@@ -1625,8 +1754,10 @@ def cmd_restore(args):
         print("WARNING: no .sha256 sidecar — restoring without integrity verification.")
     if os.path.exists(db_path):
         shutil.copy2(db_path, db_path + ".pre-restore")
+        os.chmod(db_path + ".pre-restore", 0o600)  # the snapshot holds the same secrets
         print(f"Current DB snapshotted to {db_path}.pre-restore")
     shutil.copy2(src, db_path)
+    os.chmod(db_path, 0o600)
     for ext in ("-wal", "-shm"):
         stale = db_path + ext
         if os.path.exists(stale):
@@ -1692,7 +1823,7 @@ def main():
     p_group_add = sub.add_parser("group-add", help="Create a new port group")
     p_group_add.add_argument("name", help="Group name")
     p_group_add.add_argument("port", type=int, help="Port number")
-    p_group_add.add_argument("--proto", default="tcp", help="Protocol (default: tcp)")
+    p_group_add.add_argument("--proto", default="tcp", choices=["tcp", "udp"], help="Protocol (default: tcp)")
 
     # group-del
     p_group_del = sub.add_parser("group-del", help="Delete a group")

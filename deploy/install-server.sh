@@ -47,8 +47,12 @@ pip_install() {
         fi
     fi
     if [[ -n "$index" ]]; then
-        local host; host="$(echo "$index" | awk -F/ '{print $3}')"
-        "$pip" install -i "$index" --trusted-host "$host" "$@"
+        # --trusted-host also switches certificate checks off for an https
+        # index (a man in the middle could then serve packages that run as
+        # root): pass it only for a plain-http index chosen with --mirror.
+        local trust=()
+        [[ "$index" == http://* ]] && trust=(--trusted-host "$(echo "$index" | awk -F/ '{print $3}')")
+        "$pip" install -i "$index" ${trust[@]+"${trust[@]}"} "$@"
     else
         "$pip" install "$@"
     fi

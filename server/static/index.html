@@ -787,6 +787,8 @@ const I18N = {
     prompt_totp_delete_user: "Enter your 6-digit TOTP code to confirm deleting {0}:",
     prompt_totp_delete_group: "Enter your 6-digit TOTP code to confirm deleting group {0}:",
     prompt_totp_set_admin: "Enter your 6-digit TOTP code to confirm changing admin rights for {0}:",
+    prompt_totp_membership: "Enter your 6-digit TOTP code to confirm changing {0}'s membership of {1}:",
+    prompt_totp_reenroll: "Enter your current 6-digit TOTP code to replace your authenticator:",
     prompt_totp_create_user: "Enter your 6-digit TOTP code to confirm creating user {0}:",
     prompt_totp_create_group: "Enter your 6-digit TOTP code to confirm creating group {0}:",
     prompt_set_admin_pin: "Set an admin PIN to lock the admin console (encrypts your saved credentials):",
@@ -938,6 +940,8 @@ const I18N = {
     prompt_totp_delete_user: "请输入你的 6 位 TOTP 验证码以确认删除 {0}：",
     prompt_totp_delete_group: "请输入你的 6 位 TOTP 验证码以确认删除分组 {0}：",
     prompt_totp_set_admin: "请输入你的 6 位 TOTP 验证码以确认更改 {0} 的管理员权限：",
+    prompt_totp_membership: "请输入你的 6 位 TOTP 验证码以确认更改 {0} 在分组 {1} 中的成员资格：",
+    prompt_totp_reenroll: "请输入你当前的 6 位 TOTP 验证码以更换验证器：",
     prompt_totp_create_user: "请输入你的 6 位 TOTP 验证码以确认创建用户 {0}：",
     prompt_totp_create_group: "请输入你的 6 位 TOTP 验证码以确认创建分组 {0}：",
     prompt_set_admin_pin: "设置管理 PIN 码以锁定管理控制台（加密保存的凭据）：",
@@ -1361,7 +1365,9 @@ async function connect(username, secret, remember) {
   if (remember) {
     if (pin) {
       await encryptVault(pin, { username, secret });
-    } else {
+    } else if (!readVaultBlob()) {
+      // No PIN known this time: never write the plaintext store next to an
+      // existing vault — that would undo the vault's protection.
       localStorage.setItem(STORAGE_KEY, JSON.stringify({ username, secret }));
     }
   }
@@ -1372,6 +1378,10 @@ function disconnect(reason) {
   credentials = null;
   currentIP = null;
   stopTimers();
+  // Leave no secret or PIN in the form: after a lock, "disconnect → connect"
+  // must not bring the credentials (and then the admin console) back unasked.
+  fSecret.value = "";
+  fPin.value = "";
 
   // Switch views
   dashView.hidden = true;
@@ -1523,10 +1533,10 @@ pinForm.addEventListener("submit", async (e) => {
     return;
   }
   pinAttempts = 0;
+  fPin.value = ""; // a later "lock → admin → unlock" must ask for the PIN again
   pinView.hidden = true;
   loginView.hidden = false;
   fUser.value = data.username;
-  fSecret.value = data.secret;
   pendingPin = pin; // re-encrypt with same PIN on next save
   await connect(data.username, data.secret, true);
 });
@@ -1587,6 +1597,7 @@ btnAdmin.addEventListener("click", async () => {
     if (readVaultBlob()) {
       // encrypted vault exists but not unlocked this session
       dashView.hidden = true;
+      fPin.value = "";
       pinView.hidden = false;
       fPin.focus();
       return;
@@ -1612,6 +1623,10 @@ btnAdminBack.addEventListener("click", () => {
 
 btnLock.addEventListener("click", () => {
   vaultKey = null;
+  fPin.value = "";
+  fSecret.value = "";
+  totpSecretEl.innerHTML = "";
+  totpEnrollBox.hidden = true;
   hideSecret();
   adminView.hidden = true;
   // Return to dashboard if still connected, else to login.
@@ -2069,13 +2084,20 @@ adminUsersEl.addEventListener("change", async (e) => {
   adminError.style.display = "none";
   cb.disabled = true;
   try {
-    let r;
-    if (cb.checked) {
-      r = await apiAdmin("POST", `/api/admin/users/${userId}/groups`, { group_id: Number(groupId), enabled: true });
-      if (r.ok) addLog(t("log_group_added", username, groupName), "ok");
-    } else {
-      r = await apiAdmin("POST", "/api/admin/memberships/remove", { username, group_name: groupName });
-      if (r.ok) addLog(t("log_group_removed", username, groupName), "warn");
+    const [path, body] = cb.checked
+      ? [`/api/admin/users/${userId}/groups`, { group_id: Number(groupId), enabled: true }]
+      : ["/api/admin/memberships/remove", { username, group_name: groupName }];
+    let r = await apiAdmin("POST", path, body);
+    // Opening/closing a port for someone is a sensitive write: with TOTP
+    // enabled the server demands a step-up code (like revoke / delete).
+    if (!r.ok && r.totp_required) {
+      const code = prompt(t("prompt_totp_membership", username, groupName));
+      if (!code) return; // finally re-fetches: the checkbox shows server truth
+      r = await apiAdmin("POST", path, { ...body, totp_code: code });
+    }
+    if (r.ok) {
+      if (cb.checked) addLog(t("log_group_added", username, groupName), "ok");
+      else addLog(t("log_group_removed", username, groupName), "warn");
     }
     if (!r.ok) {
       adminError.textContent = r.error || t("err_group_change_failed");
@@ -2191,7 +2213,13 @@ async function refreshTotp() {
 }
 
 btnTotpEnroll.addEventListener("click", async () => {
-  const r = await apiAdmin("POST", "/api/admin/totp/enroll");
+  let r = await apiAdmin("POST", "/api/admin/totp/enroll");
+  // Re-enrolling while TOTP is on must prove the current authenticator.
+  if (!r.ok && r.totp_required) {
+    const code = prompt(t("prompt_totp_reenroll"));
+    if (!code) return;
+    r = await apiAdmin("POST", "/api/admin/totp/enroll", { totp_code: code });
+  }
   if (!r.ok) { adminError.textContent = r.error || t("err_enroll_failed"); adminError.style.display = "block"; return; }
   totpSecretEl.innerHTML = t("totp_secret_html", esc(r.secret), esc(r.otpauth_uri));
   totpEnrollBox.hidden = false;
@@ -2205,6 +2233,7 @@ btnTotpActivate.addEventListener("click", async () => {
   if (r.ok) {
     addLog(t("log_totp_activated"), "ok");
     $("#totp-code").value = "";
+    totpSecretEl.innerHTML = ""; // the seed has no business staying in the page
     totpEnrollBox.hidden = true;
     await refreshTotp();
   } else { adminError.textContent = r.error || t("err_activate_failed"); adminError.style.display = "block"; }

@@ -284,15 +284,6 @@ class TestSecurityWave1(unittest.TestCase):
 
     # -- Revoke: depth coverage --------------------------------------- #
 
-    def _deleted_ports(self) -> set:
-        """Ports that the mocked UFW was asked to delete (legacy delete path)."""
-        ports = set()
-        for c in self._mock_ufw.call_args_list:
-            a = c.args
-            if "delete" in a and "port" in a:
-                ports.add(a[a.index("port") + 1])
-        return ports
-
     def test_revoke_closes_every_enabled_group_port(self) -> None:
         db = self._open_db()
         try:
@@ -303,12 +294,22 @@ class TestSecurityWave1(unittest.TestCase):
         self._knock_online("203.0.113.8")
         self._mock_ufw.reset_mock()
 
-        resp = self.client.post(
-            f"/api/admin/users/{self.alice_id}/revoke",
-            headers={"Authorization": self._admin_header()},
-        )
+        # What ufw lists for alice: one rule per enabled group.
+        listed = [
+            {"number": 3, "ip": "203.0.113.8", "port": 8080, "proto": "tcp",
+             "comment": "ufw-okboy:alice:default-8080"},
+            {"number": 5, "ip": "203.0.113.8", "port": 2222, "proto": "tcp",
+             "comment": "ufw-okboy:alice:extra"},
+        ]
+        with patch.object(UFWManager, "list_rules_by_comment", return_value=listed):
+            resp = self.client.post(
+                f"/api/admin/users/{self.alice_id}/revoke",
+                headers={"Authorization": self._admin_header()},
+            )
         self.assertEqual(resp.status_code, 200)
-        self.assertTrue({"8080", "2222"}.issubset(self._deleted_ports()))
+        # Both deleted by number, the higher first: a delete renumbers the rules after it.
+        self.assertEqual([c.args for c in self._mock_ufw.call_args_list],
+                         [("--force", "delete", "5"), ("--force", "delete", "3")])
 
     def test_revoke_offline_user_skips_ufw(self) -> None:
         """A user who never knocked (current_ip None) revokes without UFW calls."""

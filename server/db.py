@@ -9,6 +9,7 @@ CRUD, logging helpers, state queries, and one-time JSON state migration.
 import hashlib
 import json
 import logging
+import os
 import secrets
 import sqlite3
 import threading
@@ -49,6 +50,7 @@ SCHEMA: dict[str, str] = {
             totp_secret TEXT,
             totp_enabled INTEGER NOT NULL DEFAULT 0,
             totp_last_counter INTEGER NOT NULL DEFAULT 0,
+            totp_pending_secret TEXT,
             created_at TEXT NOT NULL DEFAULT (datetime('now'))
         )
     """,
@@ -115,6 +117,7 @@ MIGRATIONS: list[tuple[int, str]] = [
     (3, "add totp_last_counter to users (TOTP replay protection)"),
     (4, "add UNIQUE(port, proto) index on groups when data permits"),
     (5, "rotate public CHANGE_ME* sample secrets seeded from the example config"),
+    (6, "add totp_pending_secret to users (re-enrollment keeps the active TOTP until confirmed)"),
 ]
 
 CURRENT_SCHEMA_VERSION: int = MIGRATIONS[-1][0]
@@ -132,11 +135,34 @@ class Database:
 
     def __init__(self, db_path: str) -> None:
         self.db_path = db_path
-        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+        self.fresh = False  # set by init(): the database was created just now
+        Path(db_path).parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         # One connection per thread. The constructing thread's connection is
         # opened eagerly so init()/migrations/CLI/tests run without surprises.
         self._local = threading.local()
         self._connect()
+        self._restrict_files()
+
+    def _restrict_files(self) -> None:
+        """Make the database files owner-only: they hold plaintext HMAC secrets
+        and TOTP seeds (older versions left them 0644). SQLite gives the -wal and
+        -shm it creates later the database file's mode. Some filesystems refuse
+        chmod; that is tolerated only while nobody else can read the file."""
+        for path in (self.db_path, self.db_path + "-wal", self.db_path + "-shm"):
+            try:
+                os.chmod(path, 0o600)
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                try:
+                    exposed = os.stat(path).st_mode & 0o077
+                except OSError:
+                    exposed = True
+                if exposed:
+                    raise RuntimeError(
+                        f"{path} holds plaintext secrets and is readable by other "
+                        f"users, and chmod 600 failed: {exc}") from exc
+                logger.warning("could not chmod %s (%s); it is owner-only already", path, exc)
 
     def _connect(self) -> sqlite3.Connection:
         """Open and configure a SQLite connection for the calling thread."""
@@ -164,6 +190,7 @@ class Database:
 
     def init(self) -> None:
         """Create all tables if they do not already exist, then run migrations."""
+        self.fresh = not self._table_exists("users")
         for name, ddl in SCHEMA.items():
             if self._table_exists(name):
                 continue
@@ -258,6 +285,8 @@ class Database:
                 self._migration_004_groups_port_proto_unique()
             elif version == 5:
                 self._migration_005_rotate_placeholder_secrets()
+            elif version == 6:
+                self._migration_006_totp_pending()
             self._record_migration(version)
             applied.append(version)
         if applied:
@@ -349,6 +378,15 @@ class Database:
                 "closes its ports and prints a new secret.", ", ".join(rotated),
             )
 
+    def _migration_006_totp_pending(self) -> None:
+        """v6: a separate column for an enrollment awaiting confirmation, so a
+        re-enrollment no longer switches the active TOTP off until the new
+        authenticator is confirmed (idempotent ALTER)."""
+        cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(users)")}
+        if "totp_pending_secret" not in cols:
+            self.conn.execute("ALTER TABLE users ADD COLUMN totp_pending_secret TEXT")
+            self.conn.commit()
+
     def close(self) -> None:
         """Close the calling thread's connection (if one was opened)."""
         conn = getattr(self._local, "conn", None)
@@ -425,6 +463,22 @@ class Database:
         )
         self.conn.commit()
 
+    def set_totp_pending(self, user_id: int, secret: str) -> None:
+        """Store a TOTP secret awaiting confirmation (enrollment or
+        re-enrollment). An active TOTP stays in force until it is confirmed."""
+        self.conn.execute(
+            "UPDATE users SET totp_pending_secret=? WHERE id=?", (secret, user_id),
+        )
+        self.conn.commit()
+
+    def activate_totp(self, user_id: int, secret: str) -> None:
+        """Make *secret* (just confirmed) the active TOTP and turn TOTP on."""
+        self.conn.execute(
+            "UPDATE users SET totp_secret=?, totp_pending_secret=NULL, totp_enabled=1 "
+            "WHERE id=?", (secret, user_id),
+        )
+        self.conn.commit()
+
     def enable_totp(self, user_id: int) -> None:
         """Activate TOTP for a user (after the enrollment code is verified)."""
         self.conn.execute(
@@ -435,7 +489,8 @@ class Database:
     def disable_totp(self, user_id: int) -> None:
         """Remove TOTP enrollment for a user (clears the secret and the flag)."""
         self.conn.execute(
-            "UPDATE users SET totp_secret=NULL, totp_enabled=0 WHERE id=?", (user_id,),
+            "UPDATE users SET totp_secret=NULL, totp_pending_secret=NULL, totp_enabled=0 "
+            "WHERE id=?", (user_id,),
         )
         self.conn.commit()
 
@@ -642,6 +697,18 @@ class Database:
         )
         self.conn.commit()
 
+    def count_recent_user_failures(self, username: str, reason: str,
+                                   window_seconds: int) -> int:
+        """Count *username*'s failed attempts of one kind (*reason*) within the
+        window, from any IP — a per-account cap an attacker cannot spread across
+        addresses."""
+        row = self.conn.execute(
+            "SELECT COUNT(*) AS c FROM failed_attempts "
+            "WHERE username=? AND reason=? AND created_at >= datetime('now', ?)",
+            (username, reason, f"-{window_seconds} seconds"),
+        ).fetchone()
+        return row["c"]
+
     def count_recent_failed_attempts(self, ip: str | None,
                                      window_seconds: int) -> int:
         """Count failed auth attempts from *ip* within the recent time window.
@@ -828,7 +895,10 @@ class Database:
         still in the -wal not yet checkpointed into the main file). The backup
         target is a self-contained, checkpointed database.
         """
-        Path(dest_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(dest_path).parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        # Owner-only from the first byte: the snapshot holds the same secrets.
+        os.close(os.open(dest_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600))
+        os.chmod(dest_path, 0o600)
         dest = sqlite3.connect(dest_path)
         try:
             with dest:

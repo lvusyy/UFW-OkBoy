@@ -234,11 +234,13 @@ class TestIPLifecycle(unittest.TestCase):
         self.assertTrue(body["ok"])
         self.assertTrue(body["enabled"])
 
-        self.assertEqual(len(self.ufw.add_calls), 1)
-        add = self.ufw.add_calls[0]
+        # Reconcile covers ALL enabled groups — the stub lists no existing
+        # rules, so web is re-asserted too; the newly enabled db group is added.
+        adds = {a["group"]: a for a in self.ufw.add_calls}
+        self.assertEqual(set(adds), {"web", "db"})
+        add = adds["db"]
         self.assertEqual(add["ip"], "203.0.113.50")
         self.assertEqual(add["port"], 3306)
-        self.assertEqual(add["group"], "db")
         self.assertEqual(len(self.ufw.remove_calls), 0)
 
     def test_toggle_membership_forbidden_for_other_user(self) -> None:

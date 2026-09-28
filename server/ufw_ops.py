@@ -7,24 +7,102 @@ Responsibilities:
 """
 
 import glob
+import ipaddress
 import logging
+import os
 import re
 import subprocess
+import threading
 import time
+
+try:
+    import fcntl
+except ImportError:  # not POSIX (a dev box running the unit tests): thread lock only
+    fcntl = None
 
 from db import Database
 
 logger = logging.getLogger("ufw-okboy.ufw")
 
 
+def canonical_ip(value) -> str:
+    """Return *value* as one canonical IP address ("203.0.113.7", "2001:db8::1";
+    an IPv4-mapped IPv6 address becomes plain IPv4), or "" for anything else: a
+    CIDR, a zone-scoped address, a hostname, or a ufw keyword like "any". Only a
+    single address may reach a rule — ufw reads "any" or "0.0.0.0/0" as everyone.
+    """
+    if not isinstance(value, str):
+        return ""
+    s = value.strip()
+    if not s or "%" in s:
+        return ""
+    try:
+        ip = ipaddress.ip_address(s)
+    except ValueError:
+        return ""
+    if ip.version == 6 and ip.ipv4_mapped:
+        ip = ip.ipv4_mapped
+    return str(ip)
+
+
+class HostLock:
+    """An exclusive lock shared by every thread and process on the host (gunicorn
+    workers, CLI commands, the cleanup timer): an flock on *path*, re-entrant
+    within a thread.
+
+    ufw rule numbers shift after every delete, so a list-then-delete sequence
+    must not interleave with another one — the delete would remove whatever rule
+    moved into place, possibly a host DENY or the SSH rule. The app also holds it
+    across a whole knock or admin change, so its database and firewall updates
+    never interleave with another's.
+    """
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self._mu = threading.RLock()
+        self._depth = 0
+        self._fd = None
+
+    def __enter__(self):
+        self._mu.acquire()
+        if self._depth == 0 and fcntl is not None:
+            try:
+                fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX)
+                except BaseException:
+                    os.close(fd)
+                    raise
+            except BaseException:
+                self._mu.release()
+                raise
+            self._fd = fd
+        self._depth += 1
+        return self
+
+    def __exit__(self, *exc) -> bool:
+        self._depth -= 1
+        if self._depth == 0 and self._fd is not None:
+            fd, self._fd = self._fd, None
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+        self._mu.release()
+        return False
+
+
 class UFWManager:
     """Manages UFW firewall rules and delegates user-IP state to a Database."""
 
-    def __init__(self, rule_prefix: str = "ufw-okboy", db: Database | None = None) -> None:
+    def __init__(self, rule_prefix: str = "ufw-okboy", db: Database | None = None,
+                 lock_path: str | None = None) -> None:
         self.rule_prefix = rule_prefix
         if db is None:
             raise RuntimeError("UFWManager requires a Database instance")
         self.db: Database = db
+        # Next to the database: every process of this install (server workers,
+        # CLI, cleanup timer) uses the same config, hence the same lock file.
+        self.lock = HostLock(lock_path or os.path.join(
+            os.path.dirname(os.path.abspath(db.db_path)), "ufw.lock"))
 
     # ------------------------------------------------------------------ #
     #  UFW commands
@@ -62,12 +140,18 @@ class UFWManager:
         comment = f"{self.rule_prefix}:{username}"
         if group:
             comment = f"{comment}:{group}"
-        self._run_ufw(
-            "allow", "from", ip,
-            "to", "any", "port", str(port), "proto", proto,
-            "comment", comment,
-        )
-        logger.info("Added rule: %s -> port %s/%s (%s)", ip, port, proto, comment)
+        src = canonical_ip(ip)
+        if not src:
+            raise RuntimeError(f"refusing to add a rule for {ip!r}: not a single IP address")
+        if proto not in ("tcp", "udp") or not isinstance(port, int) or not 1 <= port <= 65535:
+            raise RuntimeError(f"refusing to add a rule for port {port!r}/{proto!r}")
+        with self.lock:
+            self._run_ufw(
+                "allow", "from", src,
+                "to", "any", "port", str(port), "proto", proto,
+                "comment", comment,
+            )
+        logger.info("Added rule: %s -> port %s/%s (%s)", src, port, proto, comment)
 
     def list_rules_by_comment(self, comment_prefix: str) -> list[dict]:
         """Return UFW rules whose comment starts with *comment_prefix*.
@@ -89,9 +173,13 @@ class UFWManager:
 
         # Lines look like:
         # [ 1] 22/tcp                     ALLOW IN    1.2.3.4        # ufw-okboy:alice:web
+        # [ 9] 22/tcp (v6)                ALLOW IN    Anywhere (v6)  # ufw-okboy:alice:web
+        # The second form is the IPv6 half ufw adds for a rule "from any" (one
+        # injected before addresses were validated): it must be found to go.
         line_re = re.compile(
             r"^\s*\[\s*(?P<num>\d+)\s*\]\s+"
-            r"(?P<port>\d+)/(?P<proto>\w+)\s+ALLOW\s+IN?\s+(?P<ip>\S+)"
+            r"(?P<port>\d+)/(?P<proto>\w+)(?:\s+\(v6\))?\s+ALLOW\s+IN?\s+"
+            r"(?P<ip>\S+(?:\s+\(v6\))?)"
             r"(?:\s+#\s*(?P<comment>.*))?\s*$"
         )
         rules: list[dict] = []
@@ -202,54 +290,66 @@ class UFWManager:
             })
         return rules
 
-    def delete_rule(self, number: int) -> None:
+    def delete_rule(self, number: int, expect: dict | None = None) -> None:
         """Delete a UFW rule by its CURRENT number (``ufw --force delete N``).
 
-        Rule numbers shift after each deletion, so callers must re-list between
-        deletes. Raises RuntimeError on failure (propagated to the caller).
+        Rule numbers shift after each deletion. With *expect* (a rule as returned
+        by :meth:`list_all_rules`), the rule now at *number* must still be that
+        rule — checked under the host lock, so nothing can move another rule into
+        its place in between; LookupError otherwise. Raises RuntimeError when ufw
+        fails (propagated to the caller).
         """
-        self._run_ufw("--force", "delete", str(int(number)))
+        with self.lock:
+            if expect is not None:
+                now = next((r for r in self.list_all_rules() if r["number"] == int(number)), None)
+                if now is None or any(now[k] != expect[k] for k in ("to", "action", "from", "comment")):
+                    raise LookupError(f"rule {number} is no longer the one listed")
+            self._run_ufw("--force", "delete", str(int(number)))
 
     def remove_rule(self, ip: str, port: int, username: str, proto: str = "tcp",
                     group: str | None = None) -> None:
-        """Remove a specific UFW rule. Logs warning if rule doesn't exist.
+        """Remove the user's rule for ip/port/proto: the one carrying their own
+        comment (``<prefix>:<username>:<group>``, or ``<prefix>:<username>`` from
+        versions before groups). A missing rule is not an error.
 
-        *group* is accepted for symmetry with :meth:`add_rule`. When provided,
-        the full comment ``<prefix>:<username>:<group>`` is matched precisely
-        via :meth:`list_rules_by_comment` so that rules of other groups sharing
-        the same ip/port/proto are NOT removed (fixes cross-group collision).
-
-        Falls back to the legacy ip/port/proto match when the numbered view is
-        unavailable or no comment match is found — callers relying on
-        :meth:`reconcile_user_rules` will re-add any needed rules afterwards.
+        Only a rule with this user's comment is ever deleted — matching on
+        ip/port/proto alone could delete another user's rule behind the same NAT
+        address, or a host rule. Raises RuntimeError when ufw fails to delete.
         """
-        comment = f"{self.rule_prefix}:{username}"
-        if group:
-            comment = f"{comment}:{group}"
-
-        # Precise path: locate the numbered rule whose comment matches exactly.
-        for rule in self.list_rules_by_comment(comment):
-            if (rule["ip"] == ip and rule["port"] == port
-                    and rule["proto"] == proto and rule["comment"] == comment):
-                try:
+        base = f"{self.rule_prefix}:{username}"
+        wanted = {f"{base}:{group}", base} if group else {base}
+        with self.lock:  # the number found must still be this rule's
+            for rule in self.list_rules_by_comment(base):
+                if (rule["comment"] in wanted and rule["ip"] == ip
+                        and rule["port"] == port and rule["proto"] == proto):
                     self._run_ufw("--force", "delete", str(rule["number"]))
-                    logger.info(
-                        "Removed rule (precise): %s -> port %s/%s (%s)",
-                        ip, port, proto, comment,
-                    )
+                    logger.info("Removed rule: %s -> port %s/%s (%s)",
+                                ip, port, proto, rule["comment"])
                     return
-                except RuntimeError:
-                    break  # fall through to legacy path
+        logger.info("No rule to remove: %s -> port %s/%s (%s)", ip, port, proto, base)
 
-        # Legacy / fallback path: match by ip/port/proto only.
-        try:
-            self._run_ufw(
-                "--force", "delete", "allow", "from", ip,
-                "to", "any", "port", str(port), "proto", proto,
-            )
-            logger.info("Removed rule: %s -> port %s/%s (%s)", ip, port, proto, comment)
-        except RuntimeError:
-            logger.warning("Rule removal failed (may not exist): %s -> %s/%s", ip, port, proto)
+    def purge_rules(self, username: str | None = None, group: str | None = None) -> int:
+        """Delete every rule of *username* (any group), of *group* (any user), or
+        of that user in that group — whatever the source address: a stale IP, or
+        an "any" injected before addresses were validated, must go too. For when
+        the user, group or membership is going away, or access is revoked.
+
+        Deletes from the highest number down, under the host lock. Returns how
+        many were deleted; raises RuntimeError when ufw fails, so the caller can
+        keep what it would otherwise forget until the rule is really gone.
+        """
+        prefix = f"{self.rule_prefix}:"
+        with self.lock:
+            doomed = []
+            for rule in self.list_rules_by_comment(prefix):
+                user, _, grp = rule["comment"][len(prefix):].partition(":")
+                if (username is None or user == username) and (group is None or grp == group):
+                    doomed.append(rule)
+            for rule in sorted(doomed, key=lambda r: r["number"], reverse=True):
+                self._run_ufw("--force", "delete", str(rule["number"]))
+                logger.info("Removed rule: %s -> port %s/%s (%s)",
+                            rule["ip"], rule["port"], rule["proto"], rule["comment"])
+        return len(doomed)
 
     def reconcile_user_rules(self, username: str, client_ip: str,
                              enabled_groups: dict[str, tuple[int, str]]) -> dict:
@@ -266,6 +366,11 @@ class UFWManager:
 
         Returns ``{"added": [...], "removed": [...]}`` (group names).
         """
+        with self.lock:  # numbers from a listing are only valid under it
+            return self._reconcile_locked(username, client_ip, enabled_groups)
+
+    def _reconcile_locked(self, username: str, client_ip: str,
+                          enabled_groups: dict[str, tuple[int, str]]) -> dict:
         added: list[str] = []
         removed: list[str] = []
 
@@ -292,8 +397,15 @@ class UFWManager:
 
         # Remove rules that are stale: group no longer enabled, OR bound to an
         # old IP (stale old-IP rule for an enabled group also gets cleaned up).
+        # An added IPv4 rule goes before every IPv6 one and renumbers them, so
+        # look the stale rules up again after adding. Delete from the highest
+        # number down: each delete then leaves the numbers of those still to go
+        # untouched (ascending, the second delete would hit the rule that moved
+        # into the first one's place — another user's, or a host DENY).
+        if added:
+            user_rules = self.list_rules_by_comment(prefix)
         enabled_names = set(enabled_groups.keys())
-        for rule in user_rules:
+        for rule in sorted(user_rules, key=lambda r: r["number"], reverse=True):
             suffix = rule["comment"][len(prefix):]
             group_name = suffix.split(":", 1)[0] if suffix else ""
             stale = (group_name not in enabled_names) or (rule["ip"] != client_ip)
@@ -387,43 +499,42 @@ class UFWManager:
                       proto: str = "tcp") -> list[str]:
         """Remove firewall rules for users who haven't knocked within *max_age_seconds*.
 
-        *user_group_ports* maps ``username -> [(group_name, port, proto), ...]`` from
-        each user's actual enabled groups (the caller — app.py — builds it from
-        the DB). When provided, cleanup only removes rules for the ports the
-        user is actually authorized for, avoiding orphaned rules on custom
-        group ports that ``protected_ports`` would miss (fixes ORPHAN-A).
-
-        Falls back to the flat *ports* list (legacy protected_ports) only when
-        *user_group_ports* is not provided, preserving backward compatibility.
+        Every rule carrying a stale user's comment is removed, whatever its
+        group or address (:meth:`purge_rules`) — also those of groups since
+        disabled or left, which a per-group pass missed. *user_group_ports*,
+        *ports* and *proto* are no longer needed; they are accepted so existing
+        callers keep working.
 
         Returns list of removed usernames.
         """
         now = int(time.time())
         removed: list[str] = []
-        legacy_ports = ports or []
 
-        for user in self.db.list_users():
-            last_knock = user["last_knock"]
-            if last_knock is None:
+        for listed in self.db.list_users():
+            if listed["last_knock"] is None or now - listed["last_knock"] <= max_age_seconds:
                 continue
-            if now - last_knock > max_age_seconds:
-                ip = user["current_ip"]
+            with self.lock:
+                # Re-read under the lock: a knock may have refreshed the user (new
+                # IP, new rules) since the listing, and must not be undone.
+                user = self.db.get_user(listed["id"])
+                last_knock = user["last_knock"] if user else None
+                if last_knock is None or now - last_knock <= max_age_seconds:
+                    continue
                 username = user["username"]
-                if ip:
-                    if user_group_ports is not None:
-                        # Remove rules only for the user's actual group ports
-                        # (per-group proto preserved, group passed for precise delete).
-                        for group_name, port, gproto in user_group_ports.get(username, []):
-                            self.remove_rule(ip, port, username, gproto, group_name)
-                    else:
-                        for port in legacy_ports:
-                            self.remove_rule(ip, port, username, proto)
+                # Every rule carrying the user's comment — also those of groups
+                # since disabled or left, and at older addresses.
+                try:
+                    self.purge_rules(username=username)
+                except RuntimeError as exc:
+                    # Keep the state, so the next run tries again.
+                    logger.warning("Cleanup of %s failed, retried next run: %s", username, exc)
+                    continue
                 self.db.clear_user_state(user["id"])
-                removed.append(username)
-                logger.info(
-                    "Cleaned up stale user: %s (last knock %ds ago)",
-                    username, now - last_knock,
-                )
+            removed.append(username)
+            logger.info(
+                "Cleaned up stale user: %s (last knock %ds ago)",
+                username, now - last_knock,
+            )
         return removed
 
     def list_managed_rules(self) -> list[str]:

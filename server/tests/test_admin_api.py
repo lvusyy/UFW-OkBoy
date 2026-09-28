@@ -566,7 +566,7 @@ class TestAdminAPI(unittest.TestCase):
             )
         self.assertEqual(resp.status_code, 200)
         self.assertTrue(resp.get_json()["ok"])
-        mdel.assert_called_once_with(1)
+        mdel.assert_called_once_with(1, expect=self._SSH_RULE)
         self.assertGreaterEqual(self._count_audit("ufw_rule_delete"), 1)
 
     def test_api_ufw_delete_non_ssh_deletes_without_confirm(self) -> None:
@@ -578,7 +578,7 @@ class TestAdminAPI(unittest.TestCase):
                 json={"number": 2},
             )
         self.assertEqual(resp.status_code, 200)
-        mdel.assert_called_once_with(2)
+        mdel.assert_called_once_with(2, expect=self._WEB_RULE)
 
     def test_api_ufw_delete_not_found_returns_404(self) -> None:
         with patch.object(UFWManager, "list_all_rules", return_value=[]):

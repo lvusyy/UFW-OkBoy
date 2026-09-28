@@ -9,3 +9,6 @@ Type=oneshot
 User=root
 WorkingDirectory=/opt/ufw-okboy/server
 ExecStart=/opt/ufw-okboy/venv/bin/python app.py -c config.yaml cleanup --max-age 7
+# Files it creates (database, backups, logs) are owner-only: the database holds
+# plaintext HMAC secrets and TOTP seeds.
+UMask=0077
