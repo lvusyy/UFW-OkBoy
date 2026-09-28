@@ -6,6 +6,7 @@ user_group_membership, audit_log, operation_log, failed_attempts) plus
 CRUD, logging helpers, state queries, and one-time JSON state migration.
 """
 
+import contextlib
 import glob
 import hashlib
 import json
@@ -13,7 +14,7 @@ import logging
 import os
 import secrets
 import sqlite3
-import contextlib
+import sys
 import threading
 import time
 from pathlib import Path
@@ -86,12 +87,17 @@ class _Claim:
 
 
 def _processes_with_open(db_path: str) -> list[int]:
-    """Other processes with the database's files open, from Linux's /proc
-    (none found where there is none, or where it cannot be read)."""
+    """Other processes with the database's files open, from Linux's /proc.
+    What cannot be looked at counts as open (DatabaseInUse): /proc on Linux,
+    or, for root, a process's descriptors. Not root, another user's process
+    is passed over — only root could open the owner-only files. Elsewhere
+    than Linux (no ufw there) there is nothing to look at."""
     targets = {os.path.realpath(db_path + side) for side in ("", "-wal", "-shm")}
     try:
         entries = os.listdir("/proc")
-    except OSError:
+    except OSError as exc:
+        if sys.platform.startswith("linux"):
+            raise DatabaseInUse(f"cannot tell which processes have {db_path} open: {exc}") from None
         return []
     pids = []
     for entry in entries:
@@ -99,7 +105,11 @@ def _processes_with_open(db_path: str) -> list[int]:
             continue
         try:
             fds = os.listdir(f"/proc/{entry}/fd")
-        except OSError:
+        except FileNotFoundError:
+            continue  # gone
+        except PermissionError:
+            if os.geteuid() == 0:
+                raise DatabaseInUse(f"cannot see what process {entry} has open") from None
             continue
         for fd in fds:
             try:
@@ -119,6 +129,7 @@ def exclusive_claim(db_path: str):
     still held keeps one open past close() — so the files' open descriptors
     are looked for too, once the claim is exclusive. Raises DatabaseInUse at
     once when the database is open elsewhere."""
+    db_path = os.path.realpath(db_path)  # its claim and sidecars are beside the file itself
     Path(db_path).parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     with os.fdopen(os.open(_claim_path(db_path), os.O_RDWR | os.O_CREAT, 0o600), "r+") as f:
         if fcntl is not None:
@@ -242,7 +253,10 @@ class Database:
     """
 
     def __init__(self, db_path: str) -> None:
-        self.db_path = db_path
+        # The file itself, not a link to it: SQLite puts the -wal beside the
+        # file, and the claim (see _claim_shared) must be the same for every
+        # path leading there.
+        self.db_path = os.path.realpath(db_path)
         self.fresh = False  # set by init(): the database was created just now
         Path(db_path).parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         self._lifecycle = threading.Lock()  # connecting vs close()
@@ -299,13 +313,13 @@ class Database:
             conn = sqlite3.connect(self.db_path, check_same_thread=False)
             if self._claim is not None:
                 self._claim.track(conn)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys = ON")
-        conn.execute("PRAGMA journal_mode = WAL")
-        # Wait (up to 5s) for a competing writer instead of erroring out with
-        # SQLITE_BUSY: under WAL multiple connections can attempt writes at once.
-        conn.execute("PRAGMA busy_timeout = 5000")
-        self._local.conn = conn
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA foreign_keys = ON")
+            conn.execute("PRAGMA journal_mode = WAL")
+            # Wait (up to 5s) for a competing writer instead of erroring out
+            # with SQLITE_BUSY: under WAL several connections can write at once.
+            conn.execute("PRAGMA busy_timeout = 5000")
+            self._local.conn = conn
         return conn
 
     @property

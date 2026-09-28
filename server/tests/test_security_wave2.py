@@ -27,6 +27,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import app as app_module  # noqa: E402
 import auth  # noqa: E402
+import db as db_module  # noqa: E402
 import ufw_ops  # noqa: E402
 from app import create_app, open_database  # noqa: E402
 from db import Database, DatabaseInUse, exclusive_claim  # noqa: E402
@@ -547,6 +548,42 @@ class TestFilesAndSeeding(unittest.TestCase):
         with exclusive_claim(self.db_path):
             pass
 
+    def test_what_cannot_be_looked_at_counts_as_open(self) -> None:
+        # The scan passed over what it could not read — as good as absent.
+        real = os.listdir
+
+        def listdir(path):
+            if path == "/proc":
+                return ["1", "self"]
+            if path == "/proc/1/fd":
+                raise PermissionError(path)
+            return real(path)
+
+        with patch("db.os.listdir", listdir):
+            with patch("db.os.geteuid", return_value=0, create=True):
+                with self.assertRaises(DatabaseInUse):
+                    db_module._processes_with_open(self.db_path)
+            with patch("db.os.geteuid", return_value=1000, create=True):
+                self.assertEqual(db_module._processes_with_open(self.db_path), [])
+        with patch("db.os.listdir", side_effect=FileNotFoundError("/proc")), \
+                patch("db.sys.platform", "linux"):
+            with self.assertRaises(DatabaseInUse):
+                db_module._processes_with_open(self.db_path)
+
+    @unittest.skipIf(fcntl is None, "POSIX flock")
+    def test_a_linked_path_is_the_same_database(self) -> None:
+        # Through a link in another directory, the claim was another file:
+        # a restore by the real path went unseen — and cleared the wrong -wal.
+        os.makedirs(os.path.dirname(self.db_path))
+        alias = os.path.join(self.tmpdir, "alias.db")
+        os.symlink(self.db_path, alias)
+        db = Database(alias)
+        self.assertEqual(db.db_path, os.path.realpath(self.db_path))
+        with self.assertRaises(DatabaseInUse):
+            with exclusive_claim(self.db_path):
+                pass
+        db.close()
+
     @unittest.skipIf(fcntl is None, "POSIX flock")
     def test_a_reopened_database_is_claimed_again(self) -> None:
         # Used again after close(), a Database opened a connection without a
@@ -838,7 +875,12 @@ class TestTOTPReenroll(_Base):
     def setUp(self) -> None:
         super().setUp()
         self.uid = self.db.create_user("root", "secret-root", is_admin=True)
+        # The codes are chosen relative to one moment, and the clock is held
+        # there: a 30 s step passing mid-test would move the window under them.
         now = int(time.time())
+        clock = patch("time.time", return_value=float(now))
+        clock.start()
+        self.addCleanup(clock.stop)
         self.step = lambda secret, k: auth.totp_now(secret, t=now + 30 * k)
         self.old = self._post("/api/admin/totp/enroll").get_json()["secret"]
         self.assertEqual(self._post("/api/admin/totp/activate",

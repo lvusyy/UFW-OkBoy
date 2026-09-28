@@ -1861,8 +1861,9 @@ def cmd_restore(args):
     Stop the server before restoring — this replaces the live DB file.
     """
     cfg = load_config(args.config)
-    db_path = cfg.get("db_path", "/var/lib/ufw-okboy/ufw-okboy.db")
-    # The file itself, not a link to it: its -wal and checksum are beside it.
+    # The files themselves, not links to them: the -wal, the checksum and the
+    # claim are beside each.
+    db_path = os.path.realpath(cfg.get("db_path", "/var/lib/ufw-okboy/ufw-okboy.db"))
     src = os.path.realpath(args.backup)
     if not os.path.exists(src):
         sys.exit(f"Backup not found: {args.backup}")
