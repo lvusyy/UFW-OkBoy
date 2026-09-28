@@ -78,6 +78,30 @@ detect_public_ip() {
     echo "${ip:-127.0.0.1}"
 }
 
+# Self-signed certificate for $SERVER_IP into $SSL_CERT / $SSL_KEY (10 years:
+# a 1-year self-signed cert would silently expire and break every knock). An
+# existing key is reused, so a re-run renews the certificate but keeps the
+# public key that clients pin (pin_sha256); remove the key to get a new one.
+make_self_signed() {
+    local key=(-newkey rsa:2048 -keyout "$SSL_KEY")
+    if [[ -s "$SSL_KEY" ]] && openssl pkey -in "$SSL_KEY" -noout 2>/dev/null; then
+        key=(-key "$SSL_KEY")
+        info "Keeping the existing key $SSL_KEY (clients that pin it keep working)"
+    fi
+    openssl req -x509 -nodes -days 3650 "${key[@]}" -out "$SSL_CERT" \
+        -subj "/CN=$SERVER_IP" -addext "subjectAltName=IP:$SERVER_IP" 2>/dev/null || \
+    openssl req -x509 -nodes -days 3650 "${key[@]}" -out "$SSL_CERT" \
+        -subj "/CN=$SERVER_IP" 2>/dev/null
+    chmod 600 "$SSL_KEY"
+}
+
+# The certificate's public-key pin: base64(SHA-256(SubjectPublicKeyInfo)), the
+# pin_sha256 / PIN_SHA256 of the clients (curl --pinnedpubkey sha256//...).
+spki_pin() {
+    openssl x509 -in "$1" -pubkey -noout | openssl pkey -pubin -outform der |
+        openssl dgst -sha256 -binary | base64
+}
+
 # pip install with offline-vendor / mirror fallback. Args: pip-install arguments
 # (e.g. -r requirements.txt). Order: bundled wheels (offline) > --mirror >
 # probe pypi.org, else a CN mirror. This is what makes the install survive the
@@ -355,7 +379,8 @@ SSL_KEY=""
 if [[ "$FORCE_SELF_SIGNED" == true || -z "$DOMAIN" ]]; then
     # Self-signed certificate — the default/recommended path for IP-based access
     # (no filed domain needed; works on any port). Clients trust it once: the web
-    # UI adds a browser exception; CLI clients set verify_ssl=false / --insecure.
+    # UI adds a browser exception after checking the fingerprint; CLI clients
+    # pin its public key (pin_sha256 / PIN_SHA256).
     info "Generating self-signed certificate (no domain → IP-based HTTPS)..."
     SSL_DIR="/etc/ssl/ufw-okboy"
     mkdir -p "$SSL_DIR"
@@ -366,19 +391,7 @@ if [[ "$FORCE_SELF_SIGNED" == true || -z "$DOMAIN" ]]; then
     # cloud VPS and would never match the address users connect to).
     SERVER_IP="$(detect_public_ip)"
 
-    # 10-year validity: a 1-year self-signed cert would silently expire and break
-    # every knock; for an internal tool a long-lived cert is the kinder default.
-    openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
-        -keyout "$SSL_KEY" \
-        -out "$SSL_CERT" \
-        -subj "/CN=$SERVER_IP" \
-        -addext "subjectAltName=IP:$SERVER_IP" 2>/dev/null || \
-    openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
-        -keyout "$SSL_KEY" \
-        -out "$SSL_CERT" \
-        -subj "/CN=$SERVER_IP" 2>/dev/null
-
-    chmod 600 "$SSL_KEY"
+    make_self_signed
     info "Self-signed cert: $SSL_CERT  (CN/SAN: $SERVER_IP, valid 10y)"
     info "Access via: https://$SERVER_IP:$HTTPS_PORT"
 else
@@ -409,12 +422,7 @@ else
         SSL_CERT="$SSL_DIR/selfsigned.crt"
         SSL_KEY="$SSL_DIR/selfsigned.key"
         SERVER_IP="$(detect_public_ip)"
-        openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
-            -keyout "$SSL_KEY" -out "$SSL_CERT" -subj "/CN=$SERVER_IP" \
-            -addext "subjectAltName=IP:$SERVER_IP" 2>/dev/null || \
-        openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
-            -keyout "$SSL_KEY" -out "$SSL_CERT" -subj "/CN=$SERVER_IP" 2>/dev/null
-        chmod 600 "$SSL_KEY"
+        make_self_signed
     fi
 fi
 
@@ -609,7 +617,9 @@ else
     echo "  Access URL:      https://$SERVER_IP:$HTTPS_PORT"
     warn "  Self-signed cert: the browser warns. Continue only if it shows this SHA-256 fingerprint:"
     warn "    $(openssl x509 -in "$SSL_CERT" -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2)"
-    warn "  CLI clients: set verify_ssl: false (knock.py) or INSECURE=1 (knock.sh) for self-signed."
+    echo "  Client key pin:  $(spki_pin "$SSL_CERT")"
+    echo "    (clients trust this server by it: pin_sha256 in knock.py / knock.ps1 configs,"
+    echo "     PIN_SHA256 for knock.sh, --pin-sha256 / -PinSha256 for the client installers)"
 fi
 echo ""
 if [[ -n "${SSH_PORTS:-}" ]]; then
