@@ -120,6 +120,15 @@ class TestAdminAPI(unittest.TestCase):
             db.close()
         self.assertGreaterEqual(self._count_audit("user_add"), 1)
 
+    def test_cli_user_add_existing_user_exits_cleanly(self) -> None:
+        # A duplicate raised an uncaught IntegrityError (a traceback, exit 1
+        # without saying why).
+        args = _ns(config=self.config_path, username="bob", admin=False)
+        app_module.cmd_user_add(args)
+        with self.assertRaises(SystemExit) as cm:
+            app_module.cmd_user_add(args)
+        self.assertEqual(cm.exception.code, "User 'bob' already exists.")
+
     # -- CLI: user-list ------------------------------------------------ #
 
     def test_cli_user_list_outputs_users(self) -> None:
@@ -141,6 +150,16 @@ class TestAdminAPI(unittest.TestCase):
         finally:
             db.close()
         self.assertGreaterEqual(self._count_audit("group_add"), 1)
+
+    def test_cli_group_add_existing_name_exits_cleanly(self) -> None:
+        app_module.cmd_group_add(_ns(config=self.config_path, name="ssh", port=22, proto="tcp"))
+        with self.assertRaises(SystemExit) as cm:
+            app_module.cmd_group_add(_ns(config=self.config_path, name="ssh", port=2222, proto="tcp"))
+        self.assertEqual(cm.exception.code, "Group 'ssh' already exists.")
+        # the same port under another name (this exited 0)
+        with self.assertRaises(SystemExit) as cm:
+            app_module.cmd_group_add(_ns(config=self.config_path, name="ssh2", port=22, proto="tcp"))
+        self.assertEqual(cm.exception.code, "Port 22/tcp is already used by group 'ssh'.")
 
     # -- CLI: user-join ----------------------------------------------- #
 
