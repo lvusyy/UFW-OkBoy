@@ -68,6 +68,37 @@ jobs:
             export LANG=C LC_ALL=C UFW_OKBOY_INTEGRATION=1
             "$PY" -m unittest tests.test_ufw_integration -v'
 
+  client:
+    # The command-line clients against a local HTTPS server with a self-signed
+    # certificate (public-key pinning): knock.py everywhere, knock.sh on Linux,
+    # knock.ps1 under PowerShell 7 and, on Windows, Windows PowerShell 5.1.
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Tools the tests use (a missing one would skip its client)
+        run: |
+          openssl version
+          pwsh -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'
+          if [ "$RUNNER_OS" = Windows ]; then
+            powershell -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'
+          else
+            curl --version | head -n 1
+          fi
+
+      - name: Client tests
+        run: python -m unittest discover -s client/tests -v
+
   scripts:
     # Installer, upgrade and client shell scripts: syntax and static checks.
     runs-on: ubuntu-latest

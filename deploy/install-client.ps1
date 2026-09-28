@@ -16,9 +16,21 @@
     When -Secret is omitted it is prompted for without echo, which also keeps
     it out of the PowerShell history.
 
-    One-liner (elevated PowerShell; add -NoVerifySsl for a self-signed server):
+    One-liner (elevated PowerShell; for a self-signed server add -PinSha256 with
+    the key pin the server admin gives you):
       [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 3072
       & ([scriptblock]::Create((irm https://raw.githubusercontent.com/lvusyy/UFW-OkBoy/master/deploy/install-client.ps1))) -Server https://your-server:8443 -User alice
+
+.PARAMETER PinSha256
+    Trust exactly the server key with this pin (base64 SHA-256 of its public
+    key, printed by the server installer): the way to use a self-signed server.
+    Written to the server's config as pin_sha256; -NoVerifySsl is then not used.
+    Needs an https:// server. A re-run for a server keeps its pin unless
+    -PinSha256 is given ('' removes it).
+
+.PARAMETER NoVerifySsl
+    Skip TLS verification instead (not recommended: a man in the middle can
+    then replay a knock while it is valid).
 
 .PARAMETER GhMirror
     GitHub proxy prefix for downloading knock.ps1 when GitHub is blocked, e.g.
@@ -32,6 +44,7 @@ param(
     [string]$Secret,
     [ValidateRange(1, 1440)]
     [int]$IntervalMinutes = 1,
+    [string]$PinSha256,
     [switch]$NoVerifySsl,
     [string]$GhMirror = $env:UFW_OKBOY_GH_MIRROR,
     [switch]$Uninstall
@@ -84,6 +97,10 @@ if (-not [Uri]::TryCreate($Server, [UriKind]::Absolute, [ref]$uri) -or $uri.Sche
 }
 if ($User -notmatch '^[A-Za-z0-9_.-]{1,64}$') { throw "Invalid -User '$User'" }
 if ($Secret -notmatch '^[^\s"'']+$') { throw 'Invalid -Secret: empty, or contains spaces or quotes' }
+if ($PinSha256 -and $PinSha256 -cnotmatch '^[A-Za-z0-9+/]{43}=$') {
+    throw "Invalid -PinSha256: expected the base64 SHA-256 of the server's public key (44 characters ending in '=')"
+}
+if ($PinSha256 -and $uri.Scheme -ne 'https') { throw 'A key pin (-PinSha256) needs an https:// server' }
 
 $serverUrl = $uri.AbsoluteUri.TrimEnd('/')
 $name = $uri.Host
@@ -127,6 +144,23 @@ if (Test-Path -LiteralPath $InstallDir) {
     } catch {
         Remove-Item -LiteralPath $InstallDir -Recurse -Force  # never leave an unlocked directory behind
         throw
+    }
+}
+
+# A re-run for a server keeps the key pin of its config unless -PinSha256 is
+# given ('' removes it). Read only now that the directory's lock is verified;
+# a pin line that cannot be read stops the install rather than dropping it.
+if (-not $PSBoundParameters.ContainsKey('PinSha256') -and $uri.Scheme -eq 'https' -and
+        (Test-Path -LiteralPath $configFile -PathType Leaf)) {
+    # knock.ps1 reads keys case-insensitively, so this does too.
+    $text = [IO.File]::ReadAllText($configFile)
+    if ($text -match '(?m)^\s*pin_sha256\s*:') {
+        if ($text -match '(?m)^\s*pin_sha256\s*:\s*["'']?([A-Za-z0-9+/]{43}=)["'']?\s*$') {
+            $PinSha256 = $Matches[1]
+            Write-Host "[INFO] Keeping the server key pin of $configFile (-PinSha256 '' removes it)"
+        } else {
+            throw "Cannot read the pin_sha256 of $configFile; pass -PinSha256 (or -PinSha256 '' to drop it)"
+        }
     }
 }
 
@@ -182,8 +216,9 @@ try {
         }
     }
     $verify = if ($NoVerifySsl) { 'false' } else { 'true' }
+    $pinLine = if ($PinSha256) { "pin_sha256: `"$PinSha256`"`n" } else { '' }
     [IO.File]::WriteAllText((Join-Path $stageServers $configName),
-        "server_url: `"$serverUrl`"`nusername: `"$User`"`nsecret: `"$Secret`"`nverify_ssl: $verify`n")
+        "server_url: `"$serverUrl`"`nusername: `"$User`"`nsecret: `"$Secret`"`nverify_ssl: $verify`n$pinLine")
 
     Move-IntoPlace (Join-Path $stage 'knock.ps1') $KnockScript
     New-Item -ItemType Directory -Force -Path $ServersDir | Out-Null
@@ -219,7 +254,11 @@ Write-Host '=== Client Setup Complete ==='
 Write-Host "  Config:   $configFile"
 Write-Host "  Script:   $KnockScript"
 Write-Host "  Task:     $TaskName (every $IntervalMinutes min, as SYSTEM)"
-Write-Host "  TLS:      verify_ssl=$verify"
+if ($PinSha256) {
+    Write-Host "  TLS:      pinned server key $PinSha256"
+} else {
+    Write-Host "  TLS:      verify_ssl=$verify"
+}
 Write-Host ''
 Write-Host '  Manual commands (elevated PowerShell):'
 Write-Host "    Get-Content '$LogFile'    # result of the last scheduled knock"

@@ -3,14 +3,17 @@
 # Sets up knock.py + systemd timer for auto-knocking
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/lvusyy/UFW-OkBoy/master/deploy/install-client.sh | bash -s -- --server https://1.2.3.4:8443 --user alice --secret YOUR_SECRET --no-verify-ssl
+#   curl -fsSL https://raw.githubusercontent.com/lvusyy/UFW-OkBoy/master/deploy/install-client.sh | bash -s -- --server https://203.0.113.10:8443 --user alice --secret YOUR_SECRET --pin-sha256 SERVER_KEY_PIN
 #
 # Flags:
-#   --server <url>     Server URL (e.g., https://your-server.com or https://1.2.3.4:8443)
+#   --server <url>     Server URL (e.g., https://your-server.com or https://203.0.113.10:8443)
 #   --user <username>  Your username
 #   --secret <secret>  Your HMAC secret
 #   --interval <sec>   Knock interval (default: 30)
-#   --no-verify-ssl    Skip TLS verification (for self-signed certs — common in CN)
+#   --pin-sha256 <pin> Trust exactly the server key with this pin (self-signed
+#                      certs — common in CN; the server admin has the pin).
+#                      A re-run for the same server keeps its pin; '' removes it
+#   --no-verify-ssl    Skip TLS verification instead (not recommended)
 #   --gh-mirror <url>  GitHub proxy prefix for downloads when GitHub is blocked
 #                      (e.g. https://ghfast.top; find a current one at
 #                      https://ghproxy.link/). Also via UFW_OKBOY_GH_MIRROR.
@@ -22,6 +25,8 @@ SERVER_URL=""
 USERNAME=""
 SECRET=""
 INTERVAL=30
+PIN_SHA256=""
+PIN_GIVEN=false
 NO_VERIFY_SSL=false
 GH_MIRROR="${UFW_OKBOY_GH_MIRROR:-}"
 NON_INTERACTIVE=false
@@ -34,10 +39,11 @@ while [[ $# -gt 0 ]]; do
         --user)          USERNAME="$2"; shift 2 ;;
         --secret)        SECRET="$2"; shift 2 ;;
         --interval)      INTERVAL="$2"; shift 2 ;;
+        --pin-sha256)    PIN_SHA256="$2"; PIN_GIVEN=true; shift 2 ;;
         --no-verify-ssl) NO_VERIFY_SSL=true; shift ;;
         --gh-mirror)     GH_MIRROR="$2"; shift 2 ;;
         --yes)           NON_INTERACTIVE=true; shift ;;
-        -h|--help)       head -19 "$0"; exit 0 ;;
+        -h|--help)       head -20 "$0"; exit 0 ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
@@ -72,6 +78,14 @@ fi
 [[ -z "$SERVER_URL" ]] && { echo "Error: --server is required"; exit 1; }
 [[ -z "$USERNAME" ]]   && { echo "Error: --user is required"; exit 1; }
 [[ -z "$SECRET" ]]     && { echo "Error: --secret is required"; exit 1; }
+if [[ -n "$PIN_SHA256" && ! "$PIN_SHA256" =~ ^[A-Za-z0-9+/]{43}=$ ]]; then
+    echo "Error: --pin-sha256 must be the base64 SHA-256 of the server's public key (44 characters ending in '=')"
+    exit 1
+fi
+if [[ -n "$PIN_SHA256" && "$SERVER_URL" != https://* ]]; then
+    echo "Error: a key pin (--pin-sha256) needs an https:// --server"
+    exit 1
+fi
 
 # Install python3 + pyyaml if missing
 if ! command -v python3 &>/dev/null; then
@@ -93,9 +107,32 @@ CONFIG_DIR="$HOME/.config/ufw-okboy"
 mkdir -p "$CONFIG_DIR"
 CONFIG_FILE="$CONFIG_DIR/config.yaml"
 
-# verify_ssl mirrors --no-verify-ssl: a self-signed server needs verify_ssl=false.
+# A re-run keeps the key pin of the existing config unless --pin-sha256 is
+# given ('' removes it). A pin that cannot be read, or whose server_url is not
+# this --server, stops the install rather than being dropped silently.
+# (knock.py reads the key case-sensitively; spaces may precede the colon.)
+norm_url() {  # no trailing slash, no default https port
+    local u="${1%/}"
+    [[ "$u" =~ ^(https://[^/]+):443(/.*)?$ ]] && u="${BASH_REMATCH[1]}${BASH_REMATCH[2]}"
+    printf '%s' "$u"
+}
+if [[ "$PIN_GIVEN" == false && -f "$CONFIG_FILE" ]] && grep -qE '^[[:space:]]*pin_sha256[[:space:]]*:' "$CONFIG_FILE"; then
+    old_url="$(sed -nE "s/^[[:space:]]*server_url[[:space:]]*:[[:space:]]*[\"']?([^\"'[:space:]]*)[\"']?[[:space:]]*\$/\1/p" "$CONFIG_FILE")"
+    PIN_SHA256="$(sed -nE "s/^[[:space:]]*pin_sha256[[:space:]]*:[[:space:]]*[\"']?([A-Za-z0-9+\/]{43}=)[\"']?[[:space:]]*\$/\1/p" "$CONFIG_FILE")"
+    if [[ ! "$PIN_SHA256" =~ ^[A-Za-z0-9+/]{43}=$ || "$(norm_url "$old_url")" != "$(norm_url "$SERVER_URL")" ]]; then
+        echo "Error: $CONFIG_FILE holds a key pin (server_url: ${old_url:-unreadable}) that cannot be carried over;"
+        echo "       pass --pin-sha256 <pin> for $SERVER_URL, or --pin-sha256 '' if it needs none"
+        exit 1
+    fi
+    echo "[INFO] Keeping the server key pin of $CONFIG_FILE (--pin-sha256 '' removes it)"
+fi
+
+# verify_ssl mirrors --no-verify-ssl; a pin_sha256 line (--pin-sha256) takes
+# precedence over it in knock.py.
 VERIFY_SSL=true
 [[ "$NO_VERIFY_SSL" == true ]] && VERIFY_SSL=false
+PIN_LINE=""
+[[ -n "$PIN_SHA256" ]] && PIN_LINE="pin_sha256: \"$PIN_SHA256\""
 
 # Write config in the YAML format knock.py expects (server_url/username/secret).
 # (The previous shell-style SERVER_URL=... format was silently unparseable by the
@@ -105,6 +142,7 @@ server_url: "$SERVER_URL"
 username: "$USERNAME"
 secret: "$SECRET"
 verify_ssl: $VERIFY_SSL
+$PIN_LINE
 EOF
 chmod 600 "$CONFIG_FILE"
 echo "[INFO] Config written to $CONFIG_FILE"
@@ -177,7 +215,11 @@ echo "=== Client Setup Complete ==="
 echo "  Config:   $CONFIG_FILE"
 echo "  Script:   $KNOCK_SCRIPT"
 echo "  Timer:    every ${INTERVAL}s"
-echo "  TLS:      verify_ssl=$VERIFY_SSL"
+if [[ -n "$PIN_SHA256" ]]; then
+    echo "  TLS:      pinned server key $PIN_SHA256"
+else
+    echo "  TLS:      verify_ssl=$VERIFY_SSL"
+fi
 echo ""
 echo "  Manual commands:"
 echo "    python3 $KNOCK_SCRIPT -c $CONFIG_FILE knock"
