@@ -36,14 +36,16 @@ def _ufw_env() -> dict:
 
 def _run(cmd: list[str], timeout: float) -> subprocess.CompletedProcess:
     """Run ufw like subprocess.run — in the C locale, and in its own process
-    group, all of which is killed on timeout: ufw hands its changes to
-    iptables-restore, and killing ufw alone would leave that applying them
-    after the host lock is released, maybe an older rule set over a newer."""
+    group, all of which is killed if the wait ends early (a timeout, Ctrl-C):
+    ufw hands its changes to iptables-restore, and killing ufw alone — or, in
+    its own session, ufw not seeing the terminal's Ctrl-C at all — would leave
+    that applying them after the host lock is released, maybe an older rule
+    set over a newer."""
     with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                           text=True, env=_ufw_env(), start_new_session=True) as proc:
         try:
             out, err = proc.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
+        except BaseException:
             try:
                 os.killpg(proc.pid, signal.SIGKILL)
             except ProcessLookupError:
@@ -655,21 +657,39 @@ class UFWManager:
         *ports* and *proto* are no longer needed; they are accepted so existing
         callers keep working.
 
+        A user who never knocked successfully has no rule — unless a knock
+        added one and then failed, recording nothing: such a rule would never
+        expire, so it goes too.
+
         Returns list of removed usernames.
         """
         now = int(time.time())
         removed: list[str] = []
+        prefix = f"{self.rule_prefix}:"
+        try:
+            ruled = {r["comment"][len(prefix):].partition(":")[0]
+                     for r in self.list_rules_by_comment(prefix, strict=True)}
+        except RuntimeError as exc:
+            logger.warning("Cleanup could not list the rules: %s", exc)
+            ruled = set()
+
+        def due(user) -> bool:
+            if user is None:
+                return False
+            if user["last_knock"] is None:
+                return user["username"] in ruled
+            return now - user["last_knock"] > max_age_seconds
 
         for listed in self.db.list_users():
-            if listed["last_knock"] is None or now - listed["last_knock"] <= max_age_seconds:
+            if not due(listed):
                 continue
             with self.lock:
                 # Re-read under the lock: a knock may have refreshed the user (new
                 # IP, new rules) since the listing, and must not be undone.
                 user = self.db.get_user(listed["id"])
-                last_knock = user["last_knock"] if user else None
-                if last_knock is None or now - last_knock <= max_age_seconds:
+                if not due(user):
                     continue
+                last_knock = user["last_knock"]
                 username = user["username"]
                 # Every rule carrying the user's comment — also those of groups
                 # since disabled or left, and at older addresses.
@@ -682,8 +702,9 @@ class UFWManager:
                 self.db.clear_user_state(user["id"])
             removed.append(username)
             logger.info(
-                "Cleaned up stale user: %s (last knock %ds ago)",
-                username, now - last_knock,
+                "Cleaned up stale user: %s (%s)", username,
+                f"last knock {now - last_knock}s ago" if last_knock is not None
+                else "rules left by a knock that failed",
             )
         return removed
 

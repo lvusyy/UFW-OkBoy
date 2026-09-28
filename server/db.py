@@ -13,9 +13,15 @@ import logging
 import os
 import secrets
 import sqlite3
+import contextlib
 import threading
 import time
 from pathlib import Path
+
+try:
+    import fcntl
+except ImportError:  # not POSIX: no claims on the database (see _claim)
+    fcntl = None
 
 logger = logging.getLogger("ufw-okboy.db")
 
@@ -23,6 +29,29 @@ logger = logging.getLogger("ufw-okboy.db")
 # "CHANGE_ME_run_python_app_py_gen_secret_alice"). Anyone can read them in
 # the repo, so they must never become a working credential.
 PLACEHOLDER_SECRET_PREFIX = "CHANGE_ME"
+
+
+def _claim_path(db_path: str) -> str:
+    return os.path.join(os.path.dirname(os.path.abspath(db_path)), "db.lock")
+
+
+class DatabaseInUse(RuntimeError):
+    """Another process holds the database (see exclusive_claim)."""
+
+
+@contextlib.contextmanager
+def exclusive_claim(db_path: str):
+    """Hold the database exclusively for the block: no process has it open —
+    each holds a shared claim for as long as it does (see Database). Raises
+    DatabaseInUse at once when one has."""
+    Path(db_path).parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with os.fdopen(os.open(_claim_path(db_path), os.O_RDWR | os.O_CREAT, 0o600), "r+") as f:
+        if fcntl is not None:
+            try:
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise DatabaseInUse(f"{db_path} is open in another process") from None
+        yield
 
 
 def is_placeholder_secret(secret) -> bool:
@@ -138,11 +167,27 @@ class Database:
         self.db_path = db_path
         self.fresh = False  # set by init(): the database was created just now
         Path(db_path).parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self._claim = self._claim_shared()
         # One connection per thread. The constructing thread's connection is
         # opened eagerly so init()/migrations/CLI/tests run without surprises.
         self._local = threading.local()
         self._connect()
         self._restrict_files()
+
+    def _claim_shared(self):
+        """A shared lock on ``db.lock`` beside the database, held while this
+        object lives (or until close()): a restore takes it exclusively, so it
+        never replaces the database under a process that has it open. While
+        a restore runs, opening fails at once."""
+        if fcntl is None:
+            return None
+        f = os.fdopen(os.open(_claim_path(self.db_path), os.O_RDWR | os.O_CREAT, 0o600), "r+")
+        try:
+            fcntl.flock(f.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            f.close()
+            raise DatabaseInUse(f"{self.db_path} is being restored; retry when that is done") from None
+        return f
 
     def _restrict_files(self) -> None:
         """Make the database files owner-only: they hold plaintext HMAC secrets
@@ -392,11 +437,15 @@ class Database:
             self.conn.commit()
 
     def close(self) -> None:
-        """Close the calling thread's connection (if one was opened)."""
+        """Close the calling thread's connection (if one was opened), and give
+        up the claim on the database (see _claim_shared)."""
         conn = getattr(self._local, "conn", None)
         if conn is not None:
             conn.close()
             self._local.conn = None
+        if self._claim is not None:
+            self._claim.close()
+            self._claim = None
 
     # ------------------------------------------------------------------ #
     #  User CRUD

@@ -10,6 +10,7 @@ import hashlib
 import hmac
 import io
 import os
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -26,7 +27,7 @@ import app as app_module  # noqa: E402
 import auth  # noqa: E402
 import ufw_ops  # noqa: E402
 from app import create_app, open_database  # noqa: E402
-from db import Database  # noqa: E402
+from db import Database, DatabaseInUse, exclusive_claim  # noqa: E402
 from ufw_ops import (  # noqa: E402
     DeadlineExceeded, HostLock, LockTimeout, UFWManager, canonical_ip, fcntl,
 )
@@ -67,6 +68,8 @@ class FakeUfw:
         self.v6: list[tuple] = []
         self.fail_deletes = False  # make every delete fail, as a wedged ufw would
         self.fail_list = False  # make `status numbered` fail
+        self.fail_list_after: int | None = None  # ... after this many listings
+        self.listings = 0
         self.raise_on_delete = None  # an exception every delete raises (a timeout)
         self.inactive = False  # ufw disabled: `status numbered` lists nothing
         self.fail_adds_after_saving = False  # an add saves its rule, then fails to apply it
@@ -102,7 +105,9 @@ class FakeUfw:
         self.calls.append((args, kwargs))
         rc, out = 0, ""
         if args == ["status", "numbered"]:
-            if self.fail_list:
+            self.listings += 1
+            if self.fail_list or (self.fail_list_after is not None
+                                  and self.listings > self.fail_list_after):
                 rc = 1
             elif self.inactive:
                 out = "Status: inactive\n"
@@ -482,19 +487,20 @@ class TestFilesAndSeeding(unittest.TestCase):
         backup = db.backup(os.path.join(self.tmpdir, "b.db"))
         db.close()
         ns = argparse.Namespace(config=cfg_path, backup=backup)
-        with patch("app._service_running", return_value=True), self.assertRaises(SystemExit):
+        # A oneshot cleanup, running, is "activating" — not "active".
+        states = subprocess.CompletedProcess([], 3, stdout="inactive\nactivating\n")
+        with patch("subprocess.run", return_value=states), self.assertRaises(SystemExit):
             app_module.cmd_restore(ns)
-        held = []
-        real = app_module._copy_private
-
-        def spy(src, dest):
-            held.append(_flock_held(os.path.join(os.path.dirname(self.db_path), "ufw.lock")))
-            return real(src, dest)
-
-        with patch("app._copy_private", spy), contextlib.redirect_stdout(io.StringIO()):
+        other = Database(self.db_path)  # another process's, say: open until closed
+        with self.assertRaises(SystemExit):
             app_module.cmd_restore(ns)
-        self.assertTrue(held)
-        self.assertTrue(all(held))
+        other.close()
+        with contextlib.redirect_stdout(io.StringIO()):
+            app_module.cmd_restore(ns)
+        # And while a restore holds it, the database does not open.
+        with exclusive_claim(self.db_path):
+            with self.assertRaises(DatabaseInUse):
+                Database(self.db_path)
 
     @unittest.skipIf(os.name != "posix", "POSIX file modes")
     def test_snapshot_copies_are_owner_only(self) -> None:
@@ -608,6 +614,23 @@ class TestRemovals(_Base):
         self.db.conn.commit()
         self.assertEqual(self.ufw.cleanup_stale(7 * 86400), [])
         self.assertEqual(self.db.get_user(self.alice)["current_ip"], "203.0.113.10")
+
+    def test_a_failed_first_knock_leaves_nothing_behind(self) -> None:
+        # A knock that added its rule and then failed records nothing, and the
+        # cleanup skipped users who never knocked: the rule never expired.
+        carol = self.db.create_user("carol", "secret-carol")
+        self.db.add_membership(carol, self.web, enabled=1)
+        self.fake.fail_list_after = 2  # the knock's second look fails, after its add
+        r = self.client.post("/api/knock", headers={
+            "Authorization": build_auth_header("carol", "secret-carol"),
+            "X-Real-IP": "198.51.100.5"})
+        self.assertEqual(r.status_code, 503)
+        self.assertIsNone(self.db.get_user(carol)["last_knock"])
+        self.assertIn("ufw-okboy:carol:web", self._left())
+        self.fake.fail_list_after = None
+        self.assertEqual(self.ufw.cleanup_stale(7 * 86400), ["carol"])
+        self.assertNotIn("ufw-okboy:carol:web", self._left())
+        self.assertIn("ufw-okboy:alice:web", self._left())  # a live user's stay
 
     def test_an_inactive_ufw_is_not_a_removal(self) -> None:
         # Inactive, ufw lists no rule though they stay saved: deleting the user
@@ -969,6 +992,26 @@ class TestUfwProcess(unittest.TestCase):
         pidfile = os.path.join(tempfile.mkdtemp(prefix="ufw-okboy-run-"), "pid")
         with self.assertRaises(subprocess.TimeoutExpired):
             ufw_ops._run(["sh", "-c", f"sleep 30 & echo $! > {pidfile}; wait"], timeout=1)
+        self._assert_gone(pidfile)
+
+    def test_an_interrupt_kills_what_it_started(self) -> None:
+        # Ctrl-C: in its own session, ufw never sees the terminal's SIGINT.
+        pidfile = os.path.join(tempfile.mkdtemp(prefix="ufw-okboy-run-"), "pid")
+
+        def interrupt(signum, frame):
+            raise KeyboardInterrupt
+
+        before = signal.signal(signal.SIGALRM, interrupt)
+        signal.setitimer(signal.ITIMER_REAL, 1)
+        try:
+            with self.assertRaises(KeyboardInterrupt):
+                ufw_ops._run(["sh", "-c", f"sleep 30 & echo $! > {pidfile}; wait"], timeout=30)
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, before)
+        self._assert_gone(pidfile)
+
+    def _assert_gone(self, pidfile: str) -> None:
         with open(pidfile, encoding="utf-8") as f:
             pid = int(f.read())
         for _ in range(50):  # killed: gone, or a zombie not reaped yet
@@ -976,7 +1019,7 @@ class TestUfwProcess(unittest.TestCase):
                 with open(f"/proc/{pid}/stat", encoding="utf-8") as f:
                     if f.read().rsplit(")", 1)[1].split()[0] == "Z":
                         break
-            except FileNotFoundError:
+            except (FileNotFoundError, ProcessLookupError):  # gone (read can race the exit)
                 break
             time.sleep(0.1)
         else:

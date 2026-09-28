@@ -30,7 +30,7 @@ from flask import Flask, request, jsonify, send_from_directory
 from werkzeug.exceptions import HTTPException
 
 import auth
-from db import Database, is_placeholder_secret
+from db import Database, DatabaseInUse, exclusive_claim, is_placeholder_secret
 from ufw_ops import HostLock, LockTimeout, UFWManager, canonical_ip
 
 logger = logging.getLogger("ufw-okboy")
@@ -1843,14 +1843,16 @@ def cmd_backup(args):
 
 
 def _service_running() -> bool:
-    """Whether the service, or a cleanup run, is active under systemd (False
-    where there is no systemd)."""
+    """Whether the service, or a cleanup run, is up under systemd — starting
+    or stopping counts: a running oneshot cleanup is "activating" (False where
+    there is no systemd)."""
     import subprocess as _sp
     try:
-        return _sp.run(["systemctl", "is-active", "--quiet", "ufw-okboy",
-                        "ufw-okboy-cleanup"]).returncode == 0
+        states = _sp.run(["systemctl", "is-active", "ufw-okboy", "ufw-okboy-cleanup"],
+                         capture_output=True, text=True).stdout.split()
     except OSError:
         return False
+    return any(s in ("active", "activating", "deactivating", "reloading") for s in states)
 
 
 def cmd_restore(args):
@@ -1879,27 +1881,35 @@ def cmd_restore(args):
         print("Checksum verified.")
     else:
         print("WARNING: no .sha256 sidecar — restoring without integrity verification.")
-    # Under the host lock: a CLI command, or a cleanup run, starting meanwhile
-    # waits (each opens the database under it).
-    with HostLock(os.path.join(os.path.dirname(os.path.abspath(db_path)), "ufw.lock")):
-        if os.path.exists(db_path):
-            # A byte copy — the database being replaced may be the broken one —
-            # of the file and its -wal, which can hold commits not in the file
-            # yet. Named uniquely: restoring an earlier snapshot must not
-            # overwrite it.
-            snap = f"{db_path}.pre-restore-{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}"
-            for side in ("", "-wal"):
-                if os.path.exists(db_path + side):
-                    _copy_private(db_path + side, snap + side)
-            print(f"Current DB snapshotted to {snap}")
-        _copy_private(src, db_path)
-        for ext in ("-wal", "-shm"):
-            stale = db_path + ext
-            if os.path.exists(stale):
-                os.remove(stale)
-        if os.path.exists(src + "-wal"):  # a raw snapshot's commits not yet in its file
-            _copy_private(src + "-wal", db_path + "-wal")
+    # With the database held exclusively: no process has it open — the service,
+    # a cleanup run, another app.py command — and none can open it meanwhile.
+    try:
+        with exclusive_claim(db_path):
+            _replace_database(db_path, src)
+    except DatabaseInUse:
+        sys.exit("The database is open in another process — the service, a cleanup run "
+                 "or another app.py command: stop them, then restore.")
     print(f"Restored {db_path} from {src}. Restart the server to load it.")
+
+
+def _replace_database(db_path: str, src: str) -> None:
+    """Snapshot the database, then put *src* in its place."""
+    if os.path.exists(db_path):
+        # A byte copy — the database being replaced may be the broken one — of
+        # the file and its -wal, which can hold commits not in the file yet.
+        # Named uniquely: restoring an earlier snapshot must not overwrite it.
+        snap = f"{db_path}.pre-restore-{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}"
+        for side in ("", "-wal"):
+            if os.path.exists(db_path + side):
+                _copy_private(db_path + side, snap + side)
+        print(f"Current DB snapshotted to {snap}")
+    _copy_private(src, db_path)
+    for ext in ("-wal", "-shm"):
+        stale = db_path + ext
+        if os.path.exists(stale):
+            os.remove(stale)
+    if os.path.exists(src + "-wal"):  # a raw snapshot's commits not yet in its file
+        _copy_private(src + "-wal", db_path + "-wal")
 
 
 # ====================================================================== #
