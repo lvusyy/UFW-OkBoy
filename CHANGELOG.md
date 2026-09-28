@@ -4,6 +4,32 @@
 
 ---
 
+## v2.4.1 (2026-09-29)
+
+安装、升级与发布流程的修复，外加文档按当前代码全面校订。应用本身只有命令行的行为有变化：`user-add`、`group-add` 出错时（包括重名、端口已被占用）一律以非零状态退出；`upgrade` 不再把同一版本当作新版本。
+
+| 修复 | 说明 |
+|------|------|
+| **RHEL 系上装出的服务起不来** | 服务端需要 Python 3.10+（代码使用 `X \| None` 注解），安装脚本却直接用发行版自带的 `python3`：RHEL、Rocky、AlmaLinux 8/9 上是 3.6 或 3.9，安装看似完成，服务一启动就报 `TypeError`。现在 `deploy.sh` 选用能建 venv（带 `ensurepip`）的 Python 3.10+：优先发行版的 `python3`，否则找已安装的 `python3.10`–`python3.14`；RHEL 系仍不满足时自动安装 `python3.12`（或 `python3.11`）；都不行就在改动 UFW 之前报错退出。已有用旧解释器建的 venv 时重建它，所以装坏的实例重新运行 `deploy.sh` 即可修好。RHEL 本身的软件源里没有 `epel-release`，改从 EPEL 官方地址安装。`install-server.sh` 做同样的处理 |
+| **RHEL 系上 Nginx 站点不生效** | 站点配置本应在没有 `sites-available` 的系统上改写到 `conf.d/`，但判断之前已经建出了这个目录，于是总是写进 RHEL 系 Nginx 不读取的 `sites-available/`；Nginx 也没有设为开机启动。现在按 `nginx.conf` 是否引用 `sites-enabled` 决定位置，并启用 Nginx |
+| **域名模式拿不到 Let's Encrypt 证书** | 安装脚本没有在 UFW 里放行 80 端口，HTTP-01 校验到不了 Nginx；`certbot --nginx --redirect` 还会去改 Nginx 的默认站点。结果总是退回自签证书。现在先放行 80 端口，用 `certbot certonly --nginx` 只申请证书（站点仍由安装脚本配置），登记续期后重载 Nginx（`--no-nginx` 时重启服务），并启用 certbot 的续期定时器（RHEL 系默认不启用） |
+| **`--no-nginx` 安装的实例升级必然回滚** | `upgrade.sh` 按 `config.yaml` 的 `listen_port` 探测 `http://127.0.0.1:<端口>/health`，而这一项只影响 `app.py serve`；`--no-nginx` 安装时由 gunicorn 自己以 TLS 监听对外端口，健康检查必然失败并回滚。现在按服务单元里 gunicorn 的 `--bind`（或 `-b`）探测，单元带 `--certfile` 时走 HTTPS；读不出地址（例如 unix 套接字、由 systemd 展开的变量）时改为确认服务持续运行 |
+| **升级不会补上 `UMask=0077`** | v2.4.0 起新装的服务单元带 `UMask=0077`，升级却不改已安装的单元，旧实例的服务新建文件时仍用默认的 umask。现在 `upgrade.sh` 发现单元没有这项设置时，添加 drop-in `/etc/systemd/system/<单元>.d/50-umask.conf`，不改动单元文件本身；单元（含 drop-in）里已经写了 UMask 的，视为管理员的选择，不改动，只给出提示。`--service` 写成 `ufw-okboy.service` 也能识别 |
+| **发布包缺 `upgrade.sh`，也不能离线安装** | GitHub Release 的包按另一份清单打包，漏了 `deploy/upgrade.sh`，也不带 Python 依赖——文档所说的离线安装只对自己用 `build-release.sh` 打的包成立，而那个包同样没有 `upgrade.sh`。现在发布流程直接调用 `build-release.sh`：包里带 CPython 3.10–3.14（x86_64、aarch64）的依赖 wheels，以及 `upgrade.sh`、`LICENSE`、`CHANGELOG.md`、`SECURITY.md`；清单中的文件缺任何一个都会让构建失败 |
+| **`upgrade --check` 把同一版本当作新版本** | 版本相同时提示「An upgrade is available」，`upgrade --force` 也会照样拉取代码并重启服务。现在只有更高的版本才算升级 |
+| **回滚后的恢复提示走不通** | `upgrade.sh` 回滚后服务已重新启动，而 v2.4.0 的 `restore` 要求服务先停下。提示改为先停服务、恢复、再启动 |
+| **git 检出到安装目录后无法安装** | 在 `/opt/ufw-okboy` 的 git 检出里运行 `deploy.sh`，会因为源目录与安装目录相同而中途退出，而 `app.py upgrade --force` 恰恰只支持这种安装。现在源目录就是安装目录时不再复制文件 |
+| **`install-server.sh` 的两处问题** | 没装 ufw 时在最开始就退出，后面为 RHEL 系安装 EPEL 与 ufw 的步骤从来执行不到；`--app-dir` 装到别的目录时，服务单元仍指向 `/opt/ufw-okboy`。现在先安装再检查 ufw，服务单元按实际目录生成；`--app-dir`（`deploy.sh` 同样）只接受由字母、数字、`.`、`_`、`-` 组成的绝对路径 |
+| **重复建用户、分组时抛出异常** | 命令行 `user-add` 遇到已存在的用户名、`group-add` 遇到已存在的分组名时，打印未处理的 `IntegrityError` 堆栈；端口已被占用、名称不合法时则以状态 0 退出。现在一律给出提示并以非零状态退出 |
+| 其他 | `upgrade.sh --branch` 也接受发布标签（如 `--branch v2.4.1`），连不上 git 时改下源码包也适用；`deploy.sh`、`upgrade.sh`、`install-server.sh` 的 `--help` 只打印脚本说明；在没有 pip 的机器上打包不再中途退出；自签证书安装结束时打印证书的 SHA-256 指纹，文档改为核对指纹后再在浏览器里继续；补上 `LICENSE`（MIT）与 `SECURITY.md`；README、GUIDE 按当前代码全面校订；CI 增加 Python 3.13/3.14、shellcheck 与发布包离线安装检查；Release 说明改为取自本文件对应版本的段落 |
+
+**升级须知**：
+
+- 用 `deploy/upgrade.sh` 升级会自动补上 `UMask=0077`。git 检出的安装（`app.py upgrade --force` 或 `git checkout <标签>`）不经过 `upgrade.sh`，需要时手动添加同样的 drop-in，再执行 `systemctl daemon-reload && systemctl restart ufw-okboy`。
+- 发布包可以离线升级：解压后在包目录里执行 `sudo bash deploy/upgrade.sh --repo-dir . -y`。
+- 已经装好的实例不受 Nginx 与证书两项修复影响；它们只改变今后运行 `deploy.sh` 时的行为。
+- 在 RHEL 系上用旧版本安装、服务起不来的实例：拿到本版本后重新运行 `deploy.sh` 即可。
+
 ## v2.4.0 (2026-09-28)
 
 > ⚠️ **安全修复，建议所有实例升级**。其中最严重的一条：一个属于两个以上分组的用户换 IP 时，服务端会删错 UFW 规则——可能是别人的放行规则，也可能是主机自己的规则（比如一条 DENY）。
