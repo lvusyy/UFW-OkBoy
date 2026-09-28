@@ -6,6 +6,7 @@ Run from the server/ directory with:
 
 import argparse
 import contextlib
+import gc
 import hashlib
 import hmac
 import io
@@ -501,6 +502,23 @@ class TestFilesAndSeeding(unittest.TestCase):
         with exclusive_claim(self.db_path):
             with self.assertRaises(DatabaseInUse):
                 Database(self.db_path)
+
+    @unittest.skipIf(fcntl is None, "POSIX flock")
+    def test_the_claim_outlives_every_connection(self) -> None:
+        # Dropped without close(), a Database gave up its claim while its
+        # connection could live on — whose last close checkpoints its -wal
+        # into whatever file is there by then, a restored one included.
+        db = Database(self.db_path)
+        conn = db.conn
+        del db
+        gc.collect()
+        with self.assertRaises(DatabaseInUse):
+            with exclusive_claim(self.db_path):
+                pass
+        conn.close()
+        del conn
+        with exclusive_claim(self.db_path):
+            pass
 
     @unittest.skipIf(os.name != "posix", "POSIX file modes")
     def test_snapshot_copies_are_owner_only(self) -> None:

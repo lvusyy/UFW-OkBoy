@@ -39,6 +39,32 @@ class DatabaseInUse(RuntimeError):
     """Another process holds the database (see exclusive_claim)."""
 
 
+class _Claim:
+    """A shared lock on db.lock, released when the last holder is gone: the
+    Database, or any connection it opened (see _Connection)."""
+
+    def __init__(self, path: str) -> None:
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BaseException:
+            os.close(fd)
+            raise
+        self._fd = fd
+
+    def __del__(self) -> None:
+        fd = getattr(self, "_fd", None)
+        if fd is not None:
+            os.close(fd)
+
+
+class _Connection(sqlite3.Connection):
+    """A connection keeping the claim alive for as long as it exists: closed
+    after the claim is released, it could checkpoint its -wal into a database
+    a restore has just replaced."""
+    claim = None
+
+
 @contextlib.contextmanager
 def exclusive_claim(db_path: str):
     """Hold the database exclusively for the block: no process has it open —
@@ -175,19 +201,17 @@ class Database:
         self._restrict_files()
 
     def _claim_shared(self):
-        """A shared lock on ``db.lock`` beside the database, held while this
-        object lives (or until close()): a restore takes it exclusively, so it
-        never replaces the database under a process that has it open. While
-        a restore runs, opening fails at once."""
+        """A shared lock on ``db.lock`` beside the database, held until neither
+        this object nor any connection it opened is left: a restore takes it
+        exclusively, so it never replaces the database under a process that
+        has it open — whether or not close() was called. While a restore runs,
+        opening fails at once."""
         if fcntl is None:
             return None
-        f = os.fdopen(os.open(_claim_path(self.db_path), os.O_RDWR | os.O_CREAT, 0o600), "r+")
         try:
-            fcntl.flock(f.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+            return _Claim(_claim_path(self.db_path))
         except BlockingIOError:
-            f.close()
             raise DatabaseInUse(f"{self.db_path} is being restored; retry when that is done") from None
-        return f
 
     def _restrict_files(self) -> None:
         """Make the database files owner-only: they hold plaintext HMAC secrets
@@ -215,7 +239,8 @@ class Database:
 
     def _connect(self) -> sqlite3.Connection:
         """Open and configure a SQLite connection for the calling thread."""
-        conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        conn = sqlite3.connect(self.db_path, check_same_thread=False, factory=_Connection)
+        conn.claim = self._claim
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
         conn.execute("PRAGMA journal_mode = WAL")
@@ -437,15 +462,13 @@ class Database:
             self.conn.commit()
 
     def close(self) -> None:
-        """Close the calling thread's connection (if one was opened), and give
-        up the claim on the database (see _claim_shared)."""
+        """Close the calling thread's connection (if one was opened), and let
+        go of the claim on the database (see _claim_shared)."""
         conn = getattr(self._local, "conn", None)
         if conn is not None:
             conn.close()
             self._local.conn = None
-        if self._claim is not None:
-            self._claim.close()
-            self._claim = None
+        self._claim = None
 
     # ------------------------------------------------------------------ #
     #  User CRUD
