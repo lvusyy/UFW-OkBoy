@@ -1376,10 +1376,13 @@ def cmd_upgrade(args):
 
     latest = fetch_latest_version()
     current = __version__
+    # Only a strictly newer release is an upgrade: the same version used to be
+    # reported as one, and --force pulled and restarted for nothing.
+    newer = bool(latest) and not _ver_ge(current, latest)
     print(f"Current version: {current}")
     if latest:
         print(f"Latest release: {latest}")
-        if _ver_ge(latest, current):
+        if newer:
             print("→ An upgrade is available.")
         else:
             print("→ You are up to date.")
@@ -1394,7 +1397,7 @@ def cmd_upgrade(args):
     if not latest:
         print("Aborting: cannot upgrade without a known target version.")
         sys.exit(1)
-    if not _ver_ge(latest, current):
+    if not newer:
         print("Already up to date; nothing to do.")
         return
     if not args.force:
@@ -1623,12 +1626,14 @@ def cmd_user_add(args):
     """Create a new user with a random secret."""
     name_err = _name_error(args.username, "username")
     if name_err:
-        print(name_err)
-        return
+        sys.exit(name_err)
     cfg = load_config(args.config)
     db = open_database(cfg)
     secret = secrets.token_hex(32)
-    db.create_user(args.username, secret, is_admin=args.admin)
+    try:
+        db.create_user(args.username, secret, is_admin=args.admin)
+    except sqlite3.IntegrityError:
+        sys.exit(f"User '{args.username}' already exists.")
     print(f"Created user '{args.username}' with secret: {secret}")
     db.log_audit("cli", "user_add", args.username, f"is_admin={args.admin}")
 
@@ -1673,19 +1678,20 @@ def cmd_group_add(args):
     """Create a new port group."""
     name_err = _name_error(args.name, "group name")
     if name_err:
-        print(name_err)
-        return
+        sys.exit(name_err)
     port_err = _port_error(args.port)
     if port_err:
-        print(port_err)
-        return
+        sys.exit(port_err)
     cfg = load_config(args.config)
     db = open_database(cfg)
     dup = db.get_group_by_port_proto(args.port, args.proto)
     if dup:
-        print(f"Port {args.port}/{args.proto} is already used by group '{dup['name']}'.")
-        return
-    db.create_group(args.name, args.port, args.proto)
+        sys.exit(f"Port {args.port}/{args.proto} is already used by group '{dup['name']}'.")
+    try:
+        db.create_group(args.name, args.port, args.proto)
+    except sqlite3.IntegrityError:  # the name, or a port/proto added meanwhile
+        sys.exit(f"Group '{args.name}' already exists." if db.get_group_by_name(args.name)
+                 else f"Port {args.port}/{args.proto} is already used by another group.")
     print(f"Created group '{args.name}' (port {args.port}/{args.proto})")
     db.log_audit("cli", "group_add", args.name, f"port={args.port} proto={args.proto}")
 

@@ -5,11 +5,13 @@ logic are exercised. The destructive --force path is NOT tested end-to-end
 (it restarts the service).
 """
 
+import io
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
@@ -57,11 +59,25 @@ class TestUpgradeCheck(unittest.TestCase):
         return m
 
     def test_check_up_to_date(self) -> None:
-        # latest == current -> up to date; cmd_upgrade returns without exit.
+        # latest == current is not an upgrade (it was reported as one).
         ns = MagicMock(config=None, check=True, force=False, yes=False)
+        out = io.StringIO()
         with patch("app.urllib.request.urlopen",
-                   return_value=self._mock_release(app_module.__version__)):
+                   return_value=self._mock_release(app_module.__version__)), redirect_stdout(out):
             app_module.cmd_upgrade(ns)  # should return without exit
+        self.assertIn("You are up to date", out.getvalue())
+        self.assertNotIn("An upgrade is available", out.getvalue())
+
+    def test_force_on_the_current_version_does_nothing(self) -> None:
+        # --force went on to pull and restart when the release was the same version.
+        ns = MagicMock(config=None, check=False, force=True, yes=True)
+        out = io.StringIO()
+        with patch("app.urllib.request.urlopen",
+                   return_value=self._mock_release(app_module.__version__)), \
+                patch("subprocess.run") as run, redirect_stdout(out):
+            app_module.cmd_upgrade(ns)
+        self.assertIn("Already up to date", out.getvalue())
+        run.assert_not_called()
 
     def test_check_network_failure_is_safe(self) -> None:
         """If GitHub is unreachable, --check must not raise (graceful degrade)."""

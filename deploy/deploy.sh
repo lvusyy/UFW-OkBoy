@@ -3,10 +3,10 @@
 # Supports: Ubuntu/Debian (apt), CentOS/RHEL/Fedora (dnf/yum)
 # SSL modes: domain → Let's Encrypt, no domain → self-signed (IP:port)
 #
-# Usage:
-#   curl -fsSL https://raw.githubusercontent.com/lvusyy/UFW-OkBoy/master/deploy/deploy.sh | bash
-#   OR:
-#   bash deploy.sh [--domain your.domain.com] [--port 443] [--no-nginx]
+# Usage (from a checkout or an unpacked release package, as root):
+#   bash deploy/deploy.sh [--domain your.domain.com] [--port 443] [--no-nginx]
+# One-liner without a checkout: deploy/quick-install.sh fetches the source and
+# runs this script with the same flags.
 #
 # Flags:
 #   --domain <domain>   Use Let's Encrypt for this domain (requires DNS A record)
@@ -20,7 +20,7 @@
 #   --self-signed       Force self-signed cert even if domain provided
 #   --admin-user <name> Admin user to create after install (default: admin)
 #   --app-dir <path>    Install directory (default: /opt/ufw-okboy)
-#   -y, --yes           Non-interactive mode (skip all prompts)
+#   -y, --yes           Accepted for scripted runs (the installer never prompts)
 
 set -euo pipefail
 
@@ -35,7 +35,6 @@ PIP_MIRROR=""
 OFFLINE=false
 FORCE_SELF_SIGNED=false
 NO_NGINX=false
-NON_INTERACTIVE=false
 ADMIN_USER=""          # first admin to auto-create; default "admin" (see bootstrap)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -125,9 +124,9 @@ while [[ $# -gt 0 ]]; do
         --self-signed)  FORCE_SELF_SIGNED=true; shift ;;
         --admin-user)   ADMIN_USER="$2"; shift 2 ;;
         --app-dir)      APP_DIR="$2"; shift 2 ;;
-        -y|--yes)       NON_INTERACTIVE=true; shift ;;
+        -y|--yes)       shift ;;   # nothing prompts; accepted for scripted runs
         -h|--help)
-            head -31 "$0"
+            awk 'NR > 1 && !/^#/ {exit} NR > 1 {sub(/^# ?/, ""); print}' "$0"
             exit 0
             ;;
         *) error "Unknown option: $1"; exit 1 ;;
@@ -139,13 +138,17 @@ if [[ $EUID -ne 0 ]]; then
     error "This script must be run as root."
     exit 1
 fi
+# The systemd units get --app-dir verbatim: keep it to a plain absolute path.
+if [[ ! "$APP_DIR" =~ ^/[A-Za-z0-9._/-]+$ ]]; then
+    error "--app-dir must be an absolute path of letters, digits, '.', '_', '-' and '/'."
+    exit 1
+fi
 
 # ── Detect distribution ── #
 detect_distro() {
     if [[ -f /etc/os-release ]]; then
         . /etc/os-release
         DISTRO_ID="$ID"
-        DISTRO_FAMILY="$ID_LIKE"
         DISTRO_VERSION="$VERSION_ID"
     else
         error "Cannot detect distribution: /etc/os-release not found"
@@ -177,10 +180,16 @@ select_pkg_manager() {
             fi
             NGINX_PKG="nginx"
             PYTHON_PKG="python3 python3-pip"
+            # Packaged next to an older default python3 on RHEL-family 8/9
+            # and Amazon Linux 2023 (see select_python below).
+            PYTHON_ALT_VERSIONS="3.12 3.11"
             CERTBOT_PKG="certbot python3-certbot-nginx"
             UFW_PKG="ufw"
-            # EPEL needed for ufw on RHEL-based
-            if [[ "$DISTRO_ID" != "fedora" ]]; then
+            # EPEL needed for ufw on RHEL-based. RHEL itself has no
+            # epel-release package in its repositories: install it by URL.
+            if [[ "$DISTRO_ID" == "rhel" ]]; then
+                EPEL_PKG="https://dl.fedoraproject.org/pub/epel/epel-release-latest-${DISTRO_VERSION%%.*}.noarch.rpm"
+            elif [[ "$DISTRO_ID" != "fedora" ]]; then
                 EPEL_PKG="epel-release"
             fi
             ;;
@@ -210,6 +219,36 @@ if [[ "$FORCE_SELF_SIGNED" == false && -n "$DOMAIN" ]]; then
     info "Installing certbot for Let's Encrypt..."
     $PKG_INSTALL $CERTBOT_PKG
 fi
+
+# The server needs Python 3.10+ able to create a venv with pip (Debian and
+# Ubuntu ship ensurepip separately, in python3-venv / python3.X-venv). Use the
+# distro's python3 when it qualifies, else a newer packaged one (installing it
+# where the distro has it). Decided here, before UFW is touched.
+find_python() {
+    local c
+    for c in python3 python3.14 python3.13 python3.12 python3.11 python3.10; do
+        command -v "$c" >/dev/null 2>&1 || continue
+        if "$c" -c 'import sys, ensurepip; sys.exit(sys.version_info < (3, 10))' 2>/dev/null; then
+            command -v "$c"
+            return 0
+        fi
+    done
+    return 1
+}
+PYTHON="$(find_python || true)"
+if [[ -z "$PYTHON" ]]; then
+    for _v in ${PYTHON_ALT_VERSIONS:-}; do
+        info "python3 is older than 3.10; installing python$_v..."
+        if $PKG_INSTALL "python$_v" "python$_v-pip"; then break; fi
+    done
+    PYTHON="$(find_python || true)"
+fi
+if [[ -z "$PYTHON" ]]; then
+    error "Python 3.10 or newer with venv support is required (found: $(python3 --version 2>&1 || echo none))."
+    error "Ubuntu 22.04+, Debian 12+ and Fedora ship it; elsewhere install python3.10+ (and its -venv package on Debian/Ubuntu) first, then re-run."
+    exit 1
+fi
+info "Using $("$PYTHON" --version 2>&1) ($PYTHON)"
 
 # CRITICAL: allow SSH BEFORE enabling UFW. `ufw enable` sets the default
 # incoming policy to DENY; without an SSH allow rule first, enabling UFW locks the
@@ -259,8 +298,11 @@ info "Log dir:   $LOG_DIR"
 # ── Step 3: Copy application files ── #
 step "Step 3/6: Installing application"
 
-# Copy from repo or download
-if [[ -f "$REPO_DIR/server/app.py" ]]; then
+# Copy from the source tree, unless it is the install dir itself: a git
+# checkout at $APP_DIR (the layout `app.py upgrade` updates with git pull).
+if [[ -f "$REPO_DIR/server/app.py" && "$(cd "$REPO_DIR" && pwd -P)" == "$(cd "$APP_DIR" && pwd -P)" ]]; then
+    info "Installing in place: $APP_DIR is the source checkout."
+elif [[ -f "$REPO_DIR/server/app.py" ]]; then
     info "Installing from local repository..."
     cp "$REPO_DIR/server/app.py" "$REPO_DIR/server/ufw_ops.py" "$REPO_DIR/server/db.py" \
        "$REPO_DIR/server/auth.py" "$REPO_DIR/server/requirements.txt" \
@@ -283,7 +325,15 @@ fi
 
 # Create virtual environment
 info "Setting up Python virtual environment..."
-python3 -m venv "$APP_DIR/venv"
+# A venv made by an older interpreter keeps it: `python -m venv` does not
+# replace an existing bin/python. Rebuild it then (the dependencies follow).
+VENV_ARGS=()
+if [[ -e "$APP_DIR/venv/bin/python" || -L "$APP_DIR/venv/bin/python" ]] \
+        && ! "$APP_DIR/venv/bin/python" -c 'import sys; sys.exit(sys.version_info < (3, 10))' 2>/dev/null; then
+    warn "Rebuilding $APP_DIR/venv: its interpreter is older than 3.10 or no longer runs."
+    VENV_ARGS=(--clear)
+fi
+"$PYTHON" -m venv ${VENV_ARGS[@]+"${VENV_ARGS[@]}"} "$APP_DIR/venv"
 pip_install --upgrade pip --quiet || warn "pip self-upgrade skipped (non-fatal)."
 pip_install -r "$APP_DIR/server/requirements.txt" --quiet
 
@@ -291,7 +341,7 @@ pip_install -r "$APP_DIR/server/requirements.txt" --quiet
 if [[ ! -f "$APP_DIR/server/config.yaml" ]]; then
     cp "$APP_DIR/server/config.example.yaml" "$APP_DIR/server/config.yaml"
     info "Config created: $APP_DIR/server/config.yaml"
-    warn "IMPORTANT: Edit config and create your first admin user!"
+    info "The defaults work as they are; an admin user is created at the end of this run."
 else
     info "Config already exists, preserving."
 fi
@@ -332,12 +382,25 @@ if [[ "$FORCE_SELF_SIGNED" == true || -z "$DOMAIN" ]]; then
     info "Self-signed cert: $SSL_CERT  (CN/SAN: $SERVER_IP, valid 10y)"
     info "Access via: https://$SERVER_IP:$HTTPS_PORT"
 else
-    # Let's Encrypt via certbot
+    # Let's Encrypt via certbot. The HTTP-01 check (and every renewal) comes in
+    # on port 80 and is answered by nginx; `certonly` only obtains the
+    # certificate, the site itself is configured below.
     info "Requesting Let's Encrypt certificate for: $DOMAIN"
-    if certbot --nginx -d "$DOMAIN" --non-interactive --agree-tos --register-unsafely-without-email --redirect; then
+    ufw allow 80/tcp comment "UFW OkBoy: Let's Encrypt HTTP-01" >/dev/null 2>&1 || true
+    systemctl enable --now nginx >/dev/null 2>&1 || true
+    if [[ "$NO_NGINX" == true ]]; then
+        RENEW_HOOK="systemctl restart ufw-okboy"   # gunicorn serves the certificate itself
+    else
+        RENEW_HOOK="systemctl reload nginx"
+    fi
+    if certbot certonly --nginx -d "$DOMAIN" --non-interactive --agree-tos \
+            --register-unsafely-without-email --deploy-hook "$RENEW_HOOK"; then
         SSL_CERT="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
         SSL_KEY="/etc/letsencrypt/live/$DOMAIN/privkey.pem"
         info "Let's Encrypt cert installed for: $DOMAIN"
+        # Renewals run from certbot's timer: Debian/Ubuntu enable certbot.timer
+        # on install, the RHEL family ships certbot-renew.timer disabled.
+        systemctl enable --now certbot-renew.timer >/dev/null 2>&1 || systemctl enable --now certbot.timer >/dev/null 2>&1 || true
     else
         warn "Certbot failed, falling back to self-signed..."
         FORCE_SELF_SIGNED=true
@@ -366,12 +429,12 @@ if [[ "$NO_NGINX" == true ]]; then
         --certfile $SSL_CERT --keyfile $SSL_KEY \
         'app:create_app()'"
 else
-    # Generate nginx config
-    NGINX_CONF="/etc/nginx/sites-available/ufw-okboy.conf"
-    NGINX_CONF_DIR="$(dirname "$NGINX_CONF")"
-    mkdir -p "$NGINX_CONF_DIR" /etc/nginx/sites-enabled 2>/dev/null || true
-    # Fallback for RHEL-based (no sites-available)
-    if [[ ! -d "$NGINX_CONF_DIR" ]]; then
+    # Generate nginx config where this nginx reads it: Debian/Ubuntu include
+    # sites-enabled/, the RHEL family only conf.d/.
+    if grep -qs 'sites-enabled' /etc/nginx/nginx.conf; then
+        NGINX_CONF="/etc/nginx/sites-available/ufw-okboy.conf"
+        mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
+    else
         NGINX_CONF="/etc/nginx/conf.d/ufw-okboy.conf"
     fi
 
@@ -425,12 +488,13 @@ server {
 NGINXEOF
 
     # Enable site (Debian/Ubuntu style)
-    if [[ -d /etc/nginx/sites-enabled ]]; then
+    if [[ "$NGINX_CONF" == /etc/nginx/sites-available/* ]]; then
         ln -sf "$NGINX_CONF" /etc/nginx/sites-enabled/ufw-okboy.conf
     fi
 
-    # Test and reload nginx
+    # Test and reload nginx; start it at boot (the RHEL family does not by default)
     if nginx -t 2>/dev/null; then
+        systemctl enable nginx >/dev/null 2>&1 || true
         systemctl reload nginx 2>/dev/null || systemctl restart nginx
         info "Nginx configured and reloaded."
     else
@@ -543,7 +607,8 @@ if [[ -n "$DOMAIN" && "$FORCE_SELF_SIGNED" == false ]]; then
     echo "  Access URL:      https://$DOMAIN"
 else
     echo "  Access URL:      https://$SERVER_IP:$HTTPS_PORT"
-    warn "  Self-signed cert: the browser shows a one-time warning — click through / add an exception."
+    warn "  Self-signed cert: the browser warns. Continue only if it shows this SHA-256 fingerprint:"
+    warn "    $(openssl x509 -in "$SSL_CERT" -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2)"
     warn "  CLI clients: set verify_ssl: false (knock.py) or INSECURE=1 (knock.sh) for self-signed."
 fi
 echo ""

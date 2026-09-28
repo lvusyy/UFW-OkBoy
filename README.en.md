@@ -1,123 +1,180 @@
 # UFW OkBoy
 
-**Dynamic firewall allowlist manager** — users authenticate once, the server adds their IP to UFW automatically; when the IP changes the next heartbeat swaps the rule seamlessly, keeping the firewall clean and traceable.
+[![CI](https://github.com/lvusyy/UFW-OkBoy/actions/workflows/ci.yml/badge.svg)](https://github.com/lvusyy/UFW-OkBoy/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/lvusyy/UFW-OkBoy?sort=semver)](https://github.com/lvusyy/UFW-OkBoy/releases)
+[![Python](https://img.shields.io/badge/python-3.10%E2%80%933.14-3776AB?logo=python&logoColor=white)](https://www.python.org)
+[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-English | [中文](README.md)
+**A dynamic UFW allowlist.** An authorized user authenticates once and the server opens the ports they are allowed to use to their current IP; when the IP changes the rule follows, when they stop using it the access is withdrawn, and every rule can be traced to a user and a group.
+
+[简体中文](README.md) | English
 
 <p align="center">
-  <img src="docs/web-client.png" alt="Web client interface" width="380">
+  <img src="docs/web-client.png" alt="Web client" width="380">
 </p>
 
----
+## Why
 
-## What it is
+Ports such as SSH, admin panels and databases are usually open to a few fixed IPs only. But people's egress IPs keep changing — a home line reconnects, a laptop changes networks, someone travels — and every change means someone has to log in and edit the firewall.
 
-Your server's sensitive ports (admin panels, databases, SSH, APIs) sit behind UFW rules that allow only specific IPs. But people's IPs keep changing — switching WiFi, traveling, restarting routers — and every change means bothering the admin to edit the firewall by hand.
+UFW OkBoy lets authorized users "knock" for themselves: a client periodically sends a signed request, and once the server has verified it, the request's source IP is allowed to the ports of the user's groups. Rules for an old IP are replaced when it changes, and a daily cleanup withdraws the access of users who stopped knocking.
 
-**UFW OkBoy automates this**: a user opens a web page and logs in once; the page "knocks" every 30s and the server updates the firewall. IP changed → swapped automatically. Person gone → the rule expires and is cleaned up.
+## Features
 
-## What it does
+- **Group-based access**: a group binds one port and protocol; once a user is in a group, a knock opens that port to their current IP.
+- **Automatic IP switching**: every knock reconciles the firewall with the database — rules for the new IP are added first, then rules for the old IP and for groups no longer enabled are removed. Every rule carries the comment `ufw-okboy:<user>:<group>`.
+- **Automatic expiry**: a daily cleanup removes all rules of users who have not knocked for 7 days.
+- **Four clients**: web (renews every 30 seconds), Python `knock.py`, shell `knock.sh` (curl and openssl only), Windows `knock.ps1` (scheduled task, built-in PowerShell).
+- **Web admin console**: users, groups, memberships, audit log, TOTP and the system firewall rules, all in the browser.
+- **Authentication and safeguards**: HMAC-SHA256 signatures, so the secret never crosses the network; TOTP step-up for admin writes; failed authentication throttled per IP and failed TOTP codes capped per account; every firewall change serialized by a cross-process lock; operations recorded in an audit log.
+- **Works on restricted networks**: release packages bundle the Python dependencies for an offline install; GitHub and PyPI mirrors are supported; a self-signed certificate on a high port works without a domain name.
 
-| Capability | Description |
-|------------|-------------|
-| 🌐 **One-click web client** | Open in a browser and log in — auto-renews, auto-reconnects, mobile friendly |
-| 🔄 **Automatic IP swap** | One rule per user per port; the old IP is replaced on change, no stale entries |
-| 👥 **Group authorization** | Admins create groups, bind ports, manage members; users self-toggle authorized groups |
-| 🖥️ **Web admin console** | Users / groups / rules, audit log, TOTP, system firewall rules — all in the browser, no SSH needed |
-| 🔐 **Secure auth** | HMAC-SHA256 + timestamp (secret never sent), TOTP step-up, failure throttle, audit log |
-| 🌏 **Restricted-network friendly** | Offline package + mirror fallback + self-signed cert + public IP + high ports — no filed domain needed |
-| 🧰 **Four clients** | Web / Python (`knock.py`) / Shell (`knock.sh`, zero deps) / Windows (`knock.ps1`, built-in PowerShell) |
+## How it works
+
+```text
+Client (browser / knock.py / knock.sh / knock.ps1)
+    │  HTTPS; Authorization: HMAC-SHA256 <user>:<timestamp>:<signature>
+    ▼
+Nginx (TLS termination, passes X-Real-IP)
+    │  http://127.0.0.1:5000
+    ▼
+Gunicorn + Flask (server/app.py) ──── SQLite (users, groups, memberships, audit)
+    │  ufw commands (serialized by a cross-process lock)
+    ▼
+UFW: allow from <client IP> to any port <port> proto <proto>   # ufw-okboy:<user>:<group>
+```
+
+The signature is `HMAC-SHA256(secret, "<user>:<timestamp>")`; a timestamp more than `signature_ttl` (300 seconds by default) away from the server's clock is rejected.
+
+## Requirements
+
+- Linux with UFW, and root.
+- Python 3.10 or newer. Ubuntu 22.04+, Debian 12+ and Fedora ship it; on RHEL-family 8/9 the default `python3` is older and the installer installs `python3.12` (or `python3.11`) instead.
+- The installer supports Debian/Ubuntu and the RHEL family (RHEL, Rocky, AlmaLinux, Fedora; ufw comes from EPEL). On the RHEL family, disable firewalld first, and with SELinux enforcing a few more settings are needed: see the [guide](GUIDE.md#环境要求).
 
 ## Quick start
 
-### 1. Install the server (one line, as root)
+### 1. Install the server
+
+One-line online install (self-signed certificate; open `https://server-ip:port/` afterwards):
 
 ```bash
-# Self-signed cert, no domain — access via IP:port (the most common path)
-curl -fsSL https://raw.githubusercontent.com/lvusyy/UFW-OkBoy/master/deploy/quick-install.sh | bash -s -- --self-signed -y
+curl -fsSL https://raw.githubusercontent.com/lvusyy/UFW-OkBoy/master/deploy/quick-install.sh \
+  | sudo bash -s -- --self-signed --port 8443 -y
 ```
 
-> Have a domain? Replace `--self-signed` with `--domain your.server.com` for automatic Let's Encrypt.
-> The installer prints the `admin` account and its token **highlighted at the very end** — copy it.
+With a domain name that resolves to the server, replace `--self-signed` with `--domain your.example.com` to get a Let's Encrypt certificate. Issuing and renewing it go through port 80: the installer opens it in UFW, and the cloud security group must allow it too.
 
-### 2. Start using it
+Or install a specific version from its release package (the Python dependencies are included, no PyPI access needed):
 
-Open `https://your-server:port/` → enter `admin` and the token → click **Connect**.
-The page auto-renews every 30s, keeping your current IP in the allowlist. Need to rotate the secret? Click "Rotate secret" in the console — no reinstall.
+```bash
+V=v2.4.1
+curl -fsSLO https://github.com/lvusyy/UFW-OkBoy/releases/download/$V/ufw-okboy-$V.tar.gz
+curl -fsSLO https://github.com/lvusyy/UFW-OkBoy/releases/download/$V/ufw-okboy-$V.tar.gz.sha256
+sha256sum -c ufw-okboy-$V.tar.gz.sha256
+tar xzf ufw-okboy-$V.tar.gz && cd ufw-okboy-$V
+sudo bash install.sh --self-signed --port 8443 -y
+```
 
-### 3. Add users and ports (a few clicks in the console)
+The secret of the admin user `admin` is printed at the **very end** of the output, once only — save it right away.
 
-Click **Admin** after logging in: create a user (get a token), create a group (bind a port), add the user to the group.
-Then send "server address + username + token" to your teammate — they open the page and log in (headless servers use the CLI client below).
+> On a cloud server, also open the port in the provider's security group. UFW and the security group are two separate layers; both must allow it.
 
-### CLI client for headless servers
+### 2. Log in
+
+Open `https://server:port/` in a browser, enter `admin` and the secret, and click **Connect**. The page renews every 30 seconds, so your current IP stays on the allowlist.
+
+### 3. Add users and groups
+
+In the admin console (**Admin**), create users, create groups (port + protocol) and add users to groups; a new user's secret is shown when it is created. Or from the command line:
+
+```bash
+cd /opt/ufw-okboy/server
+sudo ../venv/bin/python app.py -c config.yaml user-add alice          # prints alice's secret
+sudo ../venv/bin/python app.py -c config.yaml group-add web 8080
+sudo ../venv/bin/python app.py -c config.yaml user-join alice web
+```
+
+> **Before letting it manage SSH (port 22)**: make sure your own knock succeeds, open a new SSH session from another terminal to confirm you can log in, and only then close the current one. Otherwise you can lock yourself out.
+
+Then give the user the server address, their username and their secret; they can use the web page or one of the clients below.
+
+## Clients
+
+| Client | Use it on | Install |
+|--------|-----------|---------|
+| Web | Computers and phones with a browser | Just open the server address |
+| `knock.py` | Linux servers, headless machines | `deploy/install-client.sh` (systemd timer) |
+| `knock.sh` | Machines with only curl + openssl | Copy the script, add a cron job |
+| `knock.ps1` | Windows | `deploy/install-client.ps1` (SYSTEM scheduled task) |
+
+Linux (installs `knock.py` and a systemd timer; knocks every 30 seconds by default):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/lvusyy/UFW-OkBoy/master/deploy/install-client.sh \
-  | bash -s -- --server https://your-server:port --user alice --secret USER_TOKEN
+  | sudo bash -s -- --server https://your-server:8443 --user alice --secret <secret> --no-verify-ssl
 ```
 
-### One-click client for Windows
-
-Open PowerShell as Administrator and paste the two lines below. The token is prompted for without echo; add `-NoVerifySsl` for a self-signed server:
+Windows (in PowerShell run as Administrator; the secret is prompted for and not echoed; add `-NoVerifySsl` for a self-signed server):
 
 ```powershell
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 3072
-& ([scriptblock]::Create((irm https://raw.githubusercontent.com/lvusyy/UFW-OkBoy/master/deploy/install-client.ps1))) -Server https://your-server:port -User alice
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/lvusyy/UFW-OkBoy/master/deploy/install-client.ps1))) -Server https://your-server:8443 -User alice
 ```
 
-A scheduled task then knocks every minute as SYSTEM, from boot and with nobody logged in. For more servers, run it again with another `-Server`; `-Uninstall` removes it. Works with Windows PowerShell 5.1 and PowerShell 7, no Python needed.
+The scheduled task knocks every minute as SYSTEM and starts at boot. For more servers, run it again with another `-Server`; add `-Uninstall` to remove it.
 
-## Offline / restricted networks
+`--no-verify-ssl` and `-NoVerifySsl` turn off TLS certificate verification, for self-signed certificates. With verification off, a man in the middle can capture a knock and replay it while the signature is valid (300 seconds by default), getting their own address allowlisted. On networks you don't trust, use a trusted certificate, such as the Let's Encrypt one `--domain` obtains.
 
-For servers where GitHub/PyPI are slow or blocked, or domains require filing. **The most reliable path is the offline package**:
+## Upgrading
 
 ```bash
-# Build on a machine with network (bundles dependency wheels)
-bash deploy/build-release.sh
-# Copy dist/ufw-okboy-*.tar.gz to the server, then:
-tar xzf ufw-okboy-*.tar.gz && cd ufw-okboy-* && sudo bash install.sh --self-signed -y
+curl -fsSL https://raw.githubusercontent.com/lvusyy/UFW-OkBoy/master/deploy/upgrade.sh \
+  | sudo bash -s -- --branch v2.4.1
 ```
 
-Online but GitHub is blocked → use a mirror (proxies expire; find a current one at <https://ghproxy.link/>):
+The script backs up the database, updates the code and dependencies, restarts the service and health-checks it, and moves back to the previous code if the check fails. The configuration, certificates and database are kept. You can also upgrade offline from an unpacked release package: `sudo bash deploy/upgrade.sh --repo-dir . -y`. If `/opt/ufw-okboy` is a git checkout, follow [the upgrade section of the guide](GUIDE.md#升级与版本管理) instead. After upgrading, reload the page with Ctrl+Shift+R.
 
-```bash
-curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/lvusyy/UFW-OkBoy/master/deploy/quick-install.sh \
-  | bash -s -- --gh-mirror https://ghfast.top --self-signed --port 8443 --ip <YOUR_PUBLIC_IP> -y
-```
+## Security
 
-📖 Step-by-step + troubleshooting: the Chinese **[国内部署专题](GUIDE.md#国内部署专题)** (mainland-China deployment).
+- Authenticated requests carry a signature, never the secret; a new secret is returned once over HTTPS when a user is created or a secret is rotated. The transport relies on HTTPS.
+- Once an admin has enabled TOTP, every admin write needs a code; with `require_admin_totp: true`, admins who have not enabled TOTP cannot perform these operations until they do.
+- The database, backups and any configuration file holding secrets are readable by root only.
+- Known limitations (for example, a signature can be replayed while it is valid) and how to report a vulnerability: see [SECURITY.md](SECURITY.md). Please do not report vulnerabilities in public issues.
 
 ## FAQ
 
-**Locked out of SSH after install?**
-Make sure you're on **v2.2.1+** (older versions had this issue, now fixed); the new installer allows SSH before enabling the firewall. If locked out: log in via your cloud provider's **console / VNC** and run `sudo ufw allow 22/tcp && sudo ufw reload`.
+**Can't reach SSH after installing?**
+Since v2.2.1 the installer allows SSH before it enables UFW, and it leaves the SSH rules alone when UFW is already active. If you are locked out anyway, log in through your provider's console or VNC and run `sudo ufw allow 22/tcp`.
 
-**Installed v2.2.1 or earlier — anything to do?**
-Older installers seeded a sample user `alice` whose secret is public. Upgrading to **v2.2.2 or later** (see "How do I upgrade?") invalidates it. Then run `python app.py user-list` on the server. If `alice` is there and unused, first delete the sample `users:` / `protected_ports:` block from `config.yaml` (otherwise it is re-seeded once no users are left), then `python app.py user-del alice` removes it along with its UFW rules (and `python app.py group-del default-8080` if you don't use port 8080).
+**The web page opens but the port is still closed?**
+Most likely the cloud security group does not allow that port.
 
-**Web page opens but the port won't connect?**
-99% of the time your **cloud security group** hasn't opened that port. UFW and the cloud security group are two layers — open **both**.
+**Forgot or leaked a secret?**
+In the admin console, click **Revoke** for that user: it closes their ports and replaces their secret, so the old one stops working at once. For your own secret, click **Rotate secret**. From the command line: `sudo ../venv/bin/python app.py -c config.yaml revoke <user>`.
 
-**Self-signed cert → client TLS error?**
-Set `verify_ssl: false` in `knock.py`'s `config.yaml`; set `INSECURE=1` (or pass `--insecure`) for `knock.sh`; add `-NoVerifySsl` to the Windows installer. The HMAC secret never goes over the wire — this only disables transport-layer cert verification.
+**Installed with v2.2.1 or earlier?**
+The old installer created a sample user `alice` whose secret is public. Upgrading to v2.2.2 or later invalidates that secret; afterwards check with `user-list` whether `alice` is still there, and delete it if you don't need it. See [CHANGELOG · v2.2.2](CHANGELOG.md#v222-2026-09-27).
 
-**Lost or leaked a secret?**
-In the console, click "Rotate secret" for that user (or self-rotate your own); or run `python app.py revoke <user>` on the server — closes ports + rotates the secret, old credentials die instantly.
+More in [GUIDE.md](GUIDE.md) (Chinese), including [deploying from mainland China](GUIDE.md#国内部署专题).
 
-**How do I upgrade?**
+## Documentation
+
+- [GUIDE.md](GUIDE.md) (Chinese): deployment, configuration, CLI, REST API, clients, operations, security design
+- [CHANGELOG.md](CHANGELOG.md): release history and upgrade notes
+- [SECURITY.md](SECURITY.md): security policy and vulnerability reporting
+- [Releases](https://github.com/lvusyy/UFW-OkBoy/releases): packages and checksums
+
+## Development
+
 ```bash
-curl -fsSL https://raw.githubusercontent.com/lvusyy/UFW-OkBoy/master/deploy/upgrade.sh | bash
+cd server
+python -m pip install -r requirements.txt
+python -m unittest discover -s tests -v
 ```
-Backup → update → restart → health-check, with auto-rollback; config / DB / certs are preserved. Hard-refresh the browser (Ctrl-Shift-R) after upgrading.
 
-More in the **[full guide](GUIDE.md)** (Chinese).
-
-## Docs & versions
-
-- 📘 **[Full deployment & usage guide · GUIDE.md](GUIDE.md)** (Chinese) — server / Nginx / Systemd, manual install, key distribution, clients, operations, security, FAQ
-- 📝 **[Changelog · CHANGELOG.md](CHANGELOG.md)** | **[GitHub Releases](https://github.com/lvusyy/UFW-OkBoy/releases)**
+The real-ufw integration test (`tests/test_ufw_integration.py`) needs root and runs in private network and mount namespaces, so it never touches the host firewall; see the [CI workflow](.github/workflows/ci.yml) for how.
 
 ## License
 
-MIT
+[MIT](LICENSE)
