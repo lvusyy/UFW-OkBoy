@@ -85,11 +85,40 @@ class _Claim:
     __del__ = release
 
 
+def _processes_with_open(db_path: str) -> list[int]:
+    """Other processes with the database's files open, from Linux's /proc
+    (none found where there is none, or where it cannot be read)."""
+    targets = {os.path.realpath(db_path + side) for side in ("", "-wal", "-shm")}
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return []
+    pids = []
+    for entry in entries:
+        if not entry.isdigit() or int(entry) == os.getpid():
+            continue
+        try:
+            fds = os.listdir(f"/proc/{entry}/fd")
+        except OSError:
+            continue
+        for fd in fds:
+            try:
+                if os.readlink(f"/proc/{entry}/fd/{fd}") in targets:
+                    pids.append(int(entry))
+                    break
+            except OSError:
+                continue
+    return pids
+
+
 @contextlib.contextmanager
 def exclusive_claim(db_path: str):
-    """Hold the database exclusively for the block: no process has it open —
-    each holds a shared claim for as long as it does (see Database). Raises
-    DatabaseInUse at once when one has."""
+    """Hold the database exclusively for the block: no other process has it
+    open, and none can open it meanwhile (each takes a shared claim to, see
+    Database). A claim cannot vouch for SQLite's own handles — a statement
+    still held keeps one open past close() — so the files' open descriptors
+    are looked for too, once the claim is exclusive. Raises DatabaseInUse at
+    once when the database is open elsewhere."""
     Path(db_path).parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     with os.fdopen(os.open(_claim_path(db_path), os.O_RDWR | os.O_CREAT, 0o600), "r+") as f:
         if fcntl is not None:
@@ -97,6 +126,9 @@ def exclusive_claim(db_path: str):
                 fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 raise DatabaseInUse(f"{db_path} is open in another process") from None
+        pids = _processes_with_open(db_path)
+        if pids:
+            raise DatabaseInUse(f"{db_path} is open in process(es) {pids}")
         yield
 
 
@@ -213,6 +245,7 @@ class Database:
         self.db_path = db_path
         self.fresh = False  # set by init(): the database was created just now
         Path(db_path).parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self._lifecycle = threading.Lock()  # connecting vs close()
         self._claim = self._claim_shared()
         # One connection per thread. The constructing thread's connection is
         # opened eagerly so init()/migrations/CLI/tests run without surprises.
@@ -258,10 +291,14 @@ class Database:
                 logger.warning("could not chmod %s (%s); it is owner-only already", path, exc)
 
     def _connect(self) -> sqlite3.Connection:
-        """Open and configure a SQLite connection for the calling thread."""
-        conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        if self._claim is not None:
-            self._claim.track(conn)
+        """Open and configure a SQLite connection for the calling thread —
+        under a claim: after close(), a new one is taken."""
+        with self._lifecycle:
+            if self._claim is None:
+                self._claim = self._claim_shared()
+            conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            if self._claim is not None:
+                self._claim.track(conn)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
         conn.execute("PRAGMA journal_mode = WAL")
@@ -486,9 +523,10 @@ class Database:
         """Close this object's connections — every thread's — and let go of its
         claim on the database (see _claim_shared); without one (not POSIX),
         the calling thread's connection."""
-        if self._claim is not None:
-            self._claim.release()
-            self._claim = None
+        with self._lifecycle:
+            if self._claim is not None:
+                self._claim.release()
+                self._claim = None
         conn = getattr(self._local, "conn", None)
         if conn is not None:
             conn.close()

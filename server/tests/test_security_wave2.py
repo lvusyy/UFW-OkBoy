@@ -523,6 +523,44 @@ class TestFilesAndSeeding(unittest.TestCase):
                 with self.assertRaises(sqlite3.ProgrammingError, msg=f"cyclic={cyclic}"):
                     conn.execute("SELECT 1")
 
+    @unittest.skipIf(not os.path.isdir("/proc/self/fd"), "Linux /proc")
+    def test_restore_sees_an_open_database_without_a_claim(self) -> None:
+        # A claim cannot vouch for SQLite's own handles: a statement still
+        # held keeps one open past close(). The files' descriptors tell.
+        Database(self.db_path).close()
+        holder = subprocess.Popen([sys.executable, "-c",
+                                   "import sqlite3, sys, time\n"
+                                   "c = sqlite3.connect(sys.argv[1])\n"
+                                   "c.execute('SELECT 1').fetchall()\n"
+                                   "print('open', flush=True)\n"
+                                   "time.sleep(60)\n", self.db_path],
+                                  stdout=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(holder.stdout.readline().strip(), "open")
+            with self.assertRaises(DatabaseInUse):
+                with exclusive_claim(self.db_path):
+                    pass
+        finally:
+            holder.kill()
+            holder.wait()
+            holder.stdout.close()
+        with exclusive_claim(self.db_path):
+            pass
+
+    @unittest.skipIf(fcntl is None, "POSIX flock")
+    def test_a_reopened_database_is_claimed_again(self) -> None:
+        # Used again after close(), a Database opened a connection without a
+        # claim, unseen by a restore.
+        db = Database(self.db_path)
+        db.close()
+        db.conn.execute("SELECT 1")
+        with self.assertRaises(DatabaseInUse):
+            with exclusive_claim(self.db_path):
+                pass
+        db.close()
+        with exclusive_claim(self.db_path):
+            pass
+
     @unittest.skipIf(fcntl is None, "POSIX flock")
     def test_connections_of_ended_threads_are_closed(self) -> None:
         # Held until release, a threaded server's per-request connections
