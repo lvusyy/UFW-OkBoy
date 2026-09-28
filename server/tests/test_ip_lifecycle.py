@@ -287,14 +287,14 @@ class TestIPLifecycle(unittest.TestCase):
     def test_add_rule_comment_includes_group_suffix(self) -> None:
         ufw = CommentCaptureUFW(self.db)
         ufw.add_rule("1.2.3.4", 8080, "alice", "tcp", group="web")
-        args = ufw.captured[0]
+        args = ufw.captured[-1]  # after the look for a host rule
         comment = args[args.index("comment") + 1]
         self.assertEqual(comment, "ufw-okboy:alice:web")
 
     def test_add_rule_comment_backward_compatible(self) -> None:
         ufw = CommentCaptureUFW(self.db)
         ufw.add_rule("1.2.3.4", 8080, "alice", "tcp")
-        args = ufw.captured[0]
+        args = ufw.captured[-1]
         comment = args[args.index("comment") + 1]
         self.assertEqual(comment, "ufw-okboy:alice")
 

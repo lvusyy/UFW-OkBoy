@@ -106,6 +106,26 @@ class TestUfwIntegration(unittest.TestCase):
         self.assertEqual(self.ufw.purge_rules(username="bob"), 1)
         self.assertEqual(self._rules(), [])
 
+    def test_host_rules_are_not_taken_over(self) -> None:
+        # ufw would replace them — a DENY with an ALLOW — for the same source,
+        # port and protocol.
+        _ufw("deny", "from", "203.0.113.10", "to", "any", "port", "8080", "proto", "tcp")
+        _ufw("allow", "from", "203.0.113.11", "to", "any", "port", "8080", "proto", "tcp",
+             "comment", "office")
+        self.ufw.add_rule("203.0.113.10", 8080, "alice", "tcp", "web")
+        self.ufw.add_rule("203.0.113.11", 8080, "bob", "tcp", "web")
+        self.assertEqual(self._rules(), [
+            "8080/tcp DENY IN 203.0.113.10",
+            "8080/tcp ALLOW IN 203.0.113.11 # office",
+        ])
+
+    def test_an_inactive_ufw_cannot_be_purged(self) -> None:
+        # It lists nothing, though the rules stay saved for `ufw enable`.
+        self.ufw.add_rule("203.0.113.10", 8080, "alice", "tcp", "web")
+        _ufw("disable")
+        with self.assertRaises(RuntimeError):
+            self.ufw.purge_rules(username="alice")
+
     def test_sync_reads_the_numbered_listing(self) -> None:
         # Plain `ufw status` prints "ALLOW": sync's pattern for "ALLOW IN" there
         # never matched a rule.

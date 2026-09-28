@@ -10,6 +10,7 @@ import hashlib
 import hmac
 import io
 import os
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -53,9 +54,10 @@ class FakeUfw:
     numbered deletes depend on it: IPv4 rules are listed before IPv6 ones (each
     family in the order added), `status numbered` numbers them from 1, and
     `--force delete N` removes the N-th, renumbering every rule after it. Adding
-    a rule that differs from an existing one only in its comment rewrites that
-    comment (ufw 0.36); a rule from "any" becomes two, listed as "Anywhere"
-    and, in the IPv6 part, "PORT/PROTO (v6) ... Anywhere (v6)"."""
+    a rule that differs from an existing one only in its action or comment
+    replaces it (ufw 0.36: "Rule updated" — a DENY becomes an ALLOW); a rule
+    from "any" becomes two, listed as "Anywhere" and, in the IPv6 part,
+    "PORT/PROTO (v6) ... Anywhere (v6)"."""
 
     def __init__(self) -> None:
         self.v4: list[tuple] = []
@@ -63,11 +65,14 @@ class FakeUfw:
         self.fail_deletes = False  # make every delete fail, as a wedged ufw would
         self.fail_list = False  # make `status numbered` fail
         self.raise_on_delete = None  # an exception every delete raises (a timeout)
+        self.inactive = False  # ufw disabled: `status numbered` lists nothing
+        self.fail_adds_after_saving = False  # an add saves its rule, then fails to apply it
+        self.calls: list[tuple] = []  # (args, kwargs) of every call
 
     def add(self, to: str, action: str, frm: str, comment: str = "", v6: bool = False) -> None:
         table = self.v6 if v6 else self.v4
-        for i, (t, a, f, _) in enumerate(table):
-            if (t, a, f) == (to, action, frm):
+        for i, (t, _, f, _) in enumerate(table):
+            if (t, f) == (to, frm):
                 table[i] = (to, action, frm, comment)
                 return
         table.append((to, action, frm, comment))
@@ -91,10 +96,13 @@ class FakeUfw:
 
     def __call__(self, cmd, **kwargs):
         args = list(cmd[1:])
+        self.calls.append((args, kwargs))
         rc, out = 0, ""
         if args == ["status", "numbered"]:
             if self.fail_list:
                 rc = 1
+            elif self.inactive:
+                out = "Status: inactive\n"
             else:
                 out = self._render()
         elif args[:2] == ["--force", "delete"] and len(args) == 3 and args[2].isdigit():
@@ -122,6 +130,8 @@ class FakeUfw:
                 self.add(f"{port}/{proto} (v6)", "ALLOW IN", "Anywhere (v6)", comment, v6=True)
             else:
                 self.add(f"{port}/{proto}", "ALLOW IN", ip, comment, v6=":" in ip)
+            if self.fail_adds_after_saving:
+                rc = 1
         else:
             raise AssertionError(f"unexpected ufw call: {args}")
         return subprocess.CompletedProcess(cmd, rc, stdout=out, stderr="" if rc == 0 else "error")
@@ -188,6 +198,19 @@ class TestNumberedDeletes(_Base):
             ("22/tcp (v6)", "ALLOW IN", "Anywhere (v6)", ""),
             ("Anywhere (v6)", "DENY IN", "2001:db8::66", ""),
         ])
+
+    def test_a_failed_add_that_saved_its_rule_still_renumbers(self) -> None:
+        # ufw saves a rule before applying it to the running firewall: an add
+        # failing there still moves every IPv6 rule down one, and reconcile
+        # deleted by the numbers listed before it — here the host's IPv6 SSH.
+        f = self.fake
+        f.add("22/tcp (v6)", "ALLOW IN", "Anywhere (v6)", v6=True)
+        f.add("8080/tcp", "ALLOW IN", "2001:db8::5", "ufw-okboy:alice:web", v6=True)
+        f.fail_adds_after_saving = True
+        self.ufw.reconcile_user_rules("alice", "198.51.100.2", {"web": (8080, "tcp")})
+        self.assertIn(("22/tcp (v6)", "ALLOW IN", "Anywhere (v6)", ""), f.rules())
+        self.assertNotIn(("8080/tcp", "ALLOW IN", "2001:db8::5", "ufw-okboy:alice:web"),
+                         f.rules())
 
     def test_delete_by_number_checks_the_rule_is_still_there(self) -> None:
         f = self.fake
@@ -350,6 +373,96 @@ class TestFilesAndSeeding(unittest.TestCase):
             open_database(cfg).close()
         self.assertEqual(held, [True])
 
+    def test_a_failed_insert_releases_the_write_lock(self) -> None:
+        # A duplicate user or group left its transaction open: every other
+        # process then waited out busy_timeout and failed.
+        db = Database(self.db_path)
+        db.init()
+        db.create_user("bob", "b" * 64)
+        db.create_group("web", 8080, "tcp")
+        with self.assertRaises(sqlite3.IntegrityError):
+            db.create_user("bob", "c" * 64)
+        self.assertFalse(db.conn.in_transaction)
+        with self.assertRaises(sqlite3.IntegrityError):
+            db.create_group("web", 8443, "tcp")
+        self.assertFalse(db.conn.in_transaction)
+        db.close()
+
+    @unittest.skipIf(os.name != "posix", "POSIX file modes")
+    def test_older_copies_are_made_owner_only(self) -> None:
+        # Snapshots and backups of older versions, and a config holding seed
+        # users' secrets, stayed world-readable.
+        backup_dir = os.path.join(self.tmpdir, "backups")
+        os.makedirs(backup_dir)
+        os.makedirs(os.path.dirname(self.db_path))
+        old = [self.db_path + ".pre-upgrade-2.3.1-1", self.db_path + ".pre-restore",
+               os.path.join(backup_dir, "ufw-okboy-20260101-000000-000000.db")]
+        for path in old:
+            with open(path, "wb"):
+                pass
+            os.chmod(path, 0o644)
+        cfg_path = os.path.join(self.tmpdir, "config.yaml")
+        with open(cfg_path, "w", encoding="utf-8") as f:
+            yaml.dump({"db_path": self.db_path, "backup_dir": backup_dir,
+                       "state_file": os.path.join(self.tmpdir, "none.json"),
+                       "users": {"bob": {"secret": "b" * 64}}}, f)
+        os.chmod(cfg_path, 0o644)
+        open_database(app_module.load_config(cfg_path)).close()
+        for path in (*old, cfg_path):
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600, path)
+
+    @unittest.skipIf(os.name != "posix", "POSIX file semantics")
+    def test_restore_never_eats_its_own_input(self) -> None:
+        # Restoring the live database truncated it; restoring the .pre-restore
+        # snapshot first overwrote that snapshot; and the snapshot left out the
+        # -wal, where commits after a crash may still be.
+        cfg_path = os.path.join(self.tmpdir, "config.yaml")
+        with open(cfg_path, "w", encoding="utf-8") as f:
+            yaml.dump({"db_path": self.db_path,
+                       "state_file": os.path.join(self.tmpdir, "none.json")}, f)
+        cfg = app_module.load_config(cfg_path)
+        db = open_database(cfg)
+        db.create_user("bob", "b" * 64)
+        backup = db.backup(os.path.join(self.tmpdir, "bob-only.db"))
+        db.close()
+
+        def restore(src):
+            with contextlib.redirect_stdout(io.StringIO()):
+                app_module.cmd_restore(argparse.Namespace(config=cfg_path, backup=src))
+
+        def users(path):
+            with contextlib.closing(sqlite3.connect(path)) as c:
+                return sorted(r[0] for r in c.execute("SELECT username FROM users"))
+
+        with self.assertRaises(SystemExit):
+            restore(self.db_path)
+        self.assertEqual(users(self.db_path), ["bob"])
+        with self.assertRaises(ValueError):
+            app_module._copy_private(self.db_path, self.db_path)
+
+        # carol, committed but only in the -wal: written by a process that died
+        # without closing its connection, so nothing checkpointed it.
+        crash = ("import os, sqlite3, sys\n"
+                 "c = sqlite3.connect(sys.argv[1])\n"
+                 "c.execute('PRAGMA wal_autocheckpoint=0')\n"
+                 "c.execute('INSERT INTO users (username, secret) VALUES (?, ?)', ('carol', 'c'))\n"
+                 "c.commit()\n"
+                 "os._exit(0)\n")
+        subprocess.run([sys.executable, "-c", crash, self.db_path], check=True)
+        self.assertGreater(os.path.getsize(self.db_path + "-wal"), 0)
+        restore(backup)
+        snaps = [p for p in os.listdir(os.path.dirname(self.db_path))
+                 if p.startswith(os.path.basename(self.db_path) + ".pre-restore-")
+                 and not p.endswith(("-wal", "-shm"))]
+        self.assertEqual(len(snaps), 1)
+        snap = os.path.join(os.path.dirname(self.db_path), snaps[0])
+        self.assertEqual(users(snap), ["bob", "carol"])
+        self.assertEqual(users(self.db_path), ["bob"])
+        time.sleep(0.01)  # a distinct snapshot name
+        restore(snap)  # back to before the restore; the snapshot itself must survive
+        self.assertEqual(users(self.db_path), ["bob", "carol"])
+        self.assertEqual(users(snap), ["bob", "carol"])
+
     @unittest.skipIf(os.name != "posix", "POSIX file modes")
     def test_snapshot_copies_are_owner_only(self) -> None:
         # copy2 wrote the secrets under the umask's mode before copying the
@@ -462,6 +575,33 @@ class TestRemovals(_Base):
         self.db.conn.commit()
         self.assertEqual(self.ufw.cleanup_stale(7 * 86400), [])
         self.assertEqual(self.db.get_user(self.alice)["current_ip"], "203.0.113.10")
+
+    def test_an_inactive_ufw_is_not_a_removal(self) -> None:
+        # Inactive, ufw lists no rule though they stay saved: deleting the user
+        # left rules that `ufw enable` brought back, with nobody to remove them.
+        self.fake.inactive = True
+        self.assertEqual(self._admin("DELETE", f"/api/admin/users/{self.alice}").status_code, 500)
+        self.assertIsNotNone(self.db.get_user(self.alice))
+
+    def test_revoke_rotates_before_touching_the_firewall(self) -> None:
+        # Rotated last, a revoke whose worker died closing the ports left the
+        # old credential working.
+        seen = []
+        real = UFWManager.purge_rules
+
+        def spy(ufw, *args, **kwargs):
+            seen.append(self.db.get_user(self.alice)["secret"])
+            return real(ufw, *args, **kwargs)
+
+        with patch.object(UFWManager, "purge_rules", spy):
+            r = self._admin("POST", f"/api/admin/users/{self.alice}/revoke", json={})
+            self.assertEqual(r.status_code, 200)
+            with contextlib.redirect_stdout(io.StringIO()):
+                app_module.cmd_revoke(argparse.Namespace(
+                    config=self.config_path, username="alice", no_rotate=False))
+        self.assertEqual(len(seen), 2)
+        self.assertNotEqual(seen[0], "secret-alice")
+        self.assertNotEqual(seen[1], seen[0])
 
     def test_cli_revoke_rotates_when_ufw_times_out(self) -> None:
         # A timeout was no RuntimeError: the CLI revoke died before rotating.
@@ -624,6 +764,72 @@ class TestTOTPReenroll(_Base):
             self.assertEqual(self._post("/api/admin/totp/activate",
                                         totp_code=self.step(new, 0)).status_code, 200)
             self.assertEqual(self._disable(self.step(new, 1)).status_code, 200)
+        self.assertEqual(held, [True, True, True])
+
+
+class TestHostRulesStayTheHosts(_Base):
+    """ufw keeps one rule per source, port and protocol: a knock took over a host
+    rule with the same ones — a DENY turned into an ALLOW — and the user's
+    revoke or cleanup then deleted it."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.db.create_user("root", "secret-root", is_admin=True)
+        self.alice = self.db.create_user("alice", "secret-alice")
+        self.db.add_membership(self.alice, self.db.create_group("ssh", 22, "tcp"), enabled=1)
+
+    def _knock(self):
+        return self.client.post("/api/knock", headers={
+            "Authorization": build_auth_header("alice", "secret-alice"),
+            "X-Real-IP": "203.0.113.10"})
+
+    def test_a_host_allow_is_not_taken_over(self) -> None:
+        self.fake.add("22/tcp", "ALLOW IN", "203.0.113.10", "office")
+        self.assertEqual(self._knock().status_code, 200)
+        r = self.client.post(f"/api/admin/users/{self.alice}/revoke", json={},
+                             headers={"Authorization": build_auth_header("root", "secret-root")})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(self.fake.rules(), [("22/tcp", "ALLOW IN", "203.0.113.10", "office")])
+
+    def test_a_host_deny_stays_a_deny(self) -> None:
+        self.fake.add("22/tcp", "DENY IN", "203.0.113.10")
+        self.assertEqual(self._knock().status_code, 200)
+        self.assertEqual(self.fake.rules(), [("22/tcp", "DENY IN", "203.0.113.10", "")])
+
+    def test_request_commands_are_bounded_and_in_the_c_locale(self) -> None:
+        # Each ufw command could take 30 s after a 20 s wait for the lock:
+        # gunicorn killed the worker, and the command ran on after the lock
+        # was released. And ufw translates the status line read here.
+        self.assertEqual(self._knock().status_code, 200)
+        self.assertTrue(self.fake.calls)
+        for args, kwargs in self.fake.calls:
+            self.assertLessEqual(kwargs["timeout"], 25, args)
+            self.assertEqual((kwargs["env"]["LANGUAGE"], kwargs["env"]["LC_ALL"]), ("C", "C"))
+        with self.ufw.deadline(0):
+            with self.assertRaises(RuntimeError):
+                self.ufw._run_ufw("status")
+
+    @unittest.skipIf(fcntl is None, "POSIX flock")
+    def test_privileged_changes_hold_the_host_lock(self) -> None:
+        # Outside it, a request authenticated just before a deletion or a
+        # demotion could create the account again, or promote it back.
+        held = []
+        real = auth.require_admin
+
+        def spy(*args, **kwargs):
+            held.append(_flock_held(os.path.join(self.tmpdir, "ufw.lock")))
+            return real(*args, **kwargs)
+
+        def admin():
+            return {"Authorization": build_auth_header("root", "secret-root")}
+
+        with patch("auth.require_admin", spy):
+            bob = self.client.post("/api/admin/users", json={"username": "bob"},
+                                   headers=admin()).get_json()["id"]
+            self.client.post("/api/admin/groups", json={"name": "web", "port": 8080},
+                             headers=admin())
+            self.client.post(f"/api/admin/users/{bob}/admin", json={"is_admin": True},
+                             headers=admin())
         self.assertEqual(held, [True, True, True])
 
 

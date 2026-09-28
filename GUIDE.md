@@ -994,7 +994,7 @@ python app.py upgrade --force
 # 或非交互：python app.py upgrade --force -y
 ```
 
-升级流程（仅限 git 检出的安装）：备份 DB → 拉取新代码（`git pull --ff-only`）→ 运行 DB 迁移 → `systemctl restart ufw-okboy` → 健康检查 `/health` → **失败自动回滚**（恢复 DB 备份，代码退回升级前的提交）。用一键安装或发布包装的实例不是 git 检出，请用 `deploy/upgrade.sh` 升级。
+升级流程（仅限 git 检出的安装）：备份 DB → 拉取新代码（`git pull --ff-only`）→ 运行 DB 迁移 → `systemctl restart ufw-okboy` → 健康检查 `/health` → **失败自动回滚**（代码退回升级前的提交并重启；数据库原样保留，备份留作手动恢复）。用一键安装或发布包装的实例不是 git 检出，请用 `deploy/upgrade.sh` 升级。
 
 > **安全说明**：root 服务不自动联网拉代码。升级需手动触发（`--force`），检测（`--check`）仅提示。DB 迁移向前兼容不丢数据。代码来自 git 远端（GitHub），暂无签名验证；经镜像安装或升级，等于信任该镜像提供的代码。
 

@@ -74,10 +74,10 @@ class TestUpgradeCheck(unittest.TestCase):
 
 class TestRollback(unittest.TestCase):
     """The rollback copied the backup over a database the running service held
-    open (with a -wal belonging to the replaced file), and left the service
-    running the new code."""
+    open, and so also undid whatever happened since the backup — a revoke, a
+    deletion; and it left the service running the new code."""
 
-    def test_stops_restores_resets_and_starts(self) -> None:
+    def test_resets_the_code_restarts_and_keeps_the_database(self) -> None:
         tmp = tempfile.mkdtemp(prefix="ufw-okboy-rollback-")
         db_path = os.path.join(tmp, "ufw-okboy.db")
         backup = os.path.join(tmp, "backup.db")
@@ -91,16 +91,15 @@ class TestRollback(unittest.TestCase):
             calls.append(cmd)
             return subprocess.CompletedProcess(cmd, 0)
 
-        with patch("subprocess.run", run):
-            app_module._rollback(db_path, backup, Path(tmp, "repo"), "0123456789abcdef")
+        with patch("subprocess.run", run), patch("builtins.print"):
+            app_module._rollback(backup, Path(tmp, "repo"), "0123456789abcdef")
         self.assertEqual(calls, [
-            ["systemctl", "stop", "ufw-okboy"],
             ["git", "reset", "--hard", "0123456789abcdef"],
-            ["systemctl", "start", "ufw-okboy"],
+            ["systemctl", "restart", "ufw-okboy"],
         ])
         with open(db_path, "rb") as f:
-            self.assertEqual(f.read(), b"old")
-        self.assertFalse(os.path.exists(db_path + "-wal"))
+            self.assertEqual(f.read(), b"new")
+        self.assertTrue(os.path.exists(db_path + "-wal"))
 
 
 if __name__ == "__main__":

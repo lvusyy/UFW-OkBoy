@@ -219,7 +219,14 @@ fi
 # Only when UFW is not active yet: on a re-run the SSH rules are whatever the
 # operator made them — typically SSH closed to all but knock-authorized IPs —
 # and re-adding "allow from anywhere" would silently reopen it.
-if ! ufw status | grep -q "Status: active"; then
+# ufw translates its status line: read it in the C locale. Anything but a
+# clear "inactive" or "active" stops here — guessing wrong reopens SSH.
+UFW_STATUS="$(LC_ALL=C LANGUAGE=C ufw status 2>&1)" || { error "'ufw status' failed: $UFW_STATUS"; exit 1; }
+case "$UFW_STATUS" in
+    "Status: inactive"*|"Status: active"*) ;;
+    *) error "Unexpected 'ufw status' output: $UFW_STATUS"; exit 1 ;;
+esac
+if [[ "$UFW_STATUS" == "Status: inactive"* ]]; then
     SSH_PORTS="$(awk '/^[[:space:]]*[Pp]ort[[:space:]]+[0-9]+/{print $2}' /etc/ssh/sshd_config 2>/dev/null)"
     [[ -z "$SSH_PORTS" ]] && SSH_PORTS="22"
     if [[ -n "${SSH_CONNECTION:-}" ]]; then
@@ -236,7 +243,7 @@ else
 fi
 
 # Ensure ufw is enabled
-if ! ufw status | grep -q "Status: active"; then
+if [[ "$UFW_STATUS" == "Status: inactive"* ]]; then
     warn "UFW is not active. Enabling UFW (SSH already allowed above)..."
     ufw --force enable
 fi

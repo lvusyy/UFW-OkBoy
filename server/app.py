@@ -74,6 +74,11 @@ def load_config(path: str) -> dict:
     for name, info in cfg["users"].items():
         if not info.get("secret"):
             sys.exit(f"Config error: user '{name}' is missing 'secret'")
+    if cfg["users"]:  # their secrets: as sensitive as the database
+        try:
+            os.chmod(p, 0o600)
+        except OSError as exc:
+            logger.warning("could not make %s owner-only: %s", path, exc)
 
     if not cfg.get("db_path"):
         logger.warning("'db_path' not set in config; using default /var/lib/ufw-okboy/ufw-okboy.db")
@@ -89,6 +94,7 @@ def open_database(cfg: dict) -> Database:
     # Under the host lock (the one ufw changes take): gunicorn starts its
     # workers together, and each would run a pending migration — the second
     # ALTER fails — or seed a database created just now.
+    _restrict_backups(cfg.get("backup_dir", "/var/lib/ufw-okboy/backups"))
     with HostLock(os.path.join(data_dir, "ufw.lock")):
         db = Database(db_path)
         db.init()
@@ -104,6 +110,16 @@ def open_database(cfg: dict) -> Database:
             )
             logger.info("Database seeded from config + state.json (first run)")
     return db
+
+
+def _restrict_backups(backup_dir: str) -> None:
+    """Make the backups owner-only: older versions wrote them world-readable,
+    and they hold the same plaintext secrets as the database."""
+    for b in Path(backup_dir).glob("ufw-okboy-*.db"):
+        try:
+            b.chmod(0o600)
+        except OSError as exc:
+            logger.warning("could not make %s owner-only: %s", b, exc)
 
 # ====================================================================== #
 #  Flask Application Factory
@@ -223,15 +239,17 @@ def create_app(config_path: str = "config.yaml",
     # the ufw layer uses, also taken by the CLI and the cleanup timer. So they
     # never interleave: a revoke cannot land between a knock's signature check
     # and its rule write, and a delete by number cannot hit a shifted rule.
-    # A request waits for it at most 20 s — below gunicorn's 30 s worker
-    # timeout — and then gets a 503 to retry.
+    # A request waits for it at most 20 s — then gets a 503 to retry — and its
+    # ufw commands must end within 25 s of its start: below gunicorn's 30 s
+    # worker timeout. A killed worker would leave its command running on after
+    # the lock is released.
     ufw.lock.timeout = 20
 
     def _serialized(handler):
         @functools.wraps(handler)
         def wrapper(*args, **kwargs):
             try:
-                with ufw.lock:
+                with ufw.deadline(25), ufw.lock:
                     return handler(*args, **kwargs)
             except LockTimeout:
                 return jsonify({"ok": False, "error": "Firewall busy; retry shortly"}), 503
@@ -696,6 +714,7 @@ def create_app(config_path: str = "config.yaml",
         return jsonify({"ok": True, "users": users})
 
     @app.route("/api/admin/users", methods=["POST"])
+    @_serialized
     def admin_create_user():
         """Create a new user (admin only). Returns the generated/explied secret."""
         user, err = auth.require_admin(
@@ -766,6 +785,7 @@ def create_app(config_path: str = "config.yaml",
         return jsonify({"ok": True, "groups": groups})
 
     @app.route("/api/admin/groups", methods=["POST"])
+    @_serialized
     def admin_create_group():
         """Create a new group (admin only)."""
         user, err = auth.require_admin(
@@ -968,9 +988,17 @@ def create_app(config_path: str = "config.yaml",
         if not target:
             return jsonify({"ok": False, "error": "User not found"}), 404
 
-        # Every rule of the user, at any address. If ufw fails, the secret is
-        # still rotated below, but the state (current IP) is kept and the admin
-        # is told, so a retry — or cleanup — can still find and close the rule.
+        data = request.get_json(silent=True) or {}
+        rotate = bool(data.get("rotate_secret", True))
+        new_secret = None
+        if rotate:
+            # First: should closing the ports below not finish, the old
+            # credential is dead already.
+            new_secret = secrets.token_hex(32)
+            db.rotate_secret(user_id, new_secret)
+        # Every rule of the user, at any address. If ufw fails, the state
+        # (current IP) is kept and the admin is told, so a retry — or cleanup —
+        # can still find and close the rule.
         fw_error = None
         try:
             ufw.purge_rules(username=target["username"])
@@ -978,12 +1006,6 @@ def create_app(config_path: str = "config.yaml",
             fw_error = str(exc)
         if fw_error is None:
             db.clear_user_state(user_id)
-        data = request.get_json(silent=True) or {}
-        rotate = bool(data.get("rotate_secret", True))
-        new_secret = None
-        if rotate:
-            new_secret = secrets.token_hex(32)
-            db.rotate_secret(user_id, new_secret)
         db.log_audit(user["username"], "revoke", target["username"], f"rotate={rotate}")
         logger.info("Revoked %s (rotate=%s) by %s", target["username"], rotate, user["username"])
         resp = {"ok": True, "user_id": user_id, "rotated": rotate}
@@ -1126,6 +1148,7 @@ def create_app(config_path: str = "config.yaml",
         return jsonify({"ok": True, "user_id": user_id, "groups": groups})
 
     @app.route("/api/admin/users/<int:user_id>/admin", methods=["POST"])
+    @_serialized
     def admin_set_admin(user_id: int):
         """Promote/demote a user's admin flag (admin only, step-up protected)."""
         user, err = auth.require_admin(
@@ -1299,8 +1322,8 @@ def cmd_upgrade(args):
       (default) Perform an upgrade of a git checkout (other installs:
                 deploy/upgrade.sh): backup DB → git pull → run DB migrations →
                 restart the systemd service → health-check /health → on failure,
-                roll back (stop the service, restore the DB backup, reset to the
-                previous commit, start it again).
+                roll back: reset to the previous commit and restart (the DB is
+                left as it is; the backup stays for a manual restore).
 
     Safety: a bare-metal root service must NOT auto-fetch code. The actual
     upgrade therefore requires --force (and, outside --yes, an interactive
@@ -1425,7 +1448,7 @@ def cmd_upgrade(args):
     _sp.run(["systemctl", "restart", "ufw-okboy"])
     if not _health_check():
         print("Health check FAILED after upgrade — rolling back.")
-        _rollback(db_path, backup_path, repo_root, old_head)
+        _rollback(backup_path, repo_root, old_head)
         sys.exit(1)
     print(f"Upgrade complete: {current} -> {latest}. DB backup at {backup_path}")
 
@@ -1464,33 +1487,39 @@ def _copy_private(src: str, dest: str) -> None:
     """Copy the file *src* to *dest*, owner-only from the first byte (with
     ``shutil.copy2`` the copy has the umask's mode until the source's is
     applied): database files hold plaintext secrets."""
+    if os.path.exists(dest) and os.path.samefile(src, dest):
+        raise ValueError(f"{src} and {dest} are the same file")
     with open(src, "rb") as inp:
-        fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        fd = os.open(dest, os.O_WRONLY | os.O_CREAT, 0o600)
         with open(fd, "wb") as out:
-            os.fchmod(fd, 0o600)  # O_CREAT's mode applies to a new file only
+            # O_CREAT's mode applies to a new file only. Before truncating: if
+            # this fails, the file (maybe the live database) is still intact.
+            os.fchmod(fd, 0o600)
+            out.truncate(0)
             shutil.copyfileobj(inp, out)
 
 
-def _rollback(db_path: str, backup_path: str | None,
-              repo_root: Path, old_head: str | None) -> None:
-    """Undo an upgrade whose service failed its health check: stop the service
-    (it holds the database open, and runs the new code), restore the DB
-    backup, move the checkout back to *old_head* — the commit it was on before
-    the pull (``git checkout -- .`` only discarded local edits: after a
-    fast-forward the new code stayed) — and start the service again."""
+def _rollback(backup_path: str | None, repo_root: Path, old_head: str | None) -> None:
+    """Undo an upgrade whose service failed its health check: move the checkout
+    back to *old_head*, the commit it was on before the pull (``git checkout --
+    .`` only discarded local edits: after a fast-forward the new code stayed),
+    and restart the service.
+
+    The database is left as it is: restoring the backup would also undo what
+    happened since it was taken — a revoke, a deletion. Migrations only add to
+    the schema, and the previous code runs on it; how to restore the backup
+    anyway is printed."""
     import subprocess as _sp
-    _sp.run(["systemctl", "stop", "ufw-okboy"])
-    if backup_path and Path(backup_path).exists():
-        for side in ("-wal", "-shm"):  # the replaced database's, not the backup's
-            Path(db_path + side).unlink(missing_ok=True)
-        _copy_private(backup_path, db_path)
-        print(f"DB restored from {backup_path}")
     if old_head and (repo_root / ".git").exists():
         if _sp.run(["git", "reset", "--hard", old_head], cwd=repo_root).returncode == 0:
             print(f"Code reverted to {old_head[:12]}.")
         else:
             print(f"Could not move the code back to {old_head[:12]}: do it by hand.")
-    _sp.run(["systemctl", "start", "ufw-okboy"])
+    _sp.run(["systemctl", "restart", "ufw-okboy"])
+    if backup_path:
+        print(f"The database was left as it is. To go back to the pre-upgrade backup "
+              f"(undoing every change since): systemctl stop ufw-okboy; "
+              f"app.py restore {backup_path}; systemctl start ufw-okboy")
     print("Rollback complete. Inspect logs: journalctl -u ufw-okboy")
 
 
@@ -1754,6 +1783,10 @@ def cmd_revoke(args):
         if not user:
             print(f"User '{args.username}' not found.")
             return
+        new_secret = None
+        if not args.no_rotate:  # first: the old credential dies whatever follows
+            new_secret = secrets.token_hex(32)
+            db.rotate_secret(user["id"], new_secret)
         fw_error = None
         try:
             ufw.purge_rules(username=args.username)  # every rule, at any address
@@ -1761,10 +1794,6 @@ def cmd_revoke(args):
             fw_error = str(exc)  # keep the state: a retry or cleanup can close it
         if fw_error is None:
             db.clear_user_state(user["id"])
-        new_secret = None
-        if not args.no_rotate:
-            new_secret = secrets.token_hex(32)
-            db.rotate_secret(user["id"], new_secret)
     db.log_audit("cli", "revoke", args.username, f"rotate={not args.no_rotate}")
     if fw_error:
         print(f"WARNING: removing the firewall rules of '{args.username}' failed — their "
@@ -1792,11 +1821,8 @@ def cmd_backup(args):
         f.write(f"{digest}  {os.path.basename(dest)}\n")
     print(f"Backup written: {dest}")
     print(f"  sha256: {digest}")
+    _restrict_backups(backup_dir)
     backups = sorted(Path(backup_dir).glob("ufw-okboy-*.db"))
-    # Backups written by older versions are world-readable; they hold the same
-    # plaintext secrets as the database. Tighten them all, pruned or not.
-    for b in backups:
-        b.chmod(0o600)
     if keep > 0:
         for old in backups[:-keep]:
             old.unlink(missing_ok=True)
@@ -1814,6 +1840,8 @@ def cmd_restore(args):
     src = args.backup
     if not os.path.exists(src):
         sys.exit(f"Backup not found: {src}")
+    if os.path.exists(db_path) and os.path.samefile(src, db_path):
+        sys.exit(f"{src} is the live database itself: nothing to restore.")
     sidecar = src + ".sha256"
     if os.path.exists(sidecar):
         with open(sidecar, encoding="utf-8") as f:
@@ -1825,15 +1853,21 @@ def cmd_restore(args):
     else:
         print("WARNING: no .sha256 sidecar — restoring without integrity verification.")
     if os.path.exists(db_path):
-        # A byte copy, not the online backup: the database being replaced may
-        # be the broken one.
-        _copy_private(db_path, db_path + ".pre-restore")
-        print(f"Current DB snapshotted to {db_path}.pre-restore")
+        # A byte copy — the database being replaced may be the broken one — of
+        # the file and its -wal, which can hold commits not in the file yet.
+        # Named uniquely: restoring an earlier snapshot must not overwrite it.
+        snap = f"{db_path}.pre-restore-{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}"
+        for side in ("", "-wal"):
+            if os.path.exists(db_path + side):
+                _copy_private(db_path + side, snap + side)
+        print(f"Current DB snapshotted to {snap}")
     _copy_private(src, db_path)
     for ext in ("-wal", "-shm"):
         stale = db_path + ext
         if os.path.exists(stale):
             os.remove(stale)
+    if os.path.exists(src + "-wal"):  # a raw snapshot's commits not yet in its file
+        _copy_private(src + "-wal", db_path + "-wal")
     print(f"Restored {db_path} from {src}. Restart the server to load it.")
 
 

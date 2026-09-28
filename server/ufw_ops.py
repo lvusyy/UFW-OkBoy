@@ -6,6 +6,7 @@ Responsibilities:
 - Cleanup stale rules that exceed a configurable max age
 """
 
+import contextlib
 import glob
 import ipaddress
 import logging
@@ -23,6 +24,13 @@ except ImportError:  # not POSIX (a dev box running the unit tests): thread lock
 from db import Database
 
 logger = logging.getLogger("ufw-okboy.ufw")
+
+
+def _ufw_env() -> dict:
+    """The environment ufw runs in: the C locale. ufw translates its status
+    line ("Status: active" / "Status: inactive"), which is read here; the rule
+    lines it prints untranslated either way."""
+    return {**os.environ, "LANGUAGE": "C", "LC_ALL": "C", "LANG": "C"}
 
 
 def canonical_ip(value) -> str:
@@ -127,13 +135,36 @@ class UFWManager:
         # CLI, cleanup timer) uses the same config, hence the same lock file.
         self.lock = HostLock(lock_path or os.path.join(
             os.path.dirname(os.path.abspath(db.db_path)), "ufw.lock"))
+        self._limit = threading.local()  # see deadline()
+
+    @contextlib.contextmanager
+    def deadline(self, seconds: float):
+        """Within the block, every ufw command must end *seconds* from now: one
+        still running then is killed, and none starts after. A server request
+        must end before gunicorn kills its worker — that would leave a ufw
+        command running on after the host lock is released."""
+        self._limit.at = time.monotonic() + seconds
+        try:
+            yield
+        finally:
+            self._limit.at = None
+
+    def _timeout(self, cap: float) -> float:
+        """Seconds a ufw command may take: *cap*, or less when the deadline (see
+        :meth:`deadline`) is nearer; RuntimeError once it has passed."""
+        at = getattr(self._limit, "at", None)
+        if at is None:
+            return cap
+        left = at - time.monotonic()
+        if left <= 0:
+            raise RuntimeError("UFW command not run: out of time")
+        return min(cap, left)
 
     # ------------------------------------------------------------------ #
     #  UFW commands
     # ------------------------------------------------------------------ #
 
-    @staticmethod
-    def _run_ufw(*args: str) -> str:
+    def _run_ufw(self, *args: str) -> str:
         """Execute a UFW command, return stdout.
 
         Note: ``--force`` is NOT added globally — callers must include it
@@ -144,7 +175,8 @@ class UFWManager:
         logger.info("Exec: %s", " ".join(cmd))
         try:
             result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=30, check=False,
+                cmd, capture_output=True, text=True, timeout=self._timeout(30),
+                check=False, env=_ufw_env(),
             )
         except (subprocess.TimeoutExpired, OSError) as exc:
             # One exception type for every failure: callers keep their state on
@@ -176,6 +208,18 @@ class UFWManager:
         if proto not in ("tcp", "udp") or not isinstance(port, int) or not 1 <= port <= 65535:
             raise RuntimeError(f"refusing to add a rule for port {port!r}/{proto!r}")
         with self.lock:
+            # ufw keeps one rule per source, port and protocol: ours would
+            # replace a host rule with the same ones — a DENY would become an
+            # ALLOW, and this user's revoke or cleanup would then delete it.
+            to = f"{port}/{proto}"
+            for r in self.list_all_rules(strict=True):
+                if (r["to"] == to and r["action"].endswith(" IN")
+                        and canonical_ip(r["from"]) == src
+                        and not r["comment"].startswith(f"{self.rule_prefix}:")):
+                    logger.warning("Not adding %s -> port %s/%s (%s): host rule [%d] %s %s "
+                                   "stays as it is", src, port, proto, comment,
+                                   r["number"], r["action"], r["from"])
+                    return
             self._run_ufw(
                 "allow", "from", src,
                 "to", "any", "port", str(port), "proto", proto,
@@ -195,16 +239,7 @@ class UFWManager:
         unless *strict*: then that raises RuntimeError, as a removal must not
         take "could not list the rules" for "no rule to remove".
         """
-        if strict:
-            output = self._run_ufw("status", "numbered")
-        else:
-            try:
-                output = subprocess.run(
-                    ["ufw", "status", "numbered"], capture_output=True,
-                    text=True, timeout=15, check=False,
-                ).stdout
-            except Exception:
-                return []
+        output = self._status_numbered(strict)
 
         # Lines look like:
         # [ 1] 22/tcp                     ALLOW IN    1.2.3.4        # ufw-okboy:alice:web
@@ -266,7 +301,25 @@ class UFWManager:
                 continue
         return ports or {"22"}
 
-    def list_all_rules(self) -> list[dict]:
+    def _status_numbered(self, strict: bool) -> str:
+        """``ufw status numbered``. A failure reads as no rules — unless
+        *strict*: then it raises RuntimeError, and so does an inactive ufw,
+        which lists nothing although its rules stay saved (``ufw enable``
+        brings them back): a removal must not take either for "no rule"."""
+        if strict:
+            output = self._run_ufw("status", "numbered")
+            if output.lstrip().startswith("Status: inactive"):
+                raise RuntimeError("ufw is inactive: its rules cannot be listed")
+            return output
+        try:
+            return subprocess.run(
+                ["ufw", "status", "numbered"], capture_output=True, text=True,
+                timeout=self._timeout(15), check=False, env=_ufw_env(),
+            ).stdout
+        except Exception:
+            return ""
+
+    def list_all_rules(self, strict: bool = False) -> list[dict]:
         """Return ALL UFW rules from ``ufw status numbered`` (not just managed ones).
 
         Lets the admin inspect / clean up pre-existing system rules. Each item::
@@ -276,16 +329,11 @@ class UFWManager:
         UFW's columns are whitespace-aligned and vary (ports, app profiles like
         "OpenSSH", IPv6 "(v6)", "Anywhere"), so this splits on the action keyword
         rather than a rigid column regex. Returns [] when the numbered view is
-        unavailable (e.g. UFW inactive). ``looks_like_ssh`` flags rules that touch
+        unavailable (e.g. UFW inactive) — *strict*, raises RuntimeError instead
+        (see :meth:`_status_numbered`). ``looks_like_ssh`` flags rules that touch
         port 22 / SSH so the caller can guard against an accidental lock-out.
         """
-        try:
-            output = subprocess.run(
-                ["ufw", "status", "numbered"], capture_output=True,
-                text=True, timeout=15, check=False,
-            ).stdout
-        except Exception:
-            return []
+        output = self._status_numbered(strict)
 
         ssh_ports = self._detect_ssh_ports()
         num_re = re.compile(r"^\s*\[\s*(\d+)\s*\]\s+(.*\S)\s*$")
@@ -433,9 +481,11 @@ class UFWManager:
         existing = {(r["ip"], r["port"], r["proto"], r["comment"]): r for r in user_rules}
 
         # Add missing rules for every enabled group (per-group proto preserved).
+        tried = False
         for group_name, (port, proto) in enabled_groups.items():
             comment = f"{prefix}{group_name}"
             if (client_ip, port, proto, comment) not in existing:
+                tried = True
                 # Isolate per-group failures (transient UFW lock, bad port, ...)
                 # so one failing add does not abort the whole reconcile and skip
                 # the stale-rule cleanup below — symmetric with the removal loop.
@@ -450,12 +500,14 @@ class UFWManager:
 
         # Remove rules that are stale: group no longer enabled, OR bound to an
         # old IP (stale old-IP rule for an enabled group also gets cleaned up).
-        # An added IPv4 rule goes before every IPv6 one and renumbers them, so
-        # look the stale rules up again after adding. Delete from the highest
-        # number down: each delete then leaves the numbers of those still to go
-        # untouched (ascending, the second delete would hit the rule that moved
-        # into the first one's place — another user's, or a host DENY).
-        if added:
+        # An added IPv4 rule goes before every IPv6 one and renumbers them, and
+        # so may an add that failed (ufw saves a rule before applying it to the
+        # running firewall): after any add, look the stale rules up again.
+        # Delete from the highest number down: each delete then leaves the
+        # numbers of those still to go untouched (ascending, the second delete
+        # would hit the rule that moved into the first one's place — another
+        # user's, or a host DENY).
+        if tried:
             user_rules = listing()
         enabled_names = set(enabled_groups.keys())
         for rule in sorted(user_rules, key=lambda r: r["number"], reverse=True):
@@ -594,7 +646,8 @@ class UFWManager:
         """Parse ``ufw status`` output and return lines containing our rule prefix."""
         try:
             output = subprocess.run(
-                ["ufw", "status"], capture_output=True, text=True, timeout=15, check=False,
+                ["ufw", "status"], capture_output=True, text=True,
+                timeout=self._timeout(15), check=False, env=_ufw_env(),
             ).stdout
         except Exception:
             return []

@@ -6,6 +6,7 @@ user_group_membership, audit_log, operation_log, failed_attempts) plus
 CRUD, logging helpers, state queries, and one-time JSON state migration.
 """
 
+import glob
 import hashlib
 import json
 import logging
@@ -147,8 +148,11 @@ class Database:
         """Make the database files owner-only: they hold plaintext HMAC secrets
         and TOTP seeds (older versions left them 0644). SQLite gives the -wal and
         -shm it creates later the database file's mode. Some filesystems refuse
-        chmod; that is tolerated only while nobody else can read the file."""
-        for path in (self.db_path, self.db_path + "-wal", self.db_path + "-shm"):
+        chmod; that is tolerated only while nobody else can read the file.
+        Snapshots next to the database (``.pre-upgrade-*``, ``.pre-restore*``)
+        hold the same secrets, and older versions left them readable too."""
+        for path in (self.db_path, self.db_path + "-wal", self.db_path + "-shm",
+                     *glob.glob(glob.escape(self.db_path) + ".pre-*")):
             try:
                 os.chmod(path, 0o600)
             except FileNotFoundError:
@@ -400,11 +404,13 @@ class Database:
 
     def create_user(self, username: str, secret: str, is_admin: bool = False) -> int:
         """Insert a new user and return its id."""
-        cur = self.conn.execute(
-            "INSERT INTO users (username, secret, is_admin) VALUES (?, ?, ?)",
-            (username, secret, 1 if is_admin else 0),
-        )
-        self.conn.commit()
+        # A failed insert (a duplicate) must roll back: its open transaction
+        # would keep the write lock from every other process.
+        with self.conn:
+            cur = self.conn.execute(
+                "INSERT INTO users (username, secret, is_admin) VALUES (?, ?, ?)",
+                (username, secret, 1 if is_admin else 0),
+            )
         return cur.lastrowid
 
     def get_user_by_username(self, username: str) -> sqlite3.Row | None:
@@ -516,11 +522,11 @@ class Database:
 
     def create_group(self, name: str, port: int, proto: str = "tcp") -> int:
         """Insert a new group and return its id."""
-        cur = self.conn.execute(
-            "INSERT INTO groups (name, port, proto) VALUES (?, ?, ?)",
-            (name, port, proto),
-        )
-        self.conn.commit()
+        with self.conn:  # rolls a failed insert back (see create_user)
+            cur = self.conn.execute(
+                "INSERT INTO groups (name, port, proto) VALUES (?, ?, ?)",
+                (name, port, proto),
+            )
         return cur.lastrowid
 
     def get_group(self, group_id: int) -> sqlite3.Row | None:
